@@ -9,6 +9,7 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -56,6 +57,9 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
     private static final long GB = 1L << 30;
 
     private static final ScanAdmission.Shape UNBOUNDED = new ScanAdmission.Shape(true, true, 0L);
+
+    /** The identity of a full text scan of {@code body} over {@code perf1b}, the pool tests' scan. */
+    private static final ScanAdmission.Scope FTS_BODY = new ScanAdmission.Scope(ScanAdmission.Kind.FTS, "perf1b", Set.of("body"));
 
     @Override
     public void setUp() throws Exception {
@@ -387,7 +391,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
     public void testPoolRecordsWhatOneScanLeftBehind() {
         ScanAdmission.RetainedPool pool = new ScanAdmission.RetainedPool();
         assertEquals(0L, pool.creditBytes(80 * GB));
-        pool.scanAdmitted(80 * GB, -1L, 50 * GB);
+        pool.scanAdmitted(FTS_BODY, 80 * GB, -1L, 50 * GB);
         assertTrue(pool.awaitingCompletion());
         assertEquals("nothing is credited before the completion sample", 0L, pool.creditBytes(30 * GB));
         pool.scanCompleted(73 * GB, -1L);
@@ -398,25 +402,25 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
 
     public void testPoolAccumulatesOverScansAndStaysWithinTheLargestEstimate() {
         ScanAdmission.RetainedPool pool = new ScanAdmission.RetainedPool();
-        pool.scanAdmitted(80 * GB, -1L, 10 * GB);
+        pool.scanAdmitted(FTS_BODY, 80 * GB, -1L, 10 * GB);
         pool.scanCompleted(74 * GB, -1L);
         assertEquals(6 * GB, pool.retainedBytes());
         // The second scan is admitted below the baseline, so the pool
         // stands and its bound grows to the larger estimate.
-        pool.scanAdmitted(74 * GB, -1L, 12 * GB);
+        pool.scanAdmitted(FTS_BODY, 74 * GB, -1L, 12 * GB);
         pool.scanCompleted(66 * GB, -1L);
         assertEquals(12 * GB, pool.boundBytes());
         assertEquals("6 + 8 clamped to the 12 GiB bound", 12 * GB, pool.retainedBytes());
         assertEquals(12 * GB, pool.creditBytes(66 * GB));
         // A third scan that frees memory shrinks the pool.
-        pool.scanAdmitted(66 * GB, -1L, 10 * GB);
+        pool.scanAdmitted(FTS_BODY, 66 * GB, -1L, 10 * GB);
         pool.scanCompleted(70 * GB, -1L);
         assertEquals(8 * GB, pool.retainedBytes());
     }
 
     public void testPoolCreditDecaysAsAvailableMemoryRecovers() {
         ScanAdmission.RetainedPool pool = new ScanAdmission.RetainedPool();
-        pool.scanAdmitted(80 * GB, -1L, 50 * GB);
+        pool.scanAdmitted(FTS_BODY, 80 * GB, -1L, 50 * GB);
         pool.scanCompleted(73 * GB, -1L);
         assertEquals(7 * GB, pool.creditBytes(73 * GB));
         // Two of the seven come back (an eviction, a restart of another
@@ -426,7 +430,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         assertEquals(0L, pool.creditBytes(80 * GB));
         assertEquals(0L, pool.creditBytes(90 * GB));
         // The next admission at or above the baseline starts over.
-        pool.scanAdmitted(81 * GB, -1L, 50 * GB);
+        pool.scanAdmitted(FTS_BODY, 81 * GB, -1L, 50 * GB);
         assertEquals(0L, pool.retainedBytes());
         pool.scanCompleted(81 * GB, -1L);
         assertEquals(0L, pool.creditBytes(81 * GB));
@@ -434,7 +438,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
 
     public void testPoolDoesNotCreditAnUnrelatedDropAfterTheCompletionSample() {
         ScanAdmission.RetainedPool pool = new ScanAdmission.RetainedPool();
-        pool.scanAdmitted(80 * GB, -1L, 50 * GB);
+        pool.scanAdmitted(FTS_BODY, 80 * GB, -1L, 50 * GB);
         pool.scanCompleted(73 * GB, -1L);
         // Something else took 20 GiB since: the credit stays what the
         // scan left behind, never the whole drop.
@@ -447,7 +451,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         // inflated, but a decision made after the release sees the
         // recovery and credits only the real drop.
         ScanAdmission.RetainedPool pool = new ScanAdmission.RetainedPool();
-        pool.scanAdmitted(80 * GB, -1L, 50 * GB);
+        pool.scanAdmitted(FTS_BODY, 80 * GB, -1L, 50 * GB);
         pool.scanCompleted(40 * GB, -1L);
         assertEquals(40 * GB, pool.retainedBytes());
         assertEquals(7 * GB, pool.creditBytes(73 * GB));
@@ -465,19 +469,383 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         // by 3 GiB: another process took the other 4 GiB, which the
         // next scan cannot reuse.
         ScanAdmission.RetainedPool pool = new ScanAdmission.RetainedPool();
-        pool.scanAdmitted(80 * GB, 60 * GB, 50 * GB);
+        pool.scanAdmitted(FTS_BODY, 80 * GB, 60 * GB, 50 * GB);
         pool.scanCompleted(73 * GB, 63 * GB);
         assertEquals(3 * GB, pool.retainedBytes());
         // A resident set that shrank gave retained memory back: the pool
         // shrinks by that much even though MemAvailable fell.
-        pool.scanAdmitted(73 * GB, 63 * GB, 50 * GB);
+        pool.scanAdmitted(FTS_BODY, 73 * GB, 63 * GB, 50 * GB);
         pool.scanCompleted(70 * GB, 62 * GB);
         assertEquals(2 * GB, pool.retainedBytes());
         // Unknown on one side (the probe failed): the MemAvailable
         // difference stands on its own.
-        pool.scanAdmitted(70 * GB, -1L, 50 * GB);
+        pool.scanAdmitted(FTS_BODY, 70 * GB, -1L, 50 * GB);
         pool.scanCompleted(68 * GB, 70 * GB);
         assertEquals(4 * GB, pool.retainedBytes());
+    }
+
+    public void testPoolCreditsOnlyAScanOfItsOwnIdentityAndStartsOverUnderAnother() {
+        ScanAdmission.Scope aggregateOnPrice = new ScanAdmission.Scope(ScanAdmission.Kind.AGGREGATE_SCAN, "perf1b", Set.of("price"));
+        ScanAdmission.Scope ftsOnTitle = new ScanAdmission.Scope(ScanAdmission.Kind.FTS, "perf1b", Set.of("title"));
+        ScanAdmission.RetainedPool pool = new ScanAdmission.RetainedPool();
+        assertNull(pool.scope());
+        pool.scanAdmitted(FTS_BODY, 80 * GB, -1L, 50 * GB);
+        pool.scanCompleted(73 * GB, -1L);
+        assertEquals(FTS_BODY, pool.scope());
+        assertEquals("the scan that filled the pool is credited", 7 * GB, pool.creditBytes(FTS_BODY, 73 * GB));
+        assertEquals("the pool's own figure, what the stats report", 7 * GB, pool.creditBytes(73 * GB));
+        assertEquals("another kind over the same table is not", 0L, pool.creditBytes(aggregateOnPrice, 73 * GB));
+        assertEquals("the same kind over another column is not", 0L, pool.creditBytes(ftsOnTitle, 73 * GB));
+        // A scan of another identity admitted below the baseline starts
+        // the pool over under its identity: the 7 GiB the full text scan
+        // left is not its to reuse and is not carried into its pool.
+        pool.scanAdmitted(aggregateOnPrice, 73 * GB, -1L, 40 * GB);
+        assertEquals(aggregateOnPrice, pool.scope());
+        assertEquals(0L, pool.retainedBytes());
+        assertEquals(40 * GB, pool.boundBytes());
+        pool.scanCompleted(70 * GB, -1L);
+        assertEquals(3 * GB, pool.retainedBytes());
+        assertEquals(3 * GB, pool.creditBytes(aggregateOnPrice, 70 * GB));
+        assertEquals("the full text scan lost its credit when the pool changed hands", 0L, pool.creditBytes(FTS_BODY, 70 * GB));
+    }
+
+    public void testScopeKeyNamesTheKindTheTableAndTheSortedColumns() {
+        assertEquals("fts:perf1b:body", FTS_BODY.key());
+        assertEquals(
+            "aggregate_scan:s3://bucket/perf.lance:category,price",
+            new ScanAdmission.Scope(ScanAdmission.Kind.AGGREGATE_SCAN, "s3://bucket/perf.lance", Set.of("price", "category")).key()
+        );
+        assertEquals("filter_scan:t:", new ScanAdmission.Scope(ScanAdmission.Kind.FILTER_SCAN, "t", Set.of()).key());
+        assertEquals("a null column set is an empty one", Set.of(), new ScanAdmission.Scope(ScanAdmission.Kind.FTS, "t", null).columns());
+        assertEquals(
+            "the columns are a set: their order does not tell two identities apart",
+            new ScanAdmission.Scope(ScanAdmission.Kind.FTS, "t", new LinkedHashSet<>(List.of("title", "body"))),
+            new ScanAdmission.Scope(ScanAdmission.Kind.FTS, "t", Set.of("body", "title"))
+        );
+        assertEquals("none", ScanAdmission.retainedScope());
+    }
+
+    public void testFilterScopeIsTheIndexedColumnsTheFilterReferencesOrTheFilterItself() {
+        Optional<TableStatistics> statistics = perf1bStatistics();
+        assertEquals(
+            Set.of("category", "price"),
+            ScanAdmission.filterScope(ScanAdmission.Kind.AGGREGATE_SCAN, "t", "(category = 'cat010') AND (price >= 50.0)", statistics)
+                .columns()
+        );
+        assertEquals(
+            Set.of("price"),
+            ScanAdmission.filterScope(ScanAdmission.Kind.SCALAR_INDEX, "t", "(price >= 100.0) AND (price < 200.0)", statistics).columns()
+        );
+        // The identity is the same however the predicate on the column
+        // reads: the memory is the column's index.
+        assertEquals(
+            ScanAdmission.filterScope(ScanAdmission.Kind.FILTER_SCAN, "t", "price >= 100.0", statistics),
+            ScanAdmission.filterScope(ScanAdmission.Kind.FILTER_SCAN, "t", "price = 5.0", statistics)
+        );
+        // Without statistics, or on a column no index covers, only the
+        // very same filter shares an identity.
+        assertEquals(
+            Set.of("price >= 100.0"),
+            ScanAdmission.filterScope(ScanAdmission.Kind.FILTER_SCAN, "t", "price >= 100.0", Optional.empty()).columns()
+        );
+        assertEquals(
+            Set.of("brand = 'b1'"),
+            ScanAdmission.filterScope(ScanAdmission.Kind.FILTER_SCAN, "t", "brand = 'b1'", statistics).columns()
+        );
+        assertEquals(Set.of(), ScanAdmission.filterScope(ScanAdmission.Kind.FILTER_SCAN, "t", "", statistics).columns());
+        assertEquals(Set.of(), ScanAdmission.filterScope(ScanAdmission.Kind.FILTER_SCAN, "t", null, statistics).columns());
+    }
+
+    public void testClassifyNamesTheColumnsTheClausesSearch() {
+        assertEquals(Set.of("body"), ScanAdmission.classify(new LanceFtsQuery("body", "hello"), false).columns());
+        BooleanQuery two = new BooleanQuery.Builder().add(new LanceFtsQuery("body", "hello"), BooleanClause.Occur.SHOULD)
+            .add(new LanceFtsQuery("title", "hello"), BooleanClause.Occur.SHOULD)
+            .build();
+        assertEquals(Set.of("body", "title"), ScanAdmission.classify(two, false).columns());
+        assertEquals(Set.of(), ScanAdmission.classify(MatchAllDocsQuery.INSTANCE, false).columns());
+        assertEquals(Set.of(), UNBOUNDED.columns());
+    }
+
+    public void testFilterOnAnotherColumnIsNotCreditedWhatAnEarlierFilteredAggregateRetained() {
+        // The two shapes of the shard node kill: range price [100,200) +
+        // terms(category), admitted cold and leaving 7 GiB behind, then
+        // bool(term category, range price) + terms(rating), which reads
+        // another index and does not reuse that memory.
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(8, ByteSizeUnit.GB));
+        ScanAdmission.setHeadroom(new ByteSizeValue(8, ByteSizeUnit.GB));
+        ScanAdmission.setResidentSetProbeForTests(() -> -1L);
+        long width = ScanAdmission.UTF8_COLUMN_BYTES_PER_ROW + 8L;
+        long rangeEstimate = perf1bAggregateEstimate(50_000_000L, 200_000_000L, width);
+        long boolEstimate = perf1bAggregateEstimate(1_250_000L, 205_000_000L, 4L + 8L);
+        long[] available = { rangeEstimate + 8 * GB + 2 * GB };
+        ScanAdmission.setMemoryProbeForTests(() -> available[0]);
+        String range = "(price >= 100.0) AND (price < 200.0)";
+        String bool = "(category = 'cat010') AND (price >= 50.0)";
+
+        // The BTree on price fits the shard share, so the aggregate scan
+        // is the one admission counted; its scan leaves 7 GiB behind.
+        ScanAdmission.admitAggregateScan(
+            "perf1b",
+            perf1bStatistics(),
+            range,
+            PERF1B_SCANS,
+            PERF1B_NODE_ROWS,
+            width,
+            10L,
+            0,
+            PERF1B_READAHEAD,
+            Long.MAX_VALUE
+        );
+        assertEquals(rangeEstimate, ScanAdmission.lastEstimateBytes());
+        assertEquals(1, ScanAdmission.inFlightForTests());
+        ScanAdmission.scanStarted();
+        available[0] -= 7 * GB;
+        ScanAdmission.scanFinished();
+        ScanAdmission.requestEnded();
+        assertEquals(7 * GB, ScanAdmission.retainedCreditBytes());
+        assertEquals("aggregate_scan:perf1b:price", ScanAdmission.retainedScope());
+
+        // 3 GiB above the range estimate before the headroom: the bool
+        // shape is short by about 5 GiB on the reading alone, which the
+        // 7 GiB would cover if it were credited. It is not: the 429 names
+        // a zero credit and the pool stands.
+        long left = available[0] - 8 * GB;
+        assertTrue(left < boolEstimate);
+        assertTrue(left + 7 * GB >= boolEstimate);
+        CircuitBreakingException refused = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admitAggregateScan(
+                "perf1b",
+                perf1bStatistics(),
+                bool,
+                PERF1B_SCANS,
+                PERF1B_NODE_ROWS,
+                12L,
+                5L,
+                0,
+                PERF1B_READAHEAD,
+                Long.MAX_VALUE
+            )
+        );
+        assertTrue(refused.getMessage(), refused.getMessage().contains("[0b] retained by earlier admitted scans"));
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.AGGREGATE_SCAN));
+        assertEquals(0, ScanAdmission.inFlightForTests());
+        assertEquals(7 * GB, ScanAdmission.retainedCreditBytes());
+        assertEquals("aggregate_scan:perf1b:price", ScanAdmission.retainedScope());
+
+        // The range shape again, short by 5 GiB on the reading as well:
+        // admitted on the credit, because it reads the index the pool
+        // was filled by.
+        assertTrue(left < rangeEstimate);
+        ScanAdmission.admitAggregateScan(
+            "perf1b",
+            perf1bStatistics(),
+            range,
+            PERF1B_SCANS,
+            PERF1B_NODE_ROWS,
+            width,
+            10L,
+            0,
+            PERF1B_READAHEAD,
+            Long.MAX_VALUE
+        );
+        assertEquals(1L, ScanAdmission.rejections());
+        assertEquals(1, ScanAdmission.inFlightForTests());
+        ScanAdmission.requestEnded();
+    }
+
+    public void testAggregateAfterAFullTextScanIsNotCreditedWhatTheScanRetained() {
+        long rows = PERF1B_ROWS;
+        ScanAdmission.Shape shape = ScanAdmission.classify(new LanceFtsQuery("body", "w000100"), false);
+        assertTrue(shape.unbounded());
+        long ftsEstimate = NativeMemoryLimit.invertedIndexEntryEstimateBytes(rows) + ScanAdmission.scanBufferEstimateBytes(rows, shape);
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(8, ByteSizeUnit.GB));
+        ScanAdmission.setHeadroom(new ByteSizeValue(8, ByteSizeUnit.GB));
+        ScanAdmission.setResidentSetProbeForTests(() -> -1L);
+        long[] available = { ftsEstimate + 8 * GB + 2 * GB };
+        ScanAdmission.setMemoryProbeForTests(() -> available[0]);
+
+        ScanAdmission.admit("perf1b", rows, shape);
+        ScanAdmission.scanStarted();
+        available[0] -= 7 * GB;
+        ScanAdmission.scanFinished();
+        ScanAdmission.requestEnded();
+        assertEquals(7 * GB, ScanAdmission.retainedCreditBytes());
+        assertEquals("fts:perf1b:body", ScanAdmission.retainedScope());
+
+        // An unfiltered terms aggregate over the same table: 8 read
+        // queues of 1.25 GB. With the reading 1 GiB short of it after the
+        // headroom, the 7 GiB the full text scan left would admit it if
+        // it were credited; it is not.
+        long width = ScanAdmission.UTF8_COLUMN_BYTES_PER_ROW + 8L;
+        long aggregateEstimate = ScanAdmission.aggregateScanEstimateBytes(
+            PERF1B_SCANS,
+            PERF1B_NODE_ROWS,
+            0L,
+            width,
+            PERF1B_READAHEAD,
+            8 * GB
+        );
+        assertTrue(aggregateEstimate > 0L);
+        available[0] = 8 * GB + aggregateEstimate - GB;
+        assertEquals("the pool still holds the full text scan's memory at this reading", 7 * GB, ScanAdmission.retainedCreditBytes());
+        CircuitBreakingException refused = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admitAggregateScan(
+                "perf1b",
+                perf1bStatistics(),
+                null,
+                PERF1B_SCANS,
+                PERF1B_NODE_ROWS,
+                width,
+                10L,
+                0,
+                PERF1B_READAHEAD,
+                Long.MAX_VALUE
+            )
+        );
+        assertTrue(refused.getMessage(), refused.getMessage().startsWith("[" + ScanAdmission.LABEL + "] aggregate_scan estimate"));
+        assertTrue(refused.getMessage(), refused.getMessage().contains("[0b] retained by earlier admitted scans"));
+        assertEquals("fts:perf1b:body", ScanAdmission.retainedScope());
+        assertEquals(0, ScanAdmission.inFlightForTests());
+    }
+
+    public void testNearestScanOnAnotherColumnIsNotCreditedWhatAVectorLoadRetained() throws Exception {
+        // The indexed fixture's IVF_PQ index on embedding, loaded under a
+        // one byte shard share so its estimate counts in full; the
+        // headroom is 1000 bytes and the readings are in bytes.
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeIndexedFixtureTable(scratchDir, "admission-" + getTestName(), 2, 150);
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(1, ByteSizeUnit.BYTES));
+        ScanAdmission.setHeadroom(new ByteSizeValue(1000, ByteSizeUnit.BYTES));
+        ScanAdmission.setResidentSetProbeForTests(() -> -1L);
+        TableStatisticsCache cache = new TableStatisticsCache();
+        ScanAdmission.setTableStatistics(cache);
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            long version = dataset.version();
+            assertNull(
+                cache.lookup(dataset.uri(), version, () -> LanceRegistry.openDataset(uri, StorageOptions.empty(), Optional.of(version)))
+            );
+            TableStatistics statistics = cache.lookup(dataset.uri(), version, () -> { throw new AssertionError("already collected"); });
+            assertNotNull(statistics);
+            long embeddingEstimate = ScanAdmission.vectorIndexFor("embedding", statistics).get().sizeBytes().getAsLong()
+                * ScanAdmission.IVF_PARTITION_LOAD_FACTOR;
+            long[] available = { embeddingEstimate + 1000L + 200L };
+            ScanAdmission.setMemoryProbeForTests(() -> available[0]);
+
+            // The nearest scan on embedding is admitted and leaves 700
+            // bytes behind.
+            ScanAdmission.admitVectorSearch("demo", dataset, "embedding", 3, 1, 0, 8, null);
+            assertEquals(embeddingEstimate, ScanAdmission.lastEstimateBytes());
+            ScanAdmission.scanStarted();
+            available[0] -= 700L;
+            ScanAdmission.scanFinished();
+            ScanAdmission.requestEnded();
+            assertEquals(700L, ScanAdmission.retainedCreditBytes());
+            assertEquals("vector_index:" + dataset.uri() + ":embedding", ScanAdmission.retainedScope());
+
+            // A nearest scan on another column of the same table, one the
+            // statistics carry no index for, so the whole table's codes
+            // are taken as probed: 100 bytes short on the reading, and
+            // the 700 bytes are not its to reuse.
+            long otherEstimate = ScanAdmission.vectorIndexEstimateBytes(
+                OptionalLong.empty(),
+                ScanAdmission.tableRows(Optional.of(statistics)),
+                1,
+                0L,
+                3,
+                0,
+                8,
+                1L
+            );
+            assertTrue(otherEstimate > 0L);
+            available[0] = 1000L + otherEstimate - 100L;
+            CircuitBreakingException refused = expectThrows(
+                CircuitBreakingException.class,
+                () -> ScanAdmission.admitVectorSearch("demo", dataset, "embedding_other", 3, 1, 0, 8, null)
+            );
+            assertTrue(refused.getMessage(), refused.getMessage().contains("nearest scan on [embedding_other]"));
+            assertTrue(refused.getMessage(), refused.getMessage().contains("[0b] retained by earlier admitted scans"));
+            assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.VECTOR_INDEX));
+            assertEquals("vector_index:" + dataset.uri() + ":embedding", ScanAdmission.retainedScope());
+
+            // The scan on embedding again, 100 bytes short on the reading
+            // as well: the memory it left is credited and admits it.
+            available[0] = 1000L + embeddingEstimate - 100L;
+            ScanAdmission.admitVectorSearch("demo", dataset, "embedding", 3, 1, 0, 8, null);
+            assertEquals(1L, ScanAdmission.rejections());
+            ScanAdmission.requestEnded();
+        }
+    }
+
+    public void testALaterPathOfATicketlessRequestKeepsThePoolOnItsFirstPath() {
+        // A filtered aggregate whose bitmap load does not fit the shard
+        // share admits two paths on the runner's thread: the scalar
+        // index load, then the aggregate scan. The pool samples the
+        // first and its identity, and its bound grows to the larger
+        // estimate, so a repeat is credited on the path judged first.
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(1, ByteSizeUnit.BYTES));
+        ScanAdmission.setHeadroom(new ByteSizeValue(8, ByteSizeUnit.GB));
+        ScanAdmission.setResidentSetProbeForTests(() -> -1L);
+        long width = 4L + 8L;
+        String filter = "category = 'cat010'";
+        long bitmapEstimate = ScanAdmission.scalarIndexEstimateBytes(
+            IndexType.BITMAP,
+            OptionalLong.of(PERF1B_ROWS),
+            PERF1B_ROWS,
+            0.005d,
+            1L
+        );
+        assertTrue(bitmapEstimate > 0L);
+        long[] available = { 400 * GB };
+        ScanAdmission.setMemoryProbeForTests(() -> available[0]);
+        ScanAdmission.admitAggregateScan(
+            "perf1b",
+            perf1bStatistics(),
+            filter,
+            PERF1B_SCANS,
+            PERF1B_NODE_ROWS,
+            width,
+            5L,
+            0,
+            PERF1B_READAHEAD,
+            Long.MAX_VALUE
+        );
+        long aggregateEstimate = ScanAdmission.lastEstimateBytes();
+        assertTrue(aggregateEstimate > bitmapEstimate);
+        assertEquals("both paths count the request once", 1, ScanAdmission.inFlightForTests());
+        assertEquals("scalar_index:perf1b:category", ScanAdmission.poolForTests().scope().key());
+        assertEquals("the bound is the larger estimate", aggregateEstimate, ScanAdmission.poolForTests().boundBytes());
+        ScanAdmission.scanStarted();
+        available[0] -= GB;
+        ScanAdmission.scanFinished();
+        ScanAdmission.requestEnded();
+        assertEquals("1 GiB left behind, within the aggregate's bound", GB, ScanAdmission.retainedCreditBytes());
+
+        // The repeat at a reading that leaves the bitmap load 1 MiB short
+        // on its own: the first path is credited and admitted, and the
+        // second is judged with the request in flight, so without the
+        // credit, as before.
+        available[0] = 8 * GB + bitmapEstimate - (1L << 20);
+        CircuitBreakingException refused = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admitAggregateScan(
+                "perf1b",
+                perf1bStatistics(),
+                filter,
+                PERF1B_SCANS,
+                PERF1B_NODE_ROWS,
+                width,
+                5L,
+                0,
+                PERF1B_READAHEAD,
+                Long.MAX_VALUE
+            )
+        );
+        assertTrue(refused.getMessage(), refused.getMessage().startsWith("[" + ScanAdmission.LABEL + "] aggregate_scan estimate"));
+        assertEquals(0L, ScanAdmission.rejections(ScanAdmission.Kind.SCALAR_INDEX));
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.AGGREGATE_SCAN));
+        ScanAdmission.requestEnded();
     }
 
     public void testResidentSetGuardBlocksTheCreditWhenSomethingElseHoldsMemory() {
@@ -1525,7 +1893,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         // decision carries the figures the WARN names, the refusal is
         // counted under fts and the source is the warm up.
         ScanAdmission.setMemoryProbeForTests(() -> 16 * GB);
-        ScanAdmission.Decision skipped = ScanAdmission.admitWarmUpProbe(rows);
+        ScanAdmission.Decision skipped = ScanAdmission.admitWarmUpProbe("demo", "body", rows);
         assertFalse(skipped.admitted());
         assertEquals(estimate, skipped.estimateBytes());
         assertEquals(8 * GB, skipped.availableBytes());
@@ -1541,7 +1909,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         // what the scan left behind.
         long[] available = { estimate + 8 * GB + 2 * GB };
         ScanAdmission.setMemoryProbeForTests(() -> available[0]);
-        ScanAdmission.Decision admitted = ScanAdmission.admitWarmUpProbe(rows);
+        ScanAdmission.Decision admitted = ScanAdmission.admitWarmUpProbe("demo", "body", rows);
         assertTrue(admitted.admitted());
         assertEquals(estimate, admitted.estimateBytes());
         assertEquals(1, ScanAdmission.inFlightForTests());
@@ -1551,18 +1919,33 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         ScanAdmission.requestEnded();
         assertEquals(0, ScanAdmission.inFlightForTests());
         assertEquals(7 * GB, ScanAdmission.retainedCreditBytes());
+        assertEquals(
+            "the probe fills the pool under the identity a request's scan of the column has",
+            "fts:demo:body",
+            ScanAdmission.retainedScope()
+        );
         assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.FTS));
 
         // A request's decision afterwards flips the source back (the
-        // same one row page, admitted on the credit).
-        ScanAdmission.admit("demo", rows, ScanAdmission.WARM_UP_PROBE_SHAPE);
+        // same one row page over the same column, admitted on the
+        // credit).
+        ScanAdmission.Shape page = ScanAdmission.classify(new LanceFtsQuery("body", "hello").withScanLimit(1), false);
+        assertEquals(Set.of("body"), page.columns());
+        ScanAdmission.admit("demo", rows, page);
         assertEquals("request", ScanAdmission.lastSource());
+        assertEquals(estimate, ScanAdmission.lastEstimateBytes());
         ScanAdmission.requestEnded();
+        // A page over another column of the same index is not credited
+        // what the probe left, and is refused on the reading alone.
+        ScanAdmission.Shape otherPage = ScanAdmission.classify(new LanceFtsQuery("title", "hello").withScanLimit(1), false);
+        CircuitBreakingException refused = expectThrows(CircuitBreakingException.class, () -> ScanAdmission.admit("demo", rows, otherPage));
+        assertTrue(refused.getMessage(), refused.getMessage().contains("[0b] retained by earlier admitted scans"));
+        assertEquals(2L, ScanAdmission.rejections(ScanAdmission.Kind.FTS));
 
         // A fitting document set is estimate zero: admitted, recorded,
         // not in flight.
         ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(8, ByteSizeUnit.GB));
-        ScanAdmission.Decision fits = ScanAdmission.admitWarmUpProbe(16L);
+        ScanAdmission.Decision fits = ScanAdmission.admitWarmUpProbe("demo", "body", 16L);
         assertTrue(fits.admitted());
         assertEquals(0L, fits.estimateBytes());
         assertEquals("warm_up", ScanAdmission.lastSource());
@@ -1572,7 +1955,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(1, ByteSizeUnit.BYTES));
         ScanAdmission.setMemoryProbeForTests(() -> 0L);
         ScanAdmission.setEnabled(false);
-        assertTrue(ScanAdmission.admitWarmUpProbe(rows).admitted());
-        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.FTS));
+        assertTrue(ScanAdmission.admitWarmUpProbe("demo", "body", rows).admitted());
+        assertEquals(2L, ScanAdmission.rejections(ScanAdmission.Kind.FTS));
     }
 }

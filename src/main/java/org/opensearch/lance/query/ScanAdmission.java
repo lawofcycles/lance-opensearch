@@ -94,22 +94,28 @@ import org.opensearch.secure_sm.AccessController;
  * its index cache next to the refused one and the pages the native
  * allocator keeps after the refused entry is dropped. {@code MemAvailable}
  * therefore reads lower after the scan than before it, while the next
- * scan of the same table reuses that memory instead of allocating it
- * again. The gate keeps a per node {@link RetainedPool} of this memory:
- * the difference between {@code MemAvailable} sampled when a non zero
- * estimate is admitted with nothing else in flight and {@code MemAvailable}
- * sampled when that request's scan completes, at most the process's
- * resident set growth over the same interval, accumulated over scans,
+ * scan that loads the same index reuses that memory instead of
+ * allocating it again. The gate keeps a per node {@link RetainedPool} of
+ * this memory under the identity of the scan that left it
+ * ({@link Scope}: kind, table, columns): the difference between
+ * {@code MemAvailable} sampled when a non zero estimate is admitted with
+ * nothing else in flight and {@code MemAvailable} sampled when that
+ * request's scan completes, at most the process's resident set growth
+ * over the same interval, accumulated over scans of that identity,
  * bounded by the largest estimate admitted since the pool started, and
  * decayed as {@code MemAvailable} recovers. The decision adds the pool
- * to the available memory. The pool is credited only while no other
- * gated request is in flight and no gated scan is running (their memory
- * is in use, not reusable), and not when the process's resident set
- * exceeds {@code lance.native_memory.limit} plus the JVM heap by more
- * than the pool (something the plugin does not account holds memory).
- * Every gated scan reports itself through {@link #scanStarted} and
- * {@link #scanFinished}; {@link LanceHitsAccounting#close} reports the
- * end of the request through {@link #requestEnded(LanceHitsAccounting)},
+ * to the available memory when the scan it judges has the pool's
+ * identity, and nothing otherwise: a scan of another kind or over
+ * another index does not reuse what the earlier one left, so it is
+ * judged on {@code MemAvailable} alone, and once admitted starts the
+ * pool over under its own identity. The pool is credited only while no
+ * other gated request is in flight and no gated scan is running (their
+ * memory is in use, not reusable), and not when the process's resident
+ * set exceeds {@code lance.native_memory.limit} plus the JVM heap by
+ * more than the pool (something the plugin does not account holds
+ * memory). Every gated scan reports itself through {@link #scanStarted}
+ * and {@link #scanFinished}; {@link LanceHitsAccounting#close} reports
+ * the end of the request through {@link #requestEnded(LanceHitsAccounting)},
  * so one request counts once in flight however many of its paths were
  * admitted, and is released whether or not its scans ran.
  *
@@ -188,6 +194,43 @@ public final class ScanAdmission {
         /** The stats key: {@code request} or {@code warm_up}. */
         public String key() {
             return key;
+        }
+    }
+
+    /**
+     * What a gated scan reads, as far as the memory it leaves behind is
+     * concerned: its kind, its table and the columns whose indexes or
+     * data it loads. Two scans of one identity make Lance load the same
+     * index cache entries, so the memory the first left in the process
+     * is what the second would otherwise allocate; a scan of another
+     * identity allocates its own on top of it. The retained pool keys
+     * its credit on this ({@link RetainedPool}).
+     *
+     * <p>The table is the string the gated path names its table by: the
+     * dataset URI where the path holds the dataset, the index name for
+     * the full text paths, which are handed the index name alone. The
+     * two never meet, because the kind is part of the identity. The
+     * columns are the full text columns of a full text scan, the vector
+     * column of a nearest scan, and for a filtered scan or aggregate the
+     * indexed columns its filter references; where no statistics name
+     * the table's indexed columns the filter's SQL stands in for them,
+     * so only the very same filter matches.
+     */
+    public record Scope(Kind kind, String table, Set<String> columns) {
+
+        public Scope {
+            columns = columns == null ? Set.of() : Set.copyOf(columns);
+        }
+
+        /**
+         * {@code kind:table:columns}, the columns sorted and comma
+         * separated, as {@code GET /_lance/stats} reports the pool's
+         * identity under {@code admission.retained_scope}.
+         */
+        public String key() {
+            List<String> sorted = new ArrayList<>(columns);
+            sorted.sort(null);
+            return kind.key() + ":" + table + ":" + String.join(",", sorted);
         }
     }
 
@@ -426,26 +469,35 @@ public final class ScanAdmission {
     private ScanAdmission() {}
 
     /**
-     * Memory that earlier admitted scans left in the process and that
-     * the next scan reuses, measured as {@code MemAvailable}
-     * differences. One scan's contribution is {@code MemAvailable} when
-     * it was admitted ({@link #scanAdmitted}) minus {@code MemAvailable}
-     * when its scan completed ({@link #scanCompleted}), and at most the
-     * growth of the process's resident set over the same interval where
-     * that is known (memory another process took meanwhile is not this
-     * process's to reuse); the pool is the sum of those contributions,
-     * never above the largest estimate admitted since the pool started
-     * (one scan cannot leave behind more than it allocated) and never
-     * below zero. {@link #creditBytes} gives the pool back reduced by
-     * what {@code MemAvailable} has recovered since the last completion
-     * sample, and never more than the whole drop since the pool
-     * started, so memory the kernel or Lance gave back is not credited
-     * twice and an unrelated drop after a completion is not credited at
-     * all. An admission that finds {@code MemAvailable} at or above the
-     * pool's starting point starts the pool over: nothing is retained
-     * any more. Not thread safe; the caller holds the lock.
+     * Memory that earlier admitted scans of one identity left in the
+     * process and that the next scan of that identity reuses, measured
+     * as {@code MemAvailable} differences. One scan's contribution is
+     * {@code MemAvailable} when it was admitted ({@link #scanAdmitted})
+     * minus {@code MemAvailable} when its scan completed
+     * ({@link #scanCompleted}), and at most the growth of the process's
+     * resident set over the same interval where that is known (memory
+     * another process took meanwhile is not this process's to reuse);
+     * the pool is the sum of those contributions, never above the
+     * largest estimate admitted since the pool started (one scan cannot
+     * leave behind more than it allocated) and never below zero.
+     * {@link #creditBytes(Scope, long)} gives the pool back to a
+     * decision of the pool's identity only: a scan of another identity
+     * (another kind, another table, another column or index) does not
+     * reuse what this one left, so it is judged on the available memory
+     * alone and, once admitted, starts the pool over under its own
+     * identity. The credit is reduced by what {@code MemAvailable} has
+     * recovered since the last completion sample, and never more than
+     * the whole drop since the pool started, so memory the kernel or
+     * Lance gave back is not credited twice and an unrelated drop after
+     * a completion is not credited at all. An admission that finds
+     * {@code MemAvailable} at or above the pool's starting point starts
+     * the pool over as well: nothing is retained any more. Not thread
+     * safe; the caller holds the lock.
      */
     static final class RetainedPool {
+
+        /** Identity of the scans the pool was filled by; {@code null} before the first admission. */
+        private Scope scope;
 
         /** {@code MemAvailable} at the admission that started the pool; {@code -1} before the first. */
         private long baselineBytes = -1L;
@@ -466,15 +518,16 @@ public final class ScanAdmission {
         private long boundBytes;
 
         /**
-         * A non zero estimate was admitted with no gated request in
-         * flight: sample {@code MemAvailable} and the resident set
-         * before its scan. At or above the baseline nothing is retained
-         * any more and the pool starts over from this reading; below it
-         * the pool stands and the bound grows to this estimate if
-         * larger.
+         * A non zero estimate of a scan of {@code scope} was admitted
+         * with no gated request in flight: sample {@code MemAvailable}
+         * and the resident set before its scan. Under another identity
+         * than the pool's, or at or above the baseline, nothing the pool
+         * holds is this scan's to reuse and the pool starts over from
+         * this reading under this identity; otherwise the pool stands
+         * and the bound grows to this estimate if larger.
          */
-        void scanAdmitted(long availableNowBytes, long residentNowBytes, long estimateBytes) {
-            if (baselineBytes < 0L || availableNowBytes >= baselineBytes) {
+        void scanAdmitted(Scope scope, long availableNowBytes, long residentNowBytes, long estimateBytes) {
+            if (baselineBytes < 0L || availableNowBytes >= baselineBytes || scope.equals(this.scope) == false) {
                 baselineBytes = availableNowBytes;
                 floorBytes = availableNowBytes;
                 retainedBytes = 0L;
@@ -482,8 +535,20 @@ public final class ScanAdmission {
             } else {
                 boundBytes = Math.max(boundBytes, estimateBytes);
             }
+            this.scope = scope;
             beforeBytes = availableNowBytes;
             residentBeforeBytes = residentNowBytes;
+        }
+
+        /**
+         * A later gated path of the request whose scan completion is
+         * awaited was admitted (a filter's index load followed by its
+         * scan): the sample and the identity stay the first path's, the
+         * one a repeat of the request is credited on, and the bound
+         * grows to this estimate if larger.
+         */
+        void pathAdmitted(long estimateBytes) {
+            boundBytes = Math.max(boundBytes, estimateBytes);
         }
 
         /** Whether an admitted scan's completion sample is still awaited. */
@@ -512,11 +577,22 @@ public final class ScanAdmission {
         }
 
         /**
-         * What a decision made at {@code availableNowBytes} may add to
-         * the available memory: the recorded pool less what
-         * {@code MemAvailable} recovered since the last completion, at
-         * most the whole drop since the pool started, within
-         * {@code [0, boundBytes]}.
+         * What a decision on a scan of {@code scope} made at
+         * {@code availableNowBytes} may add to the available memory:
+         * {@link #creditBytes(long)} when {@code scope} is the pool's
+         * identity, zero for any other.
+         */
+        long creditBytes(Scope scope, long availableNowBytes) {
+            return scope.equals(this.scope) ? creditBytes(availableNowBytes) : 0L;
+        }
+
+        /**
+         * What a decision of the pool's own identity made at
+         * {@code availableNowBytes} would add to the available memory:
+         * the recorded pool less what {@code MemAvailable} recovered
+         * since the last completion, at most the whole drop since the
+         * pool started, within {@code [0, boundBytes]}. What the stats
+         * report as {@code retained_bytes}.
          */
         long creditBytes(long availableNowBytes) {
             if (baselineBytes < 0L || retainedBytes <= 0L) {
@@ -525,6 +601,11 @@ public final class ScanAdmission {
             long recovered = Math.max(0L, availableNowBytes - floorBytes);
             long dropSinceBaseline = baselineBytes - availableNowBytes;
             return clamp(Math.min(retainedBytes - recovered, dropSinceBaseline), 0L, boundBytes);
+        }
+
+        /** The identity of the scans that filled the pool, {@code null} before the first admission. */
+        Scope scope() {
+            return scope;
         }
 
         /** The recorded pool before recovery is applied, for tests. */
@@ -538,6 +619,7 @@ public final class ScanAdmission {
         }
 
         void reset() {
+            scope = null;
             baselineBytes = -1L;
             beforeBytes = -1L;
             residentBeforeBytes = -1L;
@@ -729,12 +811,13 @@ public final class ScanAdmission {
     }
 
     /**
-     * The retained memory the next decision would add to the available
-     * memory, computed at the current {@code MemAvailable}: zero while a
-     * gated request is in flight or a gated scan runs, zero when the
-     * resident set guard blocks it, else the pool's credit. Also
-     * reported as {@code admission.retained_bytes} in
-     * {@code GET /_lance/stats}.
+     * The retained memory the next decision of the pool's own identity
+     * would add to the available memory, computed at the current
+     * {@code MemAvailable}: zero while a gated request is in flight or a
+     * gated scan runs, zero when the resident set guard blocks it, else
+     * the pool's credit. A decision on a scan of another identity is
+     * credited nothing whatever this reads. Also reported as
+     * {@code admission.retained_bytes} in {@code GET /_lance/stats}.
      */
     public static long retainedCreditBytes() {
         return retainedCreditBytes(readAvailableMemoryNow());
@@ -742,18 +825,49 @@ public final class ScanAdmission {
 
     /**
      * {@link #retainedCreditBytes()} at the given {@code MemAvailable}
-     * reading, so a decision and its message, or the stats collector's
-     * two figures, use one sample.
+     * reading, so the stats collector's two figures use one sample.
      */
     public static long retainedCreditBytes(long availableNowBytes) {
+        return retainedCreditBytes(null, availableNowBytes);
+    }
+
+    /**
+     * The retained memory a decision on a scan of {@code scope} made at
+     * {@code availableNowBytes} adds to the available memory: the pool's
+     * credit when {@code scope} is the pool's identity, zero for another
+     * identity, zero while a gated request is in flight or a gated scan
+     * runs, zero when the resident set guard blocks it. A {@code null}
+     * scope reads the pool's own credit, for the stats.
+     */
+    static long retainedCreditBytes(Scope scope, long availableNowBytes) {
         long credit;
         synchronized (LOCK) {
-            credit = inFlight == 0 && activeScans == 0 ? POOL.creditBytes(availableNowBytes) : 0L;
+            if (inFlight != 0 || activeScans != 0) {
+                credit = 0L;
+            } else {
+                credit = scope == null ? POOL.creditBytes(availableNowBytes) : POOL.creditBytes(scope, availableNowBytes);
+            }
         }
         if (credit > 0L && residentSetExcessBytes() > credit) {
             return 0L;
         }
         return credit;
+    }
+
+    /**
+     * The identity of the scans that filled the retained pool, as
+     * {@link Scope#key()} spells it ({@code kind:table:columns}), or
+     * {@code "none"} before the first admission. Reported as
+     * {@code admission.retained_scope} in {@code GET /_lance/stats}, so
+     * an operator can tell which scan the {@code retained_bytes} figure
+     * would be credited to.
+     */
+    public static String retainedScope() {
+        Scope scope;
+        synchronized (LOCK) {
+            scope = POOL.scope();
+        }
+        return scope == null ? "none" : scope.key();
     }
 
     /**
@@ -874,15 +988,28 @@ public final class ScanAdmission {
      * {@code multi_match} across every {@link LanceFtsQuery} and every
      * clause of a Lance boolean or boost query: Lance runs one search
      * per clause, each over the whole index, and joins their results)
-     * and how many of those clauses are phrases, each of which reads
-     * the positions of its tokens' postings.
+     * how many of those clauses are phrases, each of which reads the
+     * positions of its tokens' postings, and the columns the clauses
+     * search (each column has its own inverted index; the set names the
+     * document sets the scan rebuilds, which is what the retained pool
+     * keys the scan's identity on).
      */
-    public record Shape(boolean hasFtsClause, boolean unbounded, long boundedScanRows, int clauses, int phraseClauses) {
+    public record Shape(boolean hasFtsClause, boolean unbounded, long boundedScanRows, int clauses, int phraseClauses, Set<
+        String> columns) {
 
         /** A query tree without a full-text clause; never gated. */
-        public static final Shape NONE = new Shape(false, false, 0L, 0, 0);
+        public static final Shape NONE = new Shape(false, false, 0L, 0, 0, Set.of());
 
-        /** A shape of one non phrase clause (a single {@code match}). */
+        public Shape {
+            columns = columns == null ? Set.of() : Set.copyOf(columns);
+        }
+
+        /** A shape whose columns are not named. */
+        public Shape(boolean hasFtsClause, boolean unbounded, long boundedScanRows, int clauses, int phraseClauses) {
+            this(hasFtsClause, unbounded, boundedScanRows, clauses, phraseClauses, Set.of());
+        }
+
+        /** A shape of one non phrase clause (a single {@code match}) whose column is not named. */
         public Shape(boolean hasFtsClause, boolean unbounded, long boundedScanRows) {
             this(hasFtsClause, unbounded, boundedScanRows, hasFtsClause ? 1 : 0, 0);
         }
@@ -928,16 +1055,18 @@ public final class ScanAdmission {
         int phraseClauses = 0;
         boolean unbounded = trackTotalHitsAccurate;
         long boundedScanRows = 0L;
+        Set<String> columns = new HashSet<>();
         for (LanceFtsQuery fts : found) {
             clauses += leafClauses(fts.fullTextQuery());
             phraseClauses += phraseClauses(fts.fullTextQuery());
+            columns.addAll(fts.columns());
             if (fts.scanLimit() == LanceFtsQuery.SCAN_LIMIT_UNBOUNDED) {
                 unbounded = true;
             } else {
                 boundedScanRows = Math.max(boundedScanRows, fts.scanLimit());
             }
         }
-        return new Shape(true, unbounded, unbounded ? 0L : boundedScanRows, Math.max(1, clauses), phraseClauses);
+        return new Shape(true, unbounded, unbounded ? 0L : boundedScanRows, Math.max(1, clauses), phraseClauses, columns);
     }
 
     /**
@@ -1342,6 +1471,29 @@ public final class ScanAdmission {
         return Pattern.compile("(?<![\\w.`])`?" + Pattern.quote(column) + "`?(?![\\w.`])");
     }
 
+    /**
+     * The identity of a {@code kind} scan over {@code table} that
+     * evaluates {@code filterSql}: the indexed columns the filter
+     * references when {@code statistics} name the table's indexed
+     * columns, else the filter's SQL itself, so that without statistics
+     * only the very same filter shares an identity (crediting a
+     * different filter is what the identity exists to prevent). An
+     * empty filter has no columns.
+     */
+    static Scope filterScope(Kind kind, String table, String filterSql, Optional<TableStatistics> statistics) {
+        if (filterSql == null || filterSql.isEmpty()) {
+            return new Scope(kind, table, Set.of());
+        }
+        if (statistics.isEmpty()) {
+            return new Scope(kind, table, Set.of(filterSql));
+        }
+        Set<String> columns = new HashSet<>();
+        for (ColumnStatistics column : referencedIndexedColumns(filterSql, statistics.get())) {
+            columns.add(column.column());
+        }
+        return new Scope(kind, table, columns.isEmpty() ? Set.of(filterSql) : columns);
+    }
+
     /** Whether {@code filterSql} compares {@code column} for equality ({@code column = value}, not {@code !=}, {@code <>}, {@code >=}, {@code <=}). */
     static boolean isEquality(String filterSql, String column) {
         Matcher matcher = Pattern.compile("(?<![\\w.`])`?" + Pattern.quote(column) + "`?\\s*(?<![!<>])=(?!=)").matcher(filterSql);
@@ -1613,7 +1765,7 @@ public final class ScanAdmission {
                 + "or relax lance.admission.headroom / lance.admission.enabled."
             : "Attach the table to a node with a larger index cache, or relax lance.admission.bounded_shapes_gated / "
                 + "lance.admission.headroom / lance.admission.enabled.";
-        judge(Kind.FTS, estimate, 0L, Long.MAX_VALUE, what, remedy, ticket);
+        judge(new Scope(Kind.FTS, indexName, shape.columns()), estimate, 0L, Long.MAX_VALUE, what, remedy, ticket);
     }
 
     /**
@@ -1644,6 +1796,7 @@ public final class ScanAdmission {
         }
         long shardShare = shardShareBytes();
         Optional<TableStatistics> statistics = statisticsOf(dataset);
+        String table = dataset == null ? indexName : dataset.uri();
         double selectivity = statistics.map(s -> filterSelectivity(filterSql, s)).orElse(FILTER_MATCH_RATIO_UNKNOWN);
         Optional<ColumnStatistics.IndexSummary> index = statistics.flatMap(s -> scalarIndexFor(filterSql, s));
         if (index.isPresent()) {
@@ -1664,7 +1817,15 @@ public final class ScanAdmission {
                 + ", against an index cache shard of ["
                 + NativeMemoryLimit.humanReadable(shardShare)
                 + "]";
-            judge(Kind.SCALAR_INDEX, estimate, 0L, heapAvailableBytes, what, filterRemedy(), ticket);
+            judge(
+                filterScope(Kind.SCALAR_INDEX, table, filterSql, statistics),
+                estimate,
+                0L,
+                heapAvailableBytes,
+                what,
+                filterRemedy(),
+                ticket
+            );
         }
         long matching = filterScanMatchingRows(nodeRows, selectivity, boundedRows, !boundedShapesGated);
         long estimate = filterScanEstimateBytes(nodeRows, matching, rowWidthBytes, batchReadahead(), shardShare);
@@ -1683,7 +1844,15 @@ public final class ScanAdmission {
             + "] per matching row plus the batches in flight and the read queue; the per fragment bit sets take ["
             + NativeMemoryLimit.humanReadable(heap)
             + "] of heap";
-        judge(Kind.FILTER_SCAN, estimate, heap, heapAvailableBytes, what, filterRemedy(), ticket);
+        judge(
+            filterScope(Kind.FILTER_SCAN, table, filterSql, statistics),
+            estimate,
+            heap,
+            heapAvailableBytes,
+            what,
+            filterRemedy(),
+            ticket
+        );
     }
 
     /**
@@ -1716,6 +1885,7 @@ public final class ScanAdmission {
         }
         long shardShare = shardShareBytes();
         Optional<TableStatistics> statistics = statisticsOf(dataset);
+        String table = dataset == null ? indexName : dataset.uri();
         boolean filtered = filterSql != null && !filterSql.isEmpty();
         double selectivity = filtered ? statistics.map(s -> filterSelectivity(filterSql, s)).orElse(FILTER_MATCH_RATIO_UNKNOWN) : 1d;
         Optional<ColumnStatistics.IndexSummary> index = filtered ? statistics.flatMap(s -> scalarIndexFor(filterSql, s)) : Optional.empty();
@@ -1732,7 +1902,7 @@ public final class ScanAdmission {
                 + filterSql
                 + "] with selectivity "
                 + String.format(Locale.ROOT, "%.4f", selectivity);
-            judge(Kind.SCALAR_INDEX, estimate, 0L, Long.MAX_VALUE, what, filterRemedy(), null);
+            judge(filterScope(Kind.SCALAR_INDEX, table, filterSql, statistics), estimate, 0L, Long.MAX_VALUE, what, filterRemedy(), null);
         }
         long matching = filterScanMatchingRows(nodeRows, selectivity, fetch, !boundedShapesGated);
         long estimate = filterScanEstimateBytes(nodeRows, matching, rowWidthBytes, batchReadahead(), shardShare);
@@ -1750,7 +1920,7 @@ public final class ScanAdmission {
             + "] per row for the sort columns, plus ["
             + NativeMemoryLimit.humanReadable(FILTER_SCAN_BYTES_PER_MATCHING_ROW)
             + "] per matching row, the batches in flight and the read queue";
-        judge(Kind.FILTER_SCAN, estimate, 0L, Long.MAX_VALUE, what, filterRemedy(), null);
+        judge(filterScope(Kind.FILTER_SCAN, table, filterSql, statistics), estimate, 0L, Long.MAX_VALUE, what, filterRemedy(), null);
     }
 
     private static String filterRemedy() {
@@ -1803,7 +1973,16 @@ public final class ScanAdmission {
             + "]";
         String remedy = "Lower nprobes, attach the table to a node with a larger index cache, or relax lance.admission.headroom / "
             + "lance.admission.enabled.";
-        judge(Kind.VECTOR_INDEX, estimate, 0L, Long.MAX_VALUE, what, remedy, ticket);
+        String table = dataset == null ? indexName : dataset.uri();
+        judge(
+            new Scope(Kind.VECTOR_INDEX, table, column == null ? Set.of() : Set.of(column)),
+            estimate,
+            0L,
+            Long.MAX_VALUE,
+            what,
+            remedy,
+            ticket
+        );
     }
 
     /**
@@ -1836,6 +2015,7 @@ public final class ScanAdmission {
         }
         admitAggregateScan(
             indexName,
+            dataset == null ? indexName : dataset.uri(),
             statisticsOf(dataset),
             filterSql,
             scans,
@@ -1852,10 +2032,39 @@ public final class ScanAdmission {
      * {@link #admitAggregateScan(String, Dataset, String, int, long, long, long, int, long)}
      * with the table's {@code statistics} and the scans'
      * {@code batchReadahead} given, so a test can judge a shape against
-     * hand built statistics on any host.
+     * hand built statistics on any host. The index name stands for the
+     * table in the scan's identity.
      */
     static void admitAggregateScan(
         String indexName,
+        Optional<TableStatistics> statistics,
+        String filterSql,
+        int scans,
+        long scannedRows,
+        long rowWidthBytes,
+        long groups,
+        int metrics,
+        int batchReadahead,
+        long heapAvailableBytes
+    ) {
+        admitAggregateScan(
+            indexName,
+            indexName,
+            statistics,
+            filterSql,
+            scans,
+            scannedRows,
+            rowWidthBytes,
+            groups,
+            metrics,
+            batchReadahead,
+            heapAvailableBytes
+        );
+    }
+
+    private static void admitAggregateScan(
+        String indexName,
+        String table,
         Optional<TableStatistics> statistics,
         String filterSql,
         int scans,
@@ -1888,7 +2097,15 @@ public final class ScanAdmission {
                     + filterSql
                     + "] with selectivity "
                     + String.format(Locale.ROOT, "%.4f", selectivity);
-                judge(Kind.SCALAR_INDEX, estimate, 0L, heapAvailableBytes, what, filterRemedy(), null);
+                judge(
+                    filterScope(Kind.SCALAR_INDEX, table, filterSql, statistics),
+                    estimate,
+                    0L,
+                    heapAvailableBytes,
+                    what,
+                    filterRemedy(),
+                    null
+                );
             }
             rows = (long) (scannedRows * selectivity);
             // The index result is evaluated over the whole table before
@@ -1926,7 +2143,7 @@ public final class ScanAdmission {
             + "] of heap";
         String remedy = "Lower lance.aggregation.pushdown_parallelism, spread the table over more data nodes, or relax "
             + "lance.admission.headroom / lance.admission.enabled.";
-        judge(Kind.AGGREGATE_SCAN, estimate, heap, heapAvailableBytes, what, remedy, null);
+        judge(filterScope(Kind.AGGREGATE_SCAN, table, filterSql, statistics), estimate, heap, heapAvailableBytes, what, remedy, null);
     }
 
     /**
@@ -1947,8 +2164,9 @@ public final class ScanAdmission {
     }
 
     /**
-     * Judge the metadata warm up's full text probe over a table of
-     * {@code rows} physical rows: the {@link Kind#FTS} estimate of
+     * Judge the metadata warm up's full text probe of {@code column}'s
+     * inverted index over {@code indexName}, a table of {@code rows}
+     * physical rows: the {@link Kind#FTS} estimate of
      * {@link #WARM_UP_PROBE_SHAPE}, the same formula a request's
      * bounded page is judged on, recorded under {@link Source#WARM_UP}.
      * Nothing is thrown: the warm up has no caller to answer 429 to, so
@@ -1958,9 +2176,10 @@ public final class ScanAdmission {
      * calling thread like a ticketless request: the caller brackets the
      * probe's scan with {@link #scanStarted} and {@link #scanFinished}
      * and ends it with {@link #requestEnded()}, so what the probe leaves
-     * behind is credited to the retained pool.
+     * behind is credited to the retained pool under the identity a
+     * request's full text scan of that column over that index has.
      */
-    public static Decision admitWarmUpProbe(long rows) {
+    public static Decision admitWarmUpProbe(String indexName, String column, long rows) {
         long shardShare = shardShareBytes();
         long estimate = ftsEstimateBytes(
             rows,
@@ -1969,7 +2188,8 @@ public final class ScanAdmission {
             scanBufferEstimateBytes(rows, WARM_UP_PROBE_SHAPE),
             shardShare
         );
-        return judge(Kind.FTS, Source.WARM_UP, estimate, 0L, Long.MAX_VALUE, null);
+        Scope scope = new Scope(Kind.FTS, indexName, column == null ? Set.of() : Set.of(column));
+        return judge(scope, Source.WARM_UP, estimate, 0L, Long.MAX_VALUE, null);
     }
 
     /**
@@ -1978,7 +2198,7 @@ public final class ScanAdmission {
      * admission in flight.
      */
     private static void judge(
-        Kind kind,
+        Scope scope,
         long estimateBytes,
         long heapEstimateBytes,
         long heapAvailableBytes,
@@ -1986,29 +2206,31 @@ public final class ScanAdmission {
         String remedy,
         LanceHitsAccounting ticket
     ) {
-        Decision decision = judge(kind, Source.REQUEST, estimateBytes, heapEstimateBytes, heapAvailableBytes, ticket);
+        Decision decision = judge(scope, Source.REQUEST, estimateBytes, heapEstimateBytes, heapAvailableBytes, ticket);
         if (!decision.admitted()) {
-            throw rejection(kind, decision, heapAvailableBytes, headroomBytes, what, remedy);
+            throw rejection(scope.kind(), decision, heapAvailableBytes, headroomBytes, what, remedy);
         }
     }
 
     /**
      * Judge one path from {@code source}: read the available memory and
-     * the credit, decide, record the estimate, kind and source, count a
-     * refusal under the kind, and count an admitted non zero estimate in
-     * flight. Returns the decision; the caller answers a refusal as its
-     * source requires.
+     * the credit the pool grants a scan of {@code scope} (nothing unless
+     * the pool was filled by scans of that identity), decide, record the
+     * estimate, kind and source, count a refusal under the kind, and
+     * count an admitted non zero estimate in flight. Returns the
+     * decision; the caller answers a refusal as its source requires.
      */
     private static Decision judge(
-        Kind kind,
+        Scope scope,
         Source source,
         long estimateBytes,
         long heapEstimateBytes,
         long heapAvailableBytes,
         LanceHitsAccounting ticket
     ) {
+        Kind kind = scope.kind();
         long availableNow = readAvailableMemoryNow();
-        long credit = retainedCreditBytes(availableNow);
+        long credit = retainedCreditBytes(scope, availableNow);
         Decision decision = decide(estimateBytes, heapEstimateBytes, availableNow, heapAvailableBytes, enabled, headroomBytes, credit);
         LAST_ESTIMATE_BYTES.set(decision.estimateBytes());
         LAST_KIND.set(kind);
@@ -2018,7 +2240,7 @@ public final class ScanAdmission {
             return decision;
         }
         if (decision.estimateBytes() > 0L) {
-            countInFlight(availableNow, decision.estimateBytes(), ticket);
+            countInFlight(scope, availableNow, decision.estimateBytes(), ticket);
         }
         return decision;
     }
@@ -2028,9 +2250,14 @@ public final class ScanAdmission {
      * a ticket already counted (an earlier path of the same request)
      * adds nothing; a thread whose previous ticketless request never
      * reported its end is released by this admission. The pool samples
-     * its before reading when this is the only request in flight.
+     * its before reading, under {@code scope}, when this is the only
+     * request in flight. A later ticketless path of the request this
+     * thread already admitted (a filter's index load followed by its
+     * scan, told apart from a request that never ended by the pool
+     * still awaiting the scan it sampled) leaves the sample and the
+     * identity with the first path and only raises the pool's bound.
      */
-    private static void countInFlight(long availableNow, long estimateBytes, LanceHitsAccounting ticket) {
+    private static void countInFlight(Scope scope, long availableNow, long estimateBytes, LanceHitsAccounting ticket) {
         if (ticket != null && ticket.markAdmitted() == false) {
             return;
         }
@@ -2040,9 +2267,14 @@ public final class ScanAdmission {
                 // The previous request on this thread never reported
                 // its end; do not let it hold the pool shut.
                 inFlight = Math.max(0, inFlight - 1);
+                if (inFlight == 0 && POOL.awaitingCompletion()) {
+                    POOL.pathAdmitted(estimateBytes);
+                    inFlight++;
+                    return;
+                }
             }
             if (inFlight == 0) {
-                POOL.scanAdmitted(availableNow, residentNow, estimateBytes);
+                POOL.scanAdmitted(scope, availableNow, residentNow, estimateBytes);
             }
             inFlight++;
         }

@@ -479,7 +479,7 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
                 // judged like a request's full text page. Refused, the
                 // probe is skipped: no request waits for it, and the
                 // first real full text query is gated on its own.
-                ScanAdmission.Decision decision = ScanAdmission.admitWarmUpProbe(tableRows);
+                ScanAdmission.Decision decision = ScanAdmission.admitWarmUpProbe(task.indexName, column, tableRows);
                 if (!decision.admitted()) {
                     String reason = "estimate ["
                         + NativeMemoryLimit.humanReadable(decision.estimateBytes())
