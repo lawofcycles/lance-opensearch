@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -379,12 +380,12 @@ public class LanceWarmCacheTests extends OpenSearchTestCase {
             }
         }, getTestName() + "-closer");
         closer.start();
-        assertBusy(() -> assertEquals("close is waiting for the lease", Thread.State.TIMED_WAITING, closer.getState()));
+        assertBusy(() -> assertEquals("close has begun and retired what it will close", 0, cache.snapshotCount()));
+        assertTrue("close is waiting for the lease", closer.isAlive());
         assertTrue("close retires what it will close", snapshot.isRetired());
         assertTrue("a snapshot nobody holds waits with the rest", idle.isRetired());
         assertFalse("the held snapshot's dataset stays open while the lease is out", snapshot.isClosed());
         assertFalse(snapshot.dataset().getFragments().isEmpty());
-        assertEquals("no lease is handed out once close has begun", 0, cache.snapshotCount());
         IllegalStateException refused = expectThrows(IllegalStateException.class, () -> acquire(UUID_A, Optional.of(snapshot.version())));
         assertTrue(refused.getMessage(), refused.getMessage().contains("closed"));
 
@@ -410,6 +411,50 @@ public class LanceWarmCacheTests extends OpenSearchTestCase {
         held.release();
         assertEquals(0, snapshot.refCount());
         assertEquals("the release after the forced close does not close the snapshot a second time", 1L, cache.snapshotCloseCount());
+        cache = null;
+    }
+
+    public void testCloseDuringABuildRefusesTheSnapshotAndClosesItsDataset() throws Exception {
+        // An acquire that passed the guard at its top is building a
+        // snapshot when close() runs. close() empties the map and closes
+        // only what it took out, so the build must not be filed after it:
+        // nothing would close that dataset. The acquire is refused and
+        // closes what it built.
+        CountDownLatch built = new CountDownLatch(1);
+        CountDownLatch closeReturned = new CountDownLatch(1);
+        cache.beforePublish(() -> {
+            built.countDown();
+            try {
+                assertTrue(closeReturned.await(30, TimeUnit.SECONDS));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError(e);
+            }
+        });
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        AtomicReference<IllegalStateException> refused = new AtomicReference<>();
+        Thread acquirer = new Thread(() -> {
+            try (Lease lease = acquire(UUID_A, Optional.empty())) {
+                failure.set(new AssertionError("a lease was handed out after close: " + lease.snapshot().key()));
+            } catch (IllegalStateException e) {
+                refused.set(e);
+            } catch (Throwable t) {
+                failure.set(t);
+            }
+        }, getTestName() + "-acquirer");
+        acquirer.start();
+        assertTrue("the build reached the publish", built.await(30, TimeUnit.SECONDS));
+        assertEquals(1L, cache.snapshotBuildCount());
+        cache.close();
+        closeReturned.countDown();
+        acquirer.join(TimeUnit.SECONDS.toMillis(30));
+        assertFalse(acquirer.isAlive());
+        assertNull(failure.get());
+        assertNotNull("the acquire was refused", refused.get());
+        assertTrue(refused.get().getMessage(), refused.get().getMessage().contains("closed"));
+        assertEquals("the built snapshot was not filed", 0, cache.snapshotCount());
+        assertEquals("the dataset the build opened was closed", 1L, cache.snapshotCloseCount());
+        assertEquals(0, cache.buildLockCount());
         cache = null;
     }
 

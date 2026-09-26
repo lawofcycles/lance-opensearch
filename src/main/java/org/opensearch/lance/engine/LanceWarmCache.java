@@ -438,6 +438,9 @@ public final class LanceWarmCache implements Closeable {
     private final Map<SnapshotKey, Snapshot> snapshots = new LinkedHashMap<>();
     /** Serialises the build of one snapshot key so concurrent first requests open the table once; see {@link BuildLock}. */
     private final Map<SnapshotKey, BuildLock> buildLocks = new ConcurrentHashMap<>();
+    // Runs on the acquiring thread between building a snapshot and
+    // filing it in the map; a test hook to hold that gap open.
+    private volatile Runnable beforePublish = () -> {};
     private final AtomicLong datasetOpens = new AtomicLong();
     private final AtomicLong snapshotBuilds = new AtomicLong();
     private final AtomicLong snapshotHits = new AtomicLong();
@@ -530,6 +533,11 @@ public final class LanceWarmCache implements Closeable {
         LancePrimaryKeyType pkType,
         LanceOverrides overrides
     ) throws IOException {
+        // Refused before anything is touched: the clone lookup below can
+        // retire snapshots, and close() has taken the cache over.
+        if (closed) {
+            throw new IllegalStateException("the snapshot cache is closed");
+        }
         // node_local placement: read this node's shallow clone instead of
         // the source. The version the caller resolved refers to the
         // source's manifest chain; the clone was created at that version
@@ -552,9 +560,6 @@ public final class LanceWarmCache implements Closeable {
                 storageOptions = StorageOptions.empty();
                 version = Optional.empty();
             }
-        }
-        if (closed) {
-            throw new IllegalStateException("the snapshot cache is closed");
         }
         if (!enabled) {
             Dataset dataset = openDataset(tableUri, storageOptions, version);
@@ -617,12 +622,25 @@ public final class LanceWarmCache implements Closeable {
                     dataset.close();
                     throw e;
                 }
-                List<Snapshot> evicted;
+                beforePublish.run();
+                List<Snapshot> evicted = List.of();
+                boolean refused;
                 synchronized (this) {
-                    built.refCount.incrementAndGet();
-                    built.lastAccessNanos = System.nanoTime();
-                    snapshots.put(key, built);
-                    evicted = evictOverflow();
+                    // close() may have run since the guard at the top: it
+                    // has emptied the map and closes only what it took
+                    // out, so a snapshot put here now would keep its
+                    // dataset open with nothing to close it.
+                    refused = closed;
+                    if (!refused) {
+                        built.refCount.incrementAndGet();
+                        built.lastAccessNanos = System.nanoTime();
+                        snapshots.put(key, built);
+                        evicted = evictOverflow();
+                    }
+                }
+                if (refused) {
+                    closeSnapshot(built);
+                    throw new IllegalStateException("the snapshot cache is closed");
                 }
                 closeAll(evicted);
                 prefetchTableStatistics(dataset, tableUri, storageOptions);
@@ -650,6 +668,15 @@ public final class LanceWarmCache implements Closeable {
     /** Snapshot keys whose build monitor is held or waited for right now, for tests. */
     int buildLockCount() {
         return buildLocks.size();
+    }
+
+    /**
+     * Test hook: {@code hook} runs on the acquiring thread after a
+     * snapshot is built and before it is filed in the map, so a test can
+     * close the cache in that gap. Set before the acquire starts.
+     */
+    void beforePublish(Runnable hook) {
+        this.beforePublish = hook;
     }
 
     /**
