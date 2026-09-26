@@ -80,6 +80,8 @@ public final class TableStatisticsCache {
     private final AtomicLong hits = new AtomicLong();
     private final AtomicLong misses = new AtomicLong();
     private final AtomicLong collectMillisTotal = new AtomicLong();
+    /** Collections that threw; the key is released and the next lookup collects again. */
+    private final AtomicLong failures = new AtomicLong();
     /** Milliseconds a collection waits before it reads the table; a test hook, zero on a real node. */
     private volatile long collectDelayMillis;
 
@@ -171,7 +173,12 @@ public final class TableStatisticsCache {
         } catch (RuntimeException e) {
             // Statistics are an input to plan quality, not to
             // correctness: the requests keep planning without them and
-            // the next lookup tries again.
+            // the next lookup tries again. The counter is what tells an
+            // operator that the collections keep failing (a table that
+            // moved, revoked credentials): a permanent failure is a
+            // counter that keeps climbing while the miss counter alone
+            // also climbs on legitimate misses.
+            failures.incrementAndGet();
             LOGGER.warn("table statistics of {} could not be collected; requests plan without them", key, e);
         } finally {
             pending.remove(key);
@@ -262,6 +269,11 @@ public final class TableStatisticsCache {
     /** Lookups that found no entry: plans made without statistics. */
     public long missCount() {
         return misses.get();
+    }
+
+    /** Collections that threw and stored nothing; each released its key so the next lookup collects again. */
+    public long failureCount() {
+        return failures.get();
     }
 
     /** Milliseconds spent collecting, summed over every collection; each collection counts at least one. */

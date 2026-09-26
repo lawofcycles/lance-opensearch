@@ -145,6 +145,7 @@ public final class FragmentPlanRefiner {
     private static final LongAdder EXECUTED_PUSHED = new LongAdder();
     private static final LongAdder EXECUTED_ON_LUCENE = new LongAdder();
     private static final LongAdder PRUNED_FRAGMENTS = new LongAdder();
+    private static final LongAdder ZONE_MAP_FAILURES = new LongAdder();
 
     /** Applies the guards to {@code planned}, counting every reason that fired. */
     public Refined refine(FragmentPlan planned, Inputs in) {
@@ -295,6 +296,21 @@ public final class FragmentPlanRefiner {
     /** Fragments this node's executor skipped under zone map pruning since the node started. */
     public static long prunedFragments() {
         return PRUNED_FRAGMENTS.sum();
+    }
+
+    /**
+     * Records that the coordinator on this node could not read the zone
+     * maps of a request's columns and planned that request without
+     * fragment pruning. The answer is unchanged; the scan covers every
+     * fragment.
+     */
+    public static void recordZoneMapFailure() {
+        ZONE_MAP_FAILURES.increment();
+    }
+
+    /** Requests this node coordinated whose zone maps could not be read, so no fragment was pruned, since the node started. */
+    public static long zoneMapFailures() {
+        return ZONE_MAP_FAILURES.sum();
     }
 
     /** Downgrades since the node started, keyed by {@link Reason#statsKey()}, every reason present. */

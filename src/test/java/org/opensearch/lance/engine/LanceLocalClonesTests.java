@@ -5,25 +5,36 @@
 
 package org.opensearch.lance.engine;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 import org.apache.arrow.memory.RootAllocator;
 import org.lance.Dataset;
 import org.opensearch.Version;
+import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.test.ClusterServiceUtils;
 import org.opensearch.test.OpenSearchTestCase;
+import org.opensearch.threadpool.TestThreadPool;
+import org.opensearch.threadpool.ThreadPool;
 
 /**
  * Unit tests of the {@link LanceLocalClones} lifecycle: the marker round
  * trip, clone reuse and re-creation, the forward-only guard of a
- * non-exact {@code ensure}, and directory removal.
+ * non-exact {@code ensure}, directory removal, and the read resolution
+ * that creates a first clone and fails the read when the clone cannot be
+ * resolved.
  */
 @ThreadLeakScope(ThreadLeakScope.Scope.NONE)
 public class LanceLocalClonesTests extends OpenSearchTestCase {
@@ -141,6 +152,99 @@ public class LanceLocalClonesTests extends OpenSearchTestCase {
             assertFalse(source.nodeLocal());
         } finally {
             LanceLocalClones.setInstance(null);
+        }
+    }
+
+    public void testLocateForReadCreatesTheCloneOnFirstContactAndFailsTheReadWhenItCannotResolveIt() throws Exception {
+        ThreadPool threadPool = new TestThreadPool(getTestName());
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(threadPool);
+        try {
+            Path scratch = createTempDir();
+            String sourceUri = LanceTableFactory.writeMultiFragmentTable(scratch, "locate-src", 12, 4);
+            String nodeLocalName = "placement-node-local";
+            String inTableName = "placement-in-table";
+            IndexMetadata nodeLocal = IndexMetadata.builder(nodeLocalName)
+                .settings(
+                    indexSettingsBuilder(nodeLocalName).put(LanceEngineFactory.TABLE_SETTING, sourceUri)
+                        .put(LanceEngineFactory.INDEX_PLACEMENT_SETTING, LanceLocalClones.PLACEMENT_NODE_LOCAL)
+                )
+                .numberOfShards(1)
+                .numberOfReplicas(0)
+                .build();
+            IndexMetadata inTable = IndexMetadata.builder(inTableName)
+                .settings(indexSettingsBuilder(inTableName).put(LanceEngineFactory.TABLE_SETTING, sourceUri))
+                .numberOfShards(1)
+                .numberOfReplicas(0)
+                .build();
+            ClusterState state = ClusterState.builder(clusterService.state())
+                .metadata(Metadata.builder(clusterService.state().metadata()).put(nodeLocal, false).put(inTable, false))
+                .build();
+            ClusterServiceUtils.setState(clusterService, state);
+
+            LanceLocalClones clones = new LanceLocalClones(createTempDir(), clusterService, null);
+            StorageOptions none = StorageOptions.empty();
+
+            // An index without node_local placement, or one this node's
+            // cluster state does not know, reads the source.
+            assertEquals(Optional.empty(), clones.locateForRead(inTable.getIndexUUID(), sourceUri, none, Optional.empty()));
+            assertEquals(Optional.empty(), clones.locateForRead("no-such-uuid", sourceUri, none, Optional.empty()));
+            assertEquals(0L, clones.resolutionFailures());
+
+            // First contact of a node_local index on this node: no clone
+            // exists yet, so one is created (without any search index,
+            // which is the state of a node that joined after the build).
+            Optional<LanceLocalClones.CloneLocation> first = clones.locateForRead(
+                nodeLocal.getIndexUUID(),
+                sourceUri,
+                none,
+                Optional.empty()
+            );
+            assertTrue(first.isPresent());
+            assertTrue("the first contact creates the clone", first.get().recreated());
+            assertTrue(Files.isDirectory(Path.of(first.get().uri())));
+            Optional<LanceLocalClones.CloneLocation> again = clones.locateForRead(
+                nodeLocal.getIndexUUID(),
+                sourceUri,
+                none,
+                Optional.empty()
+            );
+            assertEquals(first.get().uri(), again.orElseThrow().uri());
+            assertFalse(again.get().recreated());
+            assertEquals("a clone that resolves is no failure", 0L, clones.resolutionFailures());
+            assertEquals(Map.of(), clones.resolutionFailuresByIndex());
+
+            // Break the clone directory: a regular file where the index
+            // directory belongs, so neither the marker nor a fresh
+            // versioned directory can be created under it. The read must
+            // fail rather than fall back to the source.
+            clones.delete(nodeLocalName);
+            Path indexDir = clones.rootDir().resolve(nodeLocalName);
+            Files.writeString(indexDir, "not a directory");
+            IOException failure = expectThrows(
+                IOException.class,
+                () -> clones.locateForRead(nodeLocal.getIndexUUID(), sourceUri, none, Optional.empty())
+            );
+            assertTrue(failure.getMessage(), failure.getMessage().contains(nodeLocalName));
+            assertTrue(failure.getMessage(), failure.getMessage().contains(indexDir.toString()));
+            assertTrue(failure.getMessage(), failure.getMessage().contains(sourceUri));
+            assertNotNull("the cause travels with the failure", failure.getCause());
+            assertEquals(1L, clones.resolutionFailures());
+            assertEquals(Map.of(nodeLocalName, 1L), clones.resolutionFailuresByIndex());
+
+            // The same with the version the coordinator resolved shipped
+            // along: every failed resolution counts, per index.
+            expectThrows(IOException.class, () -> clones.locateForRead(nodeLocal.getIndexUUID(), sourceUri, none, Optional.of(1L)));
+            assertEquals(2L, clones.resolutionFailures());
+            assertEquals(Map.of(nodeLocalName, 2L), clones.resolutionFailuresByIndex());
+            assertEquals(
+                "the other index is untouched",
+                Optional.empty(),
+                clones.locateForRead(inTable.getIndexUUID(), sourceUri, none, Optional.empty())
+            );
+            assertEquals(2L, clones.resolutionFailures());
+        } finally {
+            clusterService.close();
+            ThreadPool.terminate(threadPool, 30L, TimeUnit.SECONDS);
         }
     }
 

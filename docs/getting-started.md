@@ -833,7 +833,7 @@ curl -sS localhost:9200/_lance/stats?pretty
         ]
       },
       "plan" : {
-        "statistics" : { "tables" : 1, "collect_millis_total" : 94, "pending" : 0, "planned_without" : 1 },
+        "statistics" : { "tables" : 1, "collect_millis_total" : 94, "pending" : 0, "planned_without" : 1, "failures" : 0 },
         "refinements" : {
           "security_wrapper" : 0,
           "sort_field_type" : 0,
@@ -841,7 +841,7 @@ curl -sS localhost:9200/_lance/stats?pretty
           "column_store_warm" : 0
         },
         "executed" : { "pushed_scan" : 6, "lucene" : 51 },
-        "pruned" : { "fragments" : 0 }
+        "pruned" : { "fragments" : 0, "zone_map_failures" : 0 }
       },
       "fetch" : {
         "take_count" : 57, "take_rows" : 570, "take_columns" : 342,
@@ -868,7 +868,7 @@ How to read it:
   - Each table entry carries the table, the manifest version the warm-up read, the mode it ran under, its `state` (`pending`, `running`, `done`, `failed`, `skipped` for mode `none`, `cancelled` when the index was deleted first), when it started, how long it took, and one entry per Lance index.
   - Each index entry carries `name`, `type`, `column`, `state`, `seconds`, and a `detail` when it failed or was skipped.
 - `plan` is what the node did with the plans the coordinator shipped: `refinements` counts, per reason, the pushed operations the node moved to the Lucene side, and `executed` counts the fragment requests the Lance scan answered against the ones Lucene's collector and aggregators answered. "Aggregations: where they run" below explains the four reasons.
-  - `statistics` is the planner's table statistics cache on the node: `tables` (table versions held), `collect_millis_total` (time spent collecting them), `pending` (collections running in the background right now) and `planned_without` (requests the node planned without statistics because their version was not collected yet).
+  - `statistics` is the planner's table statistics cache on the node: `tables` (table versions held), `collect_millis_total` (time spent collecting them), `pending` (collections running in the background right now), `planned_without` (requests the node planned without statistics because their version was not collected yet) and `failures` (collections that threw; a counter that keeps climbing means the table cannot be read for its statistics at all, and the node's `WARN` log names why).
   - The first request against a freshly attached table on a node that only coordinates is one `planned_without`, and on a table of billions of rows `pending` stays at one for the minutes the collection takes while the requests keep answering.
 - `fetch` counts the `_rowaddr IN (...)` take scans the node ran for the rows behind hits (`stored_fields_takes`, one per leaf that holds a hit of a page) and for the sort or aggregation column of a small full-text or vector hit set (`column_takes`), with the rows and columns they asked for and their wall time. `take_millis_total` set against the `took` of the requests the node served over the same interval says how much of the request time the fetch is.
 - `fetch_cache` is the node's cache of the rows behind hits, per cell and per table version: a page the node fetched before is rendered from it without a take (`rows_served`), and `hits` and `misses` count the cells looked up. The settings are `lance.fetch_cache.enabled`, `size`, `max_entry_size` and `expire`; [features.md](features.md#fetch-cache) has the key and the rules.
@@ -966,7 +966,7 @@ A data node may still move a pushed aggregate (or a pushed page or full text cla
 
 ```json
 "plan" : {
-  "statistics" : { "tables" : 1, "collect_millis_total" : 94, "pending" : 0, "planned_without" : 1 },
+  "statistics" : { "tables" : 1, "collect_millis_total" : 94, "pending" : 0, "planned_without" : 1, "failures" : 0 },
   "refinements" : {
     "security_wrapper" : 0,
     "sort_field_type" : 0,
@@ -974,7 +974,7 @@ A data node may still move a pushed aggregate (or a pushed page or full text cla
     "column_store_warm" : 0
   },
   "executed" : { "pushed_scan" : 6, "lucene" : 51 },
-  "pruned" : { "fragments" : 0 }
+  "pruned" : { "fragments" : 0, "zone_map_failures" : 0 }
 }
 ```
 

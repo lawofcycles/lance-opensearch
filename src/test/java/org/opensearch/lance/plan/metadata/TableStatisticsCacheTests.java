@@ -159,10 +159,12 @@ public class TableStatisticsCacheTests extends OpenSearchTestCase {
             tableUri = dataset.uri();
         }
         Supplier<Dataset> failing = () -> { throw new IllegalStateException("table gone"); };
+        assertEquals(0L, cache.failureCount());
         assertNull(cache.lookup(tableUri, version, failing));
         assertEquals(1, cache.pendingCount());
         executor.runAll();
         assertEquals("the failure released the key", 0, cache.pendingCount());
+        assertEquals("the failure is counted", 1L, cache.failureCount());
         assertEquals(0L, cache.collectCount());
         assertEquals(0, cache.size());
         // The next lookup tries again, with an opener that works.
@@ -170,6 +172,7 @@ public class TableStatisticsCacheTests extends OpenSearchTestCase {
         executor.runAll();
         assertNotNull(cache.peek(tableUri, version));
         assertEquals(1L, cache.collectCount());
+        assertEquals("a collection that worked adds no failure", 1L, cache.failureCount());
     }
 
     public void testBackgroundCollectionOnAnotherThreadWithTheDelayHook() throws Exception {

@@ -52,7 +52,10 @@ import org.opensearch.lance.query.LanceFtsQuery;
  * fragment executors issued for the rows behind hits and for the
  * columns of small hit sets, how many rows and columns they asked for
  * and how long they took. {@code fetch_cache} reads the node's cache of
- * the rows behind hits ({@code LanceFetchCache}).
+ * the rows behind hits ({@code LanceFetchCache}). The failure counters
+ * ({@code local_clones.resolution_failures}, {@code plan.statistics.failures},
+ * {@code plan.pruned.zone_map_failures}) read {@link LanceLocalClones},
+ * the warm cache's table statistics and {@link FragmentPlanRefiner}.
  */
 public final class LanceStatsCollector {
 
@@ -226,6 +229,7 @@ public final class LanceStatsCollector {
             ? LanceNodeStats.RequestCacheStats.NONE
             : requestCache.get();
         LanceNodeStats.FetchCacheStats fetchCacheStats = fetchCache == null ? LanceNodeStats.FetchCacheStats.NONE : fetchCache.get();
+        LanceNodeStats.FailureCounters failureCounters = failureCounters();
         if (warmCache == null) {
             return new LanceNodeStats(
                 false,
@@ -269,7 +273,7 @@ public final class LanceStatsCollector {
                 FragmentPlanRefiner.prunedFragments(),
                 freshnessStats,
                 FetchTakeStats.snapshot()
-            ).withRequestCache(requestCacheStats).withFetchCache(fetchCacheStats);
+            ).withRequestCache(requestCacheStats).withFetchCache(fetchCacheStats).withFailures(failureCounters);
         }
         ColumnStore store = warmCache.columnStore();
         return new LanceNodeStats(
@@ -314,6 +318,27 @@ public final class LanceStatsCollector {
             FragmentPlanRefiner.prunedFragments(),
             freshnessStats,
             FetchTakeStats.snapshot()
-        ).withRequestCache(requestCacheStats).withFetchCache(fetchCacheStats);
+        ).withRequestCache(requestCacheStats).withFetchCache(fetchCacheStats).withFailures(failureCounters);
+    }
+
+    /**
+     * The counters of the paths that fail or fall back without a mark
+     * in the response: the clone resolutions of {@link LanceLocalClones}
+     * (read from the node wide instance, zero when the plugin installed
+     * none), the failed collections of the warm cache's table statistics
+     * (zero without a warm cache) and the zone map reads the coordinator
+     * on this node could not do ({@link FragmentPlanRefiner#zoneMapFailures()}).
+     */
+    private LanceNodeStats.FailureCounters failureCounters() {
+        LanceLocalClones clones = LanceLocalClones.instance();
+        long cloneFailures = clones == null ? 0L : clones.resolutionFailures();
+        Map<String, Long> cloneFailuresByIndex = clones == null ? Map.of() : clones.resolutionFailuresByIndex();
+        long statisticsFailures = warmCache == null ? 0L : warmCache.tableStatistics().failureCount();
+        return new LanceNodeStats.FailureCounters(
+            cloneFailures,
+            cloneFailuresByIndex,
+            statisticsFailures,
+            FragmentPlanRefiner.zoneMapFailures()
+        );
     }
 }
