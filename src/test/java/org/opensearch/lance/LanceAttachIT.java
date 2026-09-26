@@ -8,6 +8,7 @@ package org.opensearch.lance;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Locale;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -49,7 +50,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         // PUT /{index} with index.lance.table would wire the engine
         // without deriving a mapping; the request is rejected and points
         // at POST /_lance/attach instead.
-        String indexName = "rawput-" + randomAlphaOfLength(6).toLowerCase(java.util.Locale.ROOT);
+        String indexName = "rawput-" + randomAlphaOfLength(6).toLowerCase(Locale.ROOT);
         Request create = new Request("PUT", "/" + indexName);
         create.setJsonEntity("{\"settings\":{\"index.lance.table\":\"/tmp/does-not-matter.lance\"}}");
         create.setOptions(create.getOptions().toBuilder().addHeader("Content-Type", "application/json"));
@@ -67,7 +68,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         // the response says the shard reader holds part of it; under a
         // bound of 3 no reader can hold a single fragment and attach is
         // refused. A re-attach of the flagged table reports the flag too.
-        String suffix = "bound-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "bound-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, 12, 4);
@@ -132,7 +133,7 @@ public class LanceAttachIT extends LanceRestTestCase {
     public void testAttachRefusesToClaimPlainIndex() throws IOException {
         // A plain OpenSearch index that already owns the target name must
         // not be reported as already_attached.
-        String indexName = "plain-collision-" + randomAlphaOfLength(6).toLowerCase(java.util.Locale.ROOT);
+        String indexName = "plain-collision-" + randomAlphaOfLength(6).toLowerCase(Locale.ROOT);
         Request create = new Request("PUT", "/" + indexName);
         create.setJsonEntity("{}");
         create.setOptions(create.getOptions().toBuilder().addHeader("Content-Type", "application/json"));
@@ -156,7 +157,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         // Local filesystem tables ignore object-store credentials, so this
         // only checks that storage_options are parsed, persisted under
         // index.lance.storage_options.<key>, and do not break the open.
-        String suffix = "attachso-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "attachso-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 4);
@@ -199,7 +200,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         // the shard, which reads the cluster state directly, still opens
         // the table. Local filesystem tables ignore object store
         // credentials, so the values here are placeholders.
-        String suffix = "attachcred-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "attachcred-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 4);
@@ -255,7 +256,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         // Absent storage_options must not seed any
         // index.lance.storage_options.* setting; callers use the absence
         // to detect that an index carries no per-table options.
-        String suffix = "attachnoso-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "attachnoso-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 2);
@@ -281,7 +282,7 @@ public class LanceAttachIT extends LanceRestTestCase {
     public void testAttachWithPinnedVersionServesSnapshot() throws Exception {
         // Attach the same table as latest and pinned to version 1. The
         // fixture is written in one commit, so both see six rows.
-        String suffix = "tt-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "tt-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 6);
@@ -346,7 +347,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         // deletion file) the next request keys on the new version: it
         // must not serve the previous version's rows or column values,
         // before and after the namespace poll has refreshed the shard.
-        String suffix = "advance-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "advance-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         // 3 fragments of 100 rows; rating = (i * 37) % 1000, null when i % 5 == 4.
@@ -437,7 +438,7 @@ public class LanceAttachIT extends LanceRestTestCase {
     public void testAttachRejectsUnknownTag() throws Exception {
         // The table opens fine but the tag does not exist: a 400 that
         // names the tag, with Lance's own message, not a 500.
-        String suffix = "badtag-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "badtag-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 2);
@@ -463,7 +464,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         // Tag v1 starts at A. An index attached with tag v1 reads six
         // rows; moving v1 to B makes the poll refresh it to ten. A second
         // index pinned to version A must stay at six throughout.
-        String suffix = "tag-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "tag-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 6);
@@ -536,7 +537,7 @@ public class LanceAttachIT extends LanceRestTestCase {
     }
 
     public void testRefsListsTagsAndBranches() throws Exception {
-        String suffix = "refs-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "refs-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 3);
@@ -572,7 +573,7 @@ public class LanceAttachIT extends LanceRestTestCase {
     }
 
     public void testRefsRejectsPlainIndex() throws IOException {
-        String indexName = "plain-refs-" + randomAlphaOfLength(6).toLowerCase(java.util.Locale.ROOT);
+        String indexName = "plain-refs-" + randomAlphaOfLength(6).toLowerCase(Locale.ROOT);
         Request create = new Request("PUT", "/" + indexName);
         create.setJsonEntity("{}");
         create.setOptions(create.getOptions().toBuilder().addHeader("Content-Type", "application/json"));
@@ -627,7 +628,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         // a stale entry would serve rows from the deleted table or fail
         // on a missing _indices file. A string PK table gives GET
         // something to look up.
-        String suffix = "recreate-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "recreate-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         Path tablePath = scratchDir.resolve(tableName + ".lance");
@@ -701,7 +702,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         // multi_fields gives a lance_text column a keyword sub-field
         // backed by the same Lance column. The fixture's body values are
         // all distinct, so a term on body.raw resolves to one hit.
-        String suffix = "multifields-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "multifields-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 6);
@@ -790,7 +791,7 @@ public class LanceAttachIT extends LanceRestTestCase {
     public void testMultiFieldsRejectsInvalidBaseColumn() throws Exception {
         // Non-Utf8 base columns, unknown base columns and non-keyword
         // sub-field types are rejected at attach time.
-        String suffix = "multifieldsbad-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "multifieldsbad-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 4);
@@ -843,7 +844,7 @@ public class LanceAttachIT extends LanceRestTestCase {
     public void testOverridesAcceptsFieldsClause() throws Exception {
         // overrides.<column>.fields accepts the same sub-field declaration
         // as multi_fields and produces the same mapping.
-        String suffix = "overrides-fields-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "overrides-fields-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 6);
@@ -876,7 +877,7 @@ public class LanceAttachIT extends LanceRestTestCase {
     public void testOverridesRejectsUnknownColumnType() throws Exception {
         // Type values outside the accepted set are
         // refused at parse time, naming the accepted set.
-        String suffix = "overrides-type-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "overrides-type-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 4);
@@ -896,7 +897,7 @@ public class LanceAttachIT extends LanceRestTestCase {
     public void testOverridesConflictsWithMultiFieldsRejected() throws Exception {
         // Both clauses declaring sub-fields for the same base column is
         // ambiguous and is refused.
-        String suffix = "overrides-conflict-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);
+        String suffix = "overrides-conflict-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 4);

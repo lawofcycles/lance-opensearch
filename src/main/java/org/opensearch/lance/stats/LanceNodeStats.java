@@ -498,37 +498,20 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         String,
         List<String>> indexTypes, List<LanceMappingMeta.RenamedField> renamedFields, boolean rowsWithheld) implements Writeable {
 
+        /**
+         * Rejects a withheld entry that carries a count, an index type
+         * or a rename: such an entry would emit through the version 11
+         * block what the wrapper hides. Entries are built through
+         * {@link #withheld(String, boolean)} and
+         * {@link #counted(String, long, long, long, boolean, Map, List)}.
+         */
         public IndexReaderStats {
-            if (rowsWithheld) {
-                rows = 0L;
-                shardReaderRows = 0L;
-                nestedDocs = 0L;
-                indexTypes = Map.of();
-                renamedFields = List.of();
+            if (rowsWithheld
+                && (rows != 0L || shardReaderRows != 0L || nestedDocs != 0L || !indexTypes.isEmpty() || !renamedFields.isEmpty())) {
+                throw new IllegalArgumentException(
+                    "a withheld IndexReaderStats carries no rows, index types or renamed fields: index=" + index
+                );
             }
-        }
-
-        public IndexReaderStats(
-            String index,
-            long rows,
-            long shardReaderRows,
-            long nestedDocs,
-            boolean luceneBoundExceeded,
-            Map<String, List<String>> indexTypes
-        ) {
-            this(index, rows, shardReaderRows, nestedDocs, luceneBoundExceeded, indexTypes, List.of(), false);
-        }
-
-        public IndexReaderStats(
-            String index,
-            long rows,
-            long shardReaderRows,
-            long nestedDocs,
-            boolean luceneBoundExceeded,
-            Map<String, List<String>> indexTypes,
-            List<LanceMappingMeta.RenamedField> renamedFields
-        ) {
-            this(index, rows, shardReaderRows, nestedDocs, luceneBoundExceeded, indexTypes, renamedFields, false);
         }
 
         /**
@@ -537,6 +520,19 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
          */
         public static IndexReaderStats withheld(String index, boolean luceneBoundExceeded) {
             return new IndexReaderStats(index, 0L, 0L, 0L, luceneBoundExceeded, Map.of(), List.of(), true);
+        }
+
+        /** The entry of an unwrapped index, with the counts, index types and renames it reports. */
+        public static IndexReaderStats counted(
+            String index,
+            long rows,
+            long shardReaderRows,
+            long nestedDocs,
+            boolean luceneBoundExceeded,
+            Map<String, List<String>> indexTypes,
+            List<LanceMappingMeta.RenamedField> renamedFields
+        ) {
+            return new IndexReaderStats(index, rows, shardReaderRows, nestedDocs, luceneBoundExceeded, indexTypes, renamedFields, false);
         }
 
         /** Reads the base layout, which carries no flag: the entry of an unwrapped index. */

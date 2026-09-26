@@ -219,7 +219,7 @@ public final class TransportLanceStatsAction extends TransportNodesAction<
                         indexService.getMetadata().mapping()
                     );
                     stats.add(
-                        new LanceNodeStats.IndexReaderStats(
+                        LanceNodeStats.IndexReaderStats.counted(
                             shard.shardId().getIndexName(),
                             rows,
                             shardReaderRows,

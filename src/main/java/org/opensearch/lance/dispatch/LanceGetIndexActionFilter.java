@@ -42,11 +42,17 @@ public final class LanceGetIndexActionFilter implements ActionFilter {
 
     private final SettingsFilter settingsFilter = new SettingsFilter(StorageOptions.SENSITIVE_INDEX_SETTING_PATTERNS);
 
+    /**
+     * After the security plugin's filter ({@code Integer.MIN_VALUE}),
+     * which authorises the request this filter only reshapes the answer
+     * of, and after {@code LanceClearCacheActionFilter}
+     * ({@code Integer.MIN_VALUE + 100}); the two Lance filters act on
+     * different actions, the distinct value only keeps their order
+     * explicit.
+     */
     @Override
     public int order() {
-        // After the security plugin's filter (Integer.MIN_VALUE), which
-        // authorises the request this filter only reshapes the answer of.
-        return Integer.MIN_VALUE + 100;
+        return Integer.MIN_VALUE + 101;
     }
 
     @Override

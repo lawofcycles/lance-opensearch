@@ -100,7 +100,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 )
             ),
             List.of(
-                new LanceNodeStats.IndexReaderStats(
+                LanceNodeStats.IndexReaderStats.counted(
                     "big",
                     3_000_000_000L,
                     2_000_000_000L,
@@ -109,7 +109,15 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     Map.of(),
                     List.of(new LanceMappingMeta.RenamedField("ts", "event_ts", 1))
                 ),
-                new LanceNodeStats.IndexReaderStats("small", 120L, 120L, 14L, false, Map.of("rating", List.of("BTree", "Bitmap"))),
+                LanceNodeStats.IndexReaderStats.counted(
+                    "small",
+                    120L,
+                    120L,
+                    14L,
+                    false,
+                    Map.of("rating", List.of("BTree", "Bitmap")),
+                    List.of()
+                ),
                 LanceNodeStats.IndexReaderStats.withheld("wrapped", false)
             ),
             List.of(new LanceNodeStats.LocalCloneStats("cloned", 4321L, 9L)),
@@ -539,7 +547,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
     private static List<LanceNodeStats.IndexReaderStats> unflagged(List<LanceNodeStats.IndexReaderStats> indices) {
         return indices.stream()
             .map(
-                index -> new LanceNodeStats.IndexReaderStats(
+                index -> LanceNodeStats.IndexReaderStats.counted(
                     index.index(),
                     index.rows(),
                     index.shardReaderRows(),
@@ -799,18 +807,36 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
         }
     }
 
-    public void testWithheldIndexReaderStatsCarryNoCounts() {
-        LanceNodeStats.IndexReaderStats withheld = new LanceNodeStats.IndexReaderStats(
-            "wrapped",
-            5L,
-            4L,
-            1L,
-            true,
-            Map.of("rating", List.of("BTree")),
-            List.of(new LanceMappingMeta.RenamedField("a", "b", 1)),
-            true
+    public void testWithheldIndexReaderStatsRejectsCounts() {
+        // A withheld entry that carries what the wrapper hides is a
+        // programming error, not something to zero out silently.
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> new LanceNodeStats.IndexReaderStats("wrapped", 5L, 4L, 1L, true, Map.of(), List.of(), true)
         );
-        assertEquals(LanceNodeStats.IndexReaderStats.withheld("wrapped", true), withheld);
+        assertTrue(e.getMessage(), e.getMessage().contains("wrapped"));
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> new LanceNodeStats.IndexReaderStats("wrapped", 0L, 0L, 0L, true, Map.of("rating", List.of("BTree")), List.of(), true)
+        );
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> new LanceNodeStats.IndexReaderStats(
+                "wrapped",
+                0L,
+                0L,
+                0L,
+                true,
+                Map.of(),
+                List.of(new LanceMappingMeta.RenamedField("a", "b", 1)),
+                true
+            )
+        );
+    }
+
+    public void testWithheldIndexReaderStatsCarryNoCounts() {
+        LanceNodeStats.IndexReaderStats withheld = LanceNodeStats.IndexReaderStats.withheld("wrapped", true);
+        assertTrue(withheld.rowsWithheld());
         assertEquals(0L, withheld.rows());
         assertEquals(0L, withheld.shardReaderRows());
         assertEquals(0L, withheld.nestedDocs());
