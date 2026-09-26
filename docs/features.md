@@ -44,7 +44,12 @@ Distribution over the cluster is automatic: fragments are spread over every data
   - The plugin's security policy grants the read under `~/.aws` only.
   - The policy resolves `~` from the JVM's `user.home` while the SDK resolves it from the `HOME` variable, so the two must agree, as they do on a standard install.
 
-  An Iceberg namespace registers an Iceberg REST catalog holding Lance tables (tables whose `table_type` property is `lance`). `config` carries the property names the Iceberg implementation reads, `endpoint` (required), `auth_token` (a static bearer), `credential` (an OAuth client id and secret pair), `connect_timeout` / `read_timeout` / `max_retries`, plus the two keys the plugin itself reads for the poll.
+  An Iceberg namespace registers an Iceberg REST catalog holding Lance tables, the tables whose `table_type` property is `lance`. `config` carries the property names the Iceberg implementation reads, plus the two keys the plugin itself reads for the poll (below).
+
+  - `endpoint`: the catalog endpoint, required.
+  - `auth_token`: a static bearer token.
+  - `credential`: an OAuth client id and secret pair.
+  - `connect_timeout` / `read_timeout` / `max_retries`: the client's timeouts and retry count.
 
   - `warehouse` (required): the warehouse whose namespaces are listed, the first level of every table id.
   - `max_namespace_depth`: how many namespace levels below the warehouse the poll descends, default 2.
@@ -61,7 +66,14 @@ Distribution over the cluster is automatic: fragments are spread over every data
   {"type": "polaris", "name": "pol-a", "config": {"endpoint": "https://polaris.example.com", "warehouse": "mycatalog", "auth_token": "..."}}
   ```
 
-  A Unity namespace registers a Unity Catalog. `config` carries the property names the Unity implementation reads: `endpoint` (required), `catalog` (required), `auth_token`, `api_path` (default `/api/2.1/unity-catalog`), `connect_timeout` / `read_timeout` / `max_retries`, and `storage.*` entries forwarded as storage properties. Unity's namespace shape is the fixed two-level `catalog.schema` and the poll walks the catalog's schemas without extra config. Tables whose `table_type` property is `lance` surface under their table name:
+  A Unity namespace registers a Unity Catalog. Unity's namespace shape is the fixed two-level `catalog.schema` and the poll walks the catalog's schemas without extra config. Tables whose `table_type` property is `lance` surface under their table name. `config` carries the property names the Unity implementation reads:
+
+  - `endpoint`: the Unity endpoint, required.
+  - `catalog`: the Unity catalog whose schemas are walked, required.
+  - `auth_token`: a bearer token for the endpoint.
+  - `api_path`: the REST prefix, default `/api/2.1/unity-catalog`.
+  - `connect_timeout` / `read_timeout` / `max_retries`: the client's timeouts and retry count.
+  - `storage.*`: entries forwarded as storage properties.
 
   ```json
   POST /_lance/namespace
