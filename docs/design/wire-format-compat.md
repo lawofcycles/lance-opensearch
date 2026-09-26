@@ -116,6 +116,7 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 | | 3 | Block, optional: whether the result cache would serve the body and the reason when not (optional `cacheable`, `reason`; fallback absent) |
 | `LanceFragmentQueryRequest` | 1 | Base: table URI, index name, storage options, pinned version, the fragment plan, optional query and post filter, sorts, search after, size, aggregations, fragment ids, track scores, track total hits up to, min score, terminate after, hit projection, rescores, collapse |
 | `LanceFragmentQueryResponse` | 1 | Base: matched, matched is lower bound, fragment count, hits, row addresses, aggregations, terminated early |
+| | 2 | Block, optional: the executor's profile (query and fetch phase milliseconds, take scans, rows addressed, take milliseconds; five counters, fallback zero) |
 | `LanceNodeStats` | 1 | Base: every figure of the node stats but the pruned fragment counter and the admission source, then the freshness stats |
 | | 2 | Block, optional: pruned fragment counter (fallback zero) |
 | | 3 | Block, optional: source of the last admission decision (`request` or `warm_up`; fallback `none`) |

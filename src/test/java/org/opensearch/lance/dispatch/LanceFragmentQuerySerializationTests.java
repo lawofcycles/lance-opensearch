@@ -23,6 +23,7 @@ import org.opensearch.index.query.InnerHitBuilder;
 import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.WireVersion;
 import org.opensearch.lance.WireVersionTestSupport;
 import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.search.SearchHit;
@@ -501,6 +502,87 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         }
     }
 
+    public void testResponseProfileRoundTrip() throws Exception {
+        LanceFragmentQueryResponse.Profile profile = new LanceFragmentQueryResponse.Profile(12L, 3L, 4L, 47L, 9L);
+        LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(2L, false, 1, List.of(), new long[0], null, null, profile);
+        LanceFragmentQueryResponse restored;
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            original.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                restored = new LanceFragmentQueryResponse(in);
+                assertEquals("the reader consumed the block", -1, in.read());
+            }
+        }
+        assertEquals(profile, restored.profile());
+        assertEquals(
+            "a response built without timings reports none",
+            LanceFragmentQueryResponse.Profile.NONE,
+            new LanceFragmentQueryResponse(2L, false, 1, List.of(), new long[0], null).profile()
+        );
+        assertEquals(
+            new LanceFragmentQueryResponse.Profile(13L, 5L, 5L, 50L, 10L),
+            profile.plus(new LanceFragmentQueryResponse.Profile(1L, 2L, 1L, 3L, 1L))
+        );
+    }
+
+    public void testMixedPluginVersionAVersion1CoordinatorReadsTodaysResponseWithoutTheProfile() throws Exception {
+        LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(
+            2L,
+            false,
+            1,
+            List.of(),
+            new long[0],
+            null,
+            Boolean.TRUE,
+            new LanceFragmentQueryResponse.Profile(12L, 3L, 4L, 47L, 9L)
+        );
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            original.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                LanceFragmentQueryResponse asVersion1 = LanceFragmentQueryResponse.read(in, 1);
+                assertEquals(2L, asVersion1.matched());
+                assertEquals(Boolean.TRUE, asVersion1.terminatedEarly());
+                assertEquals("the block it does not know is stepped over", LanceFragmentQueryResponse.Profile.NONE, asVersion1.profile());
+                assertEquals("the reader consumed the block", -1, in.read());
+            }
+        }
+    }
+
+    public void testMixedPluginVersionTodaysCoordinatorReadsAVersion1NodesResponse() throws Exception {
+        // The stream a version 1 data node writes: today's base fields
+        // and no block at all.
+        LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(
+            2L,
+            false,
+            1,
+            List.of(),
+            new long[0],
+            null,
+            null,
+            new LanceFragmentQueryResponse.Profile(12L, 3L, 4L, 47L, 9L)
+        );
+        int blockBytes;
+        try (BytesStreamOutput block = new BytesStreamOutput()) {
+            WireVersion.writeBlock(block, false, original.profile());
+            blockBytes = block.bytes().length();
+        }
+        try (BytesStreamOutput today = new BytesStreamOutput(); BytesStreamOutput version1 = new BytesStreamOutput()) {
+            original.writeTo(today);
+            try (StreamInput in = today.bytes().streamInput()) {
+                assertEquals(LanceFragmentQueryResponse.WIRE_VERSION, in.readVInt());
+                byte[] rest = in.readAllBytes();
+                version1.writeVInt(1);
+                version1.writeBytes(rest, 0, rest.length - blockBytes);
+            }
+            try (StreamInput in = version1.bytes().streamInput()) {
+                LanceFragmentQueryResponse restored = new LanceFragmentQueryResponse(in);
+                assertEquals(2L, restored.matched());
+                assertEquals("the profile falls back to zero", LanceFragmentQueryResponse.Profile.NONE, restored.profile());
+                assertEquals(-1, in.read());
+            }
+        }
+    }
+
     public void testResponseStreamOpensWithTheWireVersionAndANewerOptionalBlockIsSteppedOver() throws Exception {
         LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(2L, false, 1, List.of(), new long[0], null);
         try (BytesStreamOutput out = new BytesStreamOutput()) {
@@ -509,8 +591,8 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
                 assertEquals(LanceFragmentQueryResponse.WIRE_VERSION, in.readVInt());
             }
         }
-        // The stream a version 2 data node would write back to a version
-        // 1 coordinator: today's fields and one optional block.
+        // The stream a version 3 data node would write back to a version
+        // 2 coordinator: today's fields and one optional block.
         BytesReference newer = WireVersionTestSupport.asNextVersion(
             original,
             WireVersionTestSupport.NO_PRELUDE,
