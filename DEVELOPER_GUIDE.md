@@ -141,6 +141,8 @@ Unit tests are the `*Tests` classes under `src/test/java`, extending `OpenSearch
 
 Gradle only runs test classes whose names end in `Tests` or `IT`. The `testingConventions` precommit check reports a class that has test methods but another suffix, so it cannot be skipped silently. Shared base classes end in `TestCase` (`LanceRestTestCase`).
 
+Background work that must stay off the request path (table statistics collection, index warm-up, the freshness check) starts with `assert LanceCoordinatorThreads.notOnCoordinator()`, and both the test JVM and the test clusters run with `-ea`. An `AssertionError` from that assert in any test means a thread pool wiring regression put the work on the `lance_coordinator` pool; fix the wiring, do not weaken the test.
+
 ### Running one test class
 
 Pass `--tests` with the fully qualified class name (method names can follow after a dot):

@@ -15,6 +15,7 @@ import org.lance.FragmentStatistics;
 import org.lance.index.Index;
 import org.lance.index.IndexType;
 import org.lance.schema.LanceField;
+import org.opensearch.lance.dispatch.LanceCoordinatorThreads;
 import org.opensearch.lance.plan.metadata.ColumnStatistics.IndexSummary;
 import org.opensearch.lance.plan.metadata.TableStatistics.FragmentStats;
 
@@ -78,6 +79,7 @@ public final class TableStatisticsCollector {
 
     /** Collect the statistics of {@code dataset} at its current version. */
     public static TableStatistics collect(Dataset dataset) {
+        assert LanceCoordinatorThreads.notOnCoordinator() : LanceCoordinatorThreads.message("table statistics collection");
         long startNanos = System.nanoTime();
         long version = dataset.version();
 

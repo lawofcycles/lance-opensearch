@@ -43,6 +43,7 @@ import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.dispatch.LanceCoordinatorThreads;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.query.ScanAdmission;
 
@@ -375,6 +376,7 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
     }
 
     private void warm(Task task) {
+        assert LanceCoordinatorThreads.notOnCoordinator() : LanceCoordinatorThreads.message("index warm-up");
         if (task.cancelled.get() || closed) {
             task.finish(State.CANCELLED);
             return;
