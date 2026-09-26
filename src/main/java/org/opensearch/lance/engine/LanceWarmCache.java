@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -18,8 +19,10 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -360,15 +363,32 @@ public final class LanceWarmCache implements Closeable {
             return closed.get();
         }
 
-        private void closeNow() {
-            if (closed.compareAndSet(false, true)) {
-                try {
-                    dataset.close();
-                } catch (RuntimeException e) {
-                    LOGGER.warn("failed to close the dataset of snapshot {}", key, e);
-                }
+        /** Marks the snapshot closed; true for the one caller that gets to release what it holds. */
+        private boolean markClosed() {
+            return closed.compareAndSet(false, true);
+        }
+
+        private void closeDataset() {
+            try {
+                dataset.close();
+            } catch (RuntimeException e) {
+                LOGGER.warn("failed to close the dataset of snapshot {}", key, e);
             }
         }
+    }
+
+    /**
+     * The monitor the builds of one snapshot key serialise on, and how
+     * many acquires hold or wait for it. The entry leaves
+     * {@link #buildLocks} with its last user, so the map does not grow
+     * with every version a table has been read at; it is not taken out
+     * while a build is under way, because a second monitor for the same
+     * key would let two acquires build the same version and file one
+     * over the other.
+     */
+    private static final class BuildLock {
+        /** Guarded by the {@link #buildLocks} compute of the entry's key. */
+        int users;
     }
 
     /**
@@ -408,14 +428,23 @@ public final class LanceWarmCache implements Closeable {
     private final Executor executor;
     private final int maxSnapshots;
     private volatile boolean enabled;
+    /** Set by {@link #close}; an acquire from then on is refused instead of building a snapshot nothing will close. */
+    private volatile boolean closed;
+    /** The snapshots that were still leased when {@link #close} began and are yet to be released. Guarded by {@code this}. */
+    private final Set<Snapshot> leasedAtClose = Collections.newSetFromMap(new IdentityHashMap<>());
+    /** One count per snapshot in {@link #leasedAtClose}; its last release counts down. Guarded by {@code this}. */
+    private CountDownLatch leasedAtCloseGone;
     /** Guarded by {@code this}. */
     private final Map<SnapshotKey, Snapshot> snapshots = new LinkedHashMap<>();
-    /** Serialises the build of one snapshot key so concurrent first requests open the table once. */
-    private final Map<SnapshotKey, Object> buildLocks = new ConcurrentHashMap<>();
+    /** Serialises the build of one snapshot key so concurrent first requests open the table once; see {@link BuildLock}. */
+    private final Map<SnapshotKey, BuildLock> buildLocks = new ConcurrentHashMap<>();
     private final AtomicLong datasetOpens = new AtomicLong();
     private final AtomicLong snapshotBuilds = new AtomicLong();
     private final AtomicLong snapshotHits = new AtomicLong();
     private final AtomicLong snapshotCloses = new AtomicLong();
+
+    /** How long {@link #close} waits for the requests that still hold a lease before their datasets are closed under them. */
+    static final long CLOSE_WAIT_MILLIS = 60_000L;
 
     /**
      * A cache whose table statistics are collected, and whose fetch cache
@@ -524,6 +553,9 @@ public final class LanceWarmCache implements Closeable {
                 version = Optional.empty();
             }
         }
+        if (closed) {
+            throw new IllegalStateException("the snapshot cache is closed");
+        }
         if (!enabled) {
             Dataset dataset = openDataset(tableUri, storageOptions, version);
             Snapshot transientSnapshot;
@@ -569,32 +601,55 @@ public final class LanceWarmCache implements Closeable {
         // latest manifest and its version becomes the key.
         Dataset dataset = openDataset(tableUri, storageOptions, resolved >= 0 ? Optional.of(resolved) : Optional.empty());
         SnapshotKey key = new SnapshotKey(indexUuid, dataset.version());
-        Object lock = buildLocks.computeIfAbsent(key, k -> new Object());
-        synchronized (lock) {
-            Snapshot existing = lease(key);
-            if (existing != null) {
-                dataset.close();
-                snapshotHits.incrementAndGet();
-                return new Lease(existing);
+        BuildLock lock = enterBuildLock(key);
+        try {
+            synchronized (lock) {
+                Snapshot existing = lease(key);
+                if (existing != null) {
+                    dataset.close();
+                    snapshotHits.incrementAndGet();
+                    return new Lease(existing);
+                }
+                Snapshot built;
+                try {
+                    built = build(key, dataset, pkField, pkType, overrides, true);
+                } catch (IOException | RuntimeException e) {
+                    dataset.close();
+                    throw e;
+                }
+                List<Snapshot> evicted;
+                synchronized (this) {
+                    built.refCount.incrementAndGet();
+                    built.lastAccessNanos = System.nanoTime();
+                    snapshots.put(key, built);
+                    evicted = evictOverflow();
+                }
+                closeAll(evicted);
+                prefetchTableStatistics(dataset, tableUri, storageOptions);
+                return new Lease(built);
             }
-            Snapshot built;
-            try {
-                built = build(key, dataset, pkField, pkType, overrides, true);
-            } catch (IOException | RuntimeException e) {
-                dataset.close();
-                throw e;
-            }
-            List<Snapshot> evicted;
-            synchronized (this) {
-                built.refCount.incrementAndGet();
-                built.lastAccessNanos = System.nanoTime();
-                snapshots.put(key, built);
-                evicted = evictOverflow();
-            }
-            closeAll(evicted);
-            prefetchTableStatistics(dataset, tableUri, storageOptions);
-            return new Lease(built);
+        } finally {
+            leaveBuildLock(key);
         }
+    }
+
+    /** The monitor the builds of {@code key} serialise on, counted as in use until {@link #leaveBuildLock}. */
+    private BuildLock enterBuildLock(SnapshotKey key) {
+        return buildLocks.compute(key, (k, lock) -> {
+            BuildLock held = lock == null ? new BuildLock() : lock;
+            held.users++;
+            return held;
+        });
+    }
+
+    /** Lets go of the monitor of {@code key}; the last user takes the entry out of the map. */
+    private void leaveBuildLock(SnapshotKey key) {
+        buildLocks.computeIfPresent(key, (k, lock) -> --lock.users == 0 ? null : lock);
+    }
+
+    /** Snapshot keys whose build monitor is held or waited for right now, for tests. */
+    int buildLockCount() {
+        return buildLocks.size();
     }
 
     /**
@@ -701,6 +756,10 @@ public final class LanceWarmCache implements Closeable {
             if (closeIt && snapshot.cached) {
                 snapshots.remove(snapshot.key, snapshot);
             }
+            if (remaining == 0 && leasedAtClose.remove(snapshot)) {
+                // close() is waiting for this lease to go.
+                leasedAtCloseGone.countDown();
+            }
         }
         if (closeIt) {
             closeSnapshot(snapshot);
@@ -740,7 +799,7 @@ public final class LanceWarmCache implements Closeable {
     }
 
     private void closeSnapshot(Snapshot snapshot) {
-        if (snapshot.isClosed()) {
+        if (!snapshot.markClosed()) {
             return;
         }
         if (snapshot.cached && !keyServedByAnother(snapshot)) {
@@ -748,7 +807,7 @@ public final class LanceWarmCache implements Closeable {
             releaseTableStatistics(snapshot);
             releaseFetchEntries(snapshot);
         }
-        snapshot.closeNow();
+        snapshot.closeDataset();
         snapshotCloses.incrementAndGet();
         LOGGER.debug("closed snapshot {}", snapshot.key);
     }
@@ -760,7 +819,12 @@ public final class LanceWarmCache implements Closeable {
      * cells only take room from the versions that are served. The drop
      * runs on the executor, not on the thread that released the last
      * lease: that is a request thread in the middle of its response, and
-     * a version holds an entry per cell it fetched.
+     * a version holds an entry per cell it fetched. Before it drops, the
+     * runnable asks again whether another snapshot serves the key: one
+     * may have been built for the same version between the schedule and
+     * the run (the version was asked for again right after its eviction,
+     * or after the cache went off and on), and the cells it has stored
+     * since are its to keep.
      */
     private void releaseFetchEntries(Snapshot snapshot) {
         if (fetchCache == null) {
@@ -769,6 +833,10 @@ public final class LanceWarmCache implements Closeable {
         String indexUuid = snapshot.key.indexUuid();
         long version = snapshot.version();
         Runnable drop = () -> {
+            if (keyServedByAnother(snapshot)) {
+                LOGGER.debug("fetch cache entries of {} kept: the version is served by a newer snapshot", snapshot.key);
+                return;
+            }
             try {
                 int dropped = fetchCache.invalidate(indexUuid, version);
                 if (dropped > 0) {
@@ -942,15 +1010,55 @@ public final class LanceWarmCache implements Closeable {
         return snapshotCloses.get();
     }
 
+    /**
+     * Closes every snapshot, then the table statistics and the column
+     * store. A snapshot that a request still holds a lease on is given
+     * up to {@link #CLOSE_WAIT_MILLIS} in total to be released, because
+     * closing its dataset pulls the JNI handle from under a scan that is
+     * still reading it; one that is still held after that is closed
+     * anyway, with a warning that names it. No lease is handed out from
+     * the moment this is called: the held snapshots are retired and
+     * taken out of the map, and {@link #acquire} refuses.
+     */
     @Override
     public void close() {
+        close(CLOSE_WAIT_MILLIS);
+    }
+
+    /** {@link #close()} with its own bound on the wait for leased snapshots, for tests. */
+    void close(long waitMillis) {
         List<Snapshot> toClose;
+        CountDownLatch leased;
         synchronized (this) {
+            closed = true;
             toClose = new ArrayList<>(snapshots.values());
             snapshots.clear();
+            for (Snapshot snapshot : toClose) {
+                snapshot.retired.set(true);
+                if (snapshot.refCount() > 0) {
+                    leasedAtClose.add(snapshot);
+                }
+            }
+            leased = new CountDownLatch(leasedAtClose.size());
+            leasedAtCloseGone = leased;
+        }
+        // The release of a held snapshot closes it (it is retired); wait
+        // for those releases, then close whatever is left: the snapshots
+        // nobody held and the ones whose requests outlasted the wait.
+        try {
+            leased.await(waitMillis, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
         for (Snapshot snapshot : toClose) {
-            snapshot.retired.set(true);
+            if (snapshot.refCount() > 0) {
+                LOGGER.warn(
+                    "snapshot {} is still held by {} request(s) after {} ms; closing its dataset under them",
+                    snapshot.key,
+                    snapshot.refCount(),
+                    waitMillis
+                );
+            }
             closeSnapshot(snapshot);
         }
         tableStatistics.clear();
