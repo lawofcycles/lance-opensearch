@@ -4,6 +4,11 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    # Every Monday 03:00 UTC: the snapshot lanes below build against the
+    # next two OpenSearch minors. Weekly is enough to notice an API drift.
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
 
 concurrency:
   group: build-${{ github.ref }}
@@ -11,19 +16,16 @@ concurrency:
 
 jobs:
   build:
-    # One lane per OpenSearch version. The release lane (3.8.0, the
-    # version the plugin declares) is the required check; the two snapshot
-    # lanes build against the next minors so an API drift shows up here
-    # before the release ships, and continue-on-error keeps them from
-    # blocking a pull request.
+    # The release lane: the OpenSearch version the plugin declares. This is
+    # the required check of a pull request and the only lane that runs on
+    # every pull request and on every push to main.
     name: build (${{ matrix.opensearch }})
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
-      fail-fast: false
       matrix:
-        opensearch: ['3.8.0', '3.9.0-SNAPSHOT', '3.10.0-SNAPSHOT']
-    continue-on-error: ${{ endsWith(matrix.opensearch, '-SNAPSHOT') }}
+        opensearch: ['3.8.0']
     steps:
       - uses: actions/checkout@v4
 
@@ -33,12 +35,17 @@ jobs:
           java-version: 21
 
       - uses: gradle/actions/setup-gradle@v4
+        with:
+          # Only the main build writes the dependency cache; a pull request
+          # reads it. Otherwise every run of every branch adds an entry and
+          # the 10 GB cache evicts the ones main needs.
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
 
       - name: Build, precommit, unit, integTest, multiNodeIntegTest
         run: ./gradlew --no-daemon --console=plain build -Dopensearch.version=${{ matrix.opensearch }}
 
       - name: Upload test results
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: test-results-${{ matrix.opensearch }}
@@ -46,4 +53,43 @@ jobs:
             build/test-results/**/TEST-*.xml
             build/testclusters/*/logs/*.log
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 3
+
+  snapshot:
+    # The snapshot lanes: the next two minors, weekly and on demand. A
+    # failure here points at an API drift in an upcoming OpenSearch and is
+    # worth reading; it never blocks a pull request.
+    name: build (${{ matrix.opensearch }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        opensearch: ['3.9.0-SNAPSHOT', '3.10.0-SNAPSHOT']
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: true
+
+      - name: Build, precommit, unit, integTest, multiNodeIntegTest
+        run: ./gradlew --no-daemon --console=plain build -Dopensearch.version=${{ matrix.opensearch }}
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.opensearch }}
+          path: |
+            build/test-results/**/TEST-*.xml
+            build/testclusters/*/logs/*.log
+          if-no-files-found: ignore
+          retention-days: 3
