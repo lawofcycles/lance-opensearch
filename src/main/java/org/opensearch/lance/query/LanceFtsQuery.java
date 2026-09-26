@@ -173,7 +173,13 @@ public final class LanceFtsQuery extends Query {
      * <p>Callers that only need the top {@code size} hits (pure FTS
      * shape with no sort, no aggregations, no post_filter) pass that
      * value here and let Lance's inverted-index scorer stop scoring
-     * once it has enough score-sorted rows. This is the direct
+     * once it has enough score-sorted rows. Under a
+     * {@code track_total_hits} bound the fragment executor widens the
+     * value to {@code max(size, bound + 1)}: the collector still keeps
+     * the top {@code size} rows by score, and the number of rows the
+     * scan returned decides {@code hits.total} (exact when the scan
+     * came back short, a lower bound when it filled), so the page and
+     * the count come from one scan. This is the direct
      * counterpart of {@link
      * org.opensearch.lance.query.LanceScanFilterQuery#scanLimit()}
      * for FTS: {@code LanceScanFilterQuery} clips at the level of
@@ -615,6 +621,21 @@ public final class LanceFtsQuery extends Query {
         }
 
         /**
+         * The scan limit of the query this Weight was built for:
+         * {@link #SCAN_LIMIT_UNBOUNDED} or the most rows its bounded
+         * scan returns. When a bounded scan is not {@link #complete()}
+         * it returned that many rows, so {@link #hitCount()} is at
+         * least the limit, and together with {@link #complete()} being
+         * false the executor's own matches are shown to exceed the
+         * limit; the count path reads the limit off here to decide
+         * whether that proves a {@code track_total_hits} bound was
+         * passed.
+         */
+        public int scanLimit() {
+            return query().scanLimit();
+        }
+
+        /**
          * The {@link ScanOptions} of every Lance scan this Weight has
          * issued, in order; empty before the first leaf is scored.
          * For tests of the scan plan.
@@ -814,6 +835,7 @@ public final class LanceFtsQuery extends Query {
             throws IOException {
             long returned = 0L;
             try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
+                accounting.ftsScanIssued();
                 while (reader.loadNextBatch()) {
                     cancellation.checkCancelled();
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();

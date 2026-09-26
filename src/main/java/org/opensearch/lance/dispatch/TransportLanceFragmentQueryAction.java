@@ -1091,7 +1091,11 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     takes.takeCount(),
                     takes.takeRows(),
                     takes.takeMillis(),
-                    takes.takeColumns()
+                    takes.takeColumns(),
+                    // Every Lance full text scan of the request counted
+                    // on the searcher's accounting: the Weights' hits
+                    // scans and the count-only scans of computeMatched.
+                    LanceHitsAccounting.of(searcher).ftsScans()
                 );
                 if (LOGGER.isDebugEnabled()) {
                     LOGGER.debug(
@@ -1228,7 +1232,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      *       prefilter: Lance evaluates the scalar predicate before the
      *       inverted-index or nearest lookup instead of Lucene
      *       intersecting two full scans. A plain FTS clause takes the
-     *       scan limit {@link #resolveScanFilterTopK} allows; a boosted
+     *       scan limit {@link #resolveScanFilterTopK} allows, widened
+     *       by {@link #widenForTrackTotalHits} so one scan serves the
+     *       page and its bounded count; a boosted
      *       one stays unbounded like the unplanned boosted path.</li>
      *   <li>{@link FragmentPlan#scalarFilter()} — the planner spelled the
      *       whole top-level query tree for Lance (bool / term / terms
@@ -1268,7 +1274,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         // match, so the scan stays unbounded and the Lucene collector
         // does the clipping after the liveDocs are applied.
         int scanLimit = hasSecurityWrapper ? LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED : resolveScanFilterTopK(request);
-        int ftsScanLimit = scanLimit == LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED ? LanceFtsQuery.SCAN_LIMIT_UNBOUNDED : scanLimit;
+        int ftsScanLimit = scanLimit == LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED
+            ? LanceFtsQuery.SCAN_LIMIT_UNBOUNDED
+            : widenForTrackTotalHits(scanLimit, request.trackTotalHitsUpTo());
         if (plan.lanceClause() != null) {
             Query clause = plan.lanceClause().toQuery(qsc);
             if (clause instanceof LanceFtsQuery fts) {
@@ -1400,6 +1408,32 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             return LanceScanFilterQuery.SCAN_LIMIT_UNBOUNDED;
         }
         return size;
+    }
+
+    /**
+     * The limit of a bounded full text page's Lance scan: the page's
+     * {@code pageLimit} widened to {@code trackTotalHitsUpTo + 1} rows
+     * when the request counts under a bound (the default 10,000 or the
+     * body's integer). The collector keeps the top {@code pageLimit}
+     * rows by score as before; the rows the scan returned then settle
+     * {@code hits.total} in {@link PlanExecutor#computeMatched}, exact
+     * when the scan came back short and a lower bound when it filled,
+     * so the count needs no second scan of the inverted index. Lance
+     * rebuilds the index's document set on every full text scan, which
+     * is what made the count-only scan cost as much as the page.
+     *
+     * <p>{@code track_total_hits: true} keeps the page limit: its exact
+     * count runs the count-only scan whatever the page scan returned.
+     * {@code track_total_hits: false} keeps it too, as no count is
+     * reported. The widened limit is what the admission gate sees as
+     * the scan's rows, so its buffer estimate charges the widened scan.
+     */
+    static int widenForTrackTotalHits(int pageLimit, int trackTotalHitsUpTo) {
+        if (trackTotalHitsUpTo == SearchContext.TRACK_TOTAL_HITS_ACCURATE || trackTotalHitsUpTo < 0) {
+            // track_total_hits: true, or false (TRACK_TOTAL_HITS_DISABLED).
+            return pageLimit;
+        }
+        return Math.max(pageLimit, trackTotalHitsUpTo + 1);
     }
 
     /**

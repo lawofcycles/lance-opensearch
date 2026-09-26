@@ -22,7 +22,9 @@ import org.opensearch.core.rest.RestStatus;
  * executor's query and fetch timings and the take scans of the request,
  * a {@code size: 0} request issues no take, a page does, the columns the
  * takes project follow the body's {@code _source} and {@code fields},
- * and an answer from the result cache says so instead.
+ * a bounded full text page runs one Lance scan for its hits and its
+ * count ({@code query.fts_scans}), and an answer from the result cache
+ * says so instead.
  */
 public class LanceProfileIT extends LanceRestTestCase {
 
@@ -220,6 +222,85 @@ public class LanceProfileIT extends LanceRestTestCase {
                 client().performRequest(new Request("DELETE", "/" + index));
             } catch (Exception ignored) {}
         }
+    }
+
+    public void testABoundedFullTextPageRunsOneLanceScanForThePageAndTheCount() throws Exception {
+        // Two fragments of 10,000 rows on one node: hello matches every
+        // row (20,000, above the default bound of 10,000), sp7 matches
+        // 32 rows (below it). The executor holds every fragment, so its
+        // hits scan is one whole table scan whose limit is the page
+        // widened to bound + 1 rows; the rows it returned settle the
+        // count, and no count only scan follows.
+        try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(2, 10_000, "profilefts")) {
+            String index = fixture.indexName();
+            String nodeId = localNodeId();
+            String hello = "\"query\":{\"match\":{\"body\":\"hello\"}}";
+            String sp7 = "\"query\":{\"match\":{\"body\":\"sp7\"}}";
+
+            // The default bound over a match set above it: the page is
+            // the top ten of the widened scan, the count is the bound
+            // with gte, and the executor ran one full text scan.
+            String bounded = readAll(postJson("/" + index + "/_search", "{\"size\":10,\"profile\":true," + hello + "}"));
+            assertEquals(bounded, 10, hitsOf(bounded).size());
+            assertEquals(bounded, 10_000, extractIntPath(bounded, "hits", "total", "value"));
+            assertEquals(bounded, "gte", totalRelation(bounded));
+            assertEquals("one scan served the page and the count: " + bounded, 1L, ftsScans(bounded, nodeId));
+
+            // An explicit bound below the match count: the same, at that bound.
+            String narrow = readAll(
+                postJson("/" + index + "/_search", "{\"size\":10,\"profile\":true,\"track_total_hits\":20," + hello + "}")
+            );
+            assertEquals(narrow, 10, hitsOf(narrow).size());
+            assertEquals(narrow, 20, extractIntPath(narrow, "hits", "total", "value"));
+            assertEquals(narrow, "gte", totalRelation(narrow));
+            assertEquals("one scan under an explicit bound: " + narrow, 1L, ftsScans(narrow, nodeId));
+
+            // The default bound over a match set below it: the widened
+            // scan comes back short of its limit, so the count is exact
+            // from the same scan.
+            String below = readAll(postJson("/" + index + "/_search", "{\"size\":10,\"profile\":true," + sp7 + "}"));
+            assertEquals(below, 10, hitsOf(below).size());
+            assertEquals(below, 32, extractIntPath(below, "hits", "total", "value"));
+            assertEquals(below, "eq", totalRelation(below));
+            assertEquals("one scan, exact count from it: " + below, 1L, ftsScans(below, nodeId));
+
+            // track_total_hits: true keeps the exact count path: the page
+            // scan of ten rows and a count only scan of the whole match set.
+            String exact = readAll(
+                postJson("/" + index + "/_search", "{\"size\":10,\"profile\":true,\"track_total_hits\":true," + hello + "}")
+            );
+            assertEquals(exact, 10, hitsOf(exact).size());
+            assertEquals(exact, 20_000, extractIntPath(exact, "hits", "total", "value"));
+            assertEquals(exact, "eq", totalRelation(exact));
+            assertEquals("the page scan and the count only scan: " + exact, 2L, ftsScans(exact, nodeId));
+
+            // track_total_hits: false: the page scan alone, no hits.total.
+            String disabled = readAll(
+                postJson("/" + index + "/_search", "{\"size\":10,\"profile\":true,\"track_total_hits\":false," + hello + "}")
+            );
+            assertEquals(disabled, 10, hitsOf(disabled).size());
+            assertFalse("no hits.total: " + disabled, disabled.contains("\"total\":{"));
+            assertEquals("the page scan alone: " + disabled, 1L, ftsScans(disabled, nodeId));
+
+            // size 0 under the default bound: no page scan, so the count
+            // only scan stopped at bound + 1 rows is the one scan.
+            String countOnly = readAll(postJson("/" + index + "/_search", "{\"size\":0,\"profile\":true," + hello + "}"));
+            assertEquals(countOnly, 10_000, extractIntPath(countOnly, "hits", "total", "value"));
+            assertEquals(countOnly, "gte", totalRelation(countOnly));
+            assertEquals("the count only scan alone: " + countOnly, 1L, ftsScans(countOnly, nodeId));
+        }
+    }
+
+    /** {@code profile.lance.nodes.<nodeId>.query.fts_scans} of {@code body}. */
+    private static long ftsScans(String body, String nodeId) throws Exception {
+        return number(section(lanceNode(parseJson(body), nodeId), "query").get("fts_scans"));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String totalRelation(String body) throws Exception {
+        Map<String, Object> total = (Map<String, Object>) ((Map<String, Object>) parseJson(body).get("hits")).get("total");
+        assertNotNull("hits.total is present: " + body, total);
+        return (String) total.get("relation");
     }
 
     @SuppressWarnings("unchecked")

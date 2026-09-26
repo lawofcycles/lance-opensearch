@@ -135,11 +135,14 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 assertTrue("expected the opt-out setting in the message: " + body, body.contains("lance.admission.bounded_shapes_gated"));
 
                 // The estimate carries the page's own scan buffer: 16
-                // rows at 52 bytes for the document set plus the top-k
-                // page of 5 rows at 12 bytes, doubled: 832 + 120.
+                // rows at 52 bytes for the document set plus the page
+                // scan, widened from the top-k of 5 to the default
+                // track_total_hits bound plus one (10,001 rows, so the
+                // count comes from the same scan), at 12 bytes per row,
+                // doubled: 832 + 240,024.
                 Map<String, Object> admission = admissionStats();
                 assertTrue(admission.toString(), rejections(admission, "fts") >= 1L);
-                assertEquals(admission.toString(), 16L * 52L + 120L, ((Number) admission.get("last_estimate_bytes")).longValue());
+                assertEquals(admission.toString(), 16L * 52L + 10_001L * 24L, ((Number) admission.get("last_estimate_bytes")).longValue());
 
                 // Opting bounded shapes out restores the pass-through
                 // for the page while the unbounded shape stays gated.
