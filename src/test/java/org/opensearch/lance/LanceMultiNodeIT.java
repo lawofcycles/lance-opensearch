@@ -338,9 +338,14 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         // A hit is answered by the coordinating node alone: no per node
         // request leaves it and its took stays in the single digit
         // milliseconds however many data nodes the miss fanned out to.
-        // The following index reads the table's version before the
-        // lookup; the pinned index knows it from its settings and is
-        // looked up before the table is opened.
+        // What a hit opens is read off snapshots.dataset_open_count of
+        // the coordinating node, which counts the coordinator's own open
+        // next to the executors' snapshot builds: the following index
+        // opens the table once per hit to learn its version, the pinned
+        // index knows the version from its settings and is looked up
+        // before the table is opened, so a hit on it opens nothing. The
+        // miss on either index opens the table, which keeps the counter
+        // itself honest.
         String suffix = "mn-rchit-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -364,16 +369,23 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             HttpHost host = getClusterHosts().get(0);
             try (RestClient pinned = buildClient(restClientSettings(), new HttpHost[] { host })) {
                 String nodeId = localNodeId(pinned);
+                int repeats = 5;
                 for (String indexName : new String[] { following, pinnedIndex }) {
+                    long opensPerHit = indexName.equals(pinnedIndex) ? 0L : 1L;
                     Map<String, Object> before = requestCacheOf(nodeId);
+                    Map<String, Object> snapshotsBefore = snapshotsOf(nodeId);
                     long executedBefore = LanceRestTestCase.fragmentRequestsExecuted();
                     String miss = readAll(post(pinned, "/" + indexName + "/_search", body));
                     assertEquals(15.0d, extractDoublePath(miss, "aggregations", "s", "value"), 0.0d);
                     long executedAfterMiss = LanceRestTestCase.fragmentRequestsExecuted();
                     assertTrue("the miss fanned out: " + executedBefore + " -> " + executedAfterMiss, executedAfterMiss > executedBefore);
                     assertEquals(counter(before, "misses") + 1, counter(requestCacheOf(nodeId), "misses"));
+                    Map<String, Object> snapshotsAfterMiss = snapshotsOf(nodeId);
+                    assertTrue(
+                        indexName + ": the miss opened the table on the coordinator: " + snapshotsBefore + " -> " + snapshotsAfterMiss,
+                        counter(snapshotsAfterMiss, "dataset_open_count") > counter(snapshotsBefore, "dataset_open_count")
+                    );
 
-                    int repeats = 5;
                     long fastest = Long.MAX_VALUE;
                     for (int i = 0; i < repeats; i++) {
                         String hit = readAll(post(pinned, "/" + indexName + "/_search", body));
@@ -387,6 +399,17 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                         indexName + ": a hit sends no per node request",
                         executedAfterMiss,
                         LanceRestTestCase.fragmentRequestsExecuted()
+                    );
+                    Map<String, Object> snapshotsAfterHits = snapshotsOf(nodeId);
+                    assertEquals(
+                        indexName + ": a hit opens the table " + opensPerHit + " times on the coordinator",
+                        counter(snapshotsAfterMiss, "dataset_open_count") + opensPerHit * repeats,
+                        counter(snapshotsAfterHits, "dataset_open_count")
+                    );
+                    assertEquals(
+                        indexName + ": a hit builds no snapshot",
+                        counter(snapshotsAfterMiss, "snapshot_build_count"),
+                        counter(snapshotsAfterHits, "snapshot_build_count")
                     );
                     logger.info("--> {}: fastest of {} result cache hits took {} ms", indexName, repeats, fastest);
                     assertTrue(indexName + ": a hit is answered by the coordinator alone, fastest took " + fastest + " ms", fastest <= 10L);
@@ -411,13 +434,22 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     /** The {@code request_cache} object of {@code nodeId} in {@code GET /_lance/stats}. */
-    @SuppressWarnings("unchecked")
     private static Map<String, Object> requestCacheOf(String nodeId) throws IOException {
+        return statsBlockOf(nodeId, "request_cache");
+    }
+
+    /** The {@code snapshots} object of {@code nodeId} in {@code GET /_lance/stats}. */
+    private static Map<String, Object> snapshotsOf(String nodeId) throws IOException {
+        return statsBlockOf(nodeId, "snapshots");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> statsBlockOf(String nodeId, String block) throws IOException {
         Map<String, Object> parsed = parse(readAll(client().performRequest(new Request("GET", "/_lance/stats/" + nodeId))));
         Map<String, Object> nodes = (Map<String, Object>) parsed.get("nodes");
         Map<String, Object> node = (Map<String, Object>) nodes.get(nodeId);
         assertNotNull("stats of " + nodeId + ": " + parsed, node);
-        return (Map<String, Object>) node.get("request_cache");
+        return (Map<String, Object>) node.get(block);
     }
 
     private static long counter(Map<String, Object> block, String key) {

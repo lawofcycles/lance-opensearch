@@ -171,7 +171,11 @@ public class LanceStatsIT extends LanceRestTestCase {
             Map<String, Object> after = nodeStats();
             assertEquals("GET, _count and _search read one snapshot", 1, snapshots(after).get("count"));
             assertEquals("none of them built a snapshot", builds, number(snapshots(after).get("snapshot_build_count")));
-            assertEquals("none of them opened a dataset through the cache", opens, number(snapshots(after).get("dataset_open_count")));
+            assertEquals(
+                "GET opened nothing; _count and _search each opened the table once on the coordinator",
+                opens + 2,
+                number(snapshots(after).get("dataset_open_count"))
+            );
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + tableName));
