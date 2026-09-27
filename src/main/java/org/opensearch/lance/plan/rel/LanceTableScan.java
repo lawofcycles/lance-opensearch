@@ -392,11 +392,11 @@ public class LanceTableScan extends TableScan implements LanceRel {
      *
      * <p>A scan carrying a pushed aggregate is infinite, at every table
      * size, when the run's {@link CostInputs} forbid the pushed form:
-     * {@code lance.aggregation.pushdown} is off, or the group rows the
+     * {@code plugins.lance.aggregation.pushdown} is off, or the group rows the
      * executor would hold ({@link AggregateProfile#mergedGroups}: the
      * statistics based group estimate, cut to the top-k retention for a
      * single level terms ordered by count or by a metric) exceed
-     * {@code lance.aggregation.pushdown_max_groups} while every key's
+     * {@code plugins.lance.aggregation.pushdown_max_groups} while every key's
      * domain is known ({@link AggregateProfile#groupsKnown}). A domain
      * the statistics cannot answer is guessed as a share of the rows,
      * which would put any large table over the bound regardless of the

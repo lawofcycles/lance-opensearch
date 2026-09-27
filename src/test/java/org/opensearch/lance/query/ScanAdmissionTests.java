@@ -162,7 +162,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
             Long.MAX_VALUE,
             8 * GB,
             "unbounded full text scan over [perf1b]",
-            "Relax lance.admission.headroom / lance.admission.enabled."
+            "Relax plugins.lance.admission.headroom / plugins.lance.admission.enabled."
         );
         assertEquals(CircuitBreaker.Durability.TRANSIENT, rejection.getDurability());
         assertEquals(48 * GB, rejection.getBytesWanted());
@@ -172,8 +172,8 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
             message.startsWith("[" + ScanAdmission.LABEL + "] fts estimate [48gb] exceeds available [0b] minus headroom [8gb]")
         );
         assertTrue(message, message.contains("unbounded full text scan over [perf1b]"));
-        assertTrue(message, message.contains("lance.admission.headroom"));
-        assertTrue(message, message.contains("lance.admission.enabled"));
+        assertTrue(message, message.contains("plugins.lance.admission.headroom"));
+        assertTrue(message, message.contains("plugins.lance.admission.enabled"));
     }
 
     public void testHeapRejectionNamesTheBreakerRoom() {
@@ -228,7 +228,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
             () -> ScanAdmission.admit("demo", 1_000L, bounded)
         );
         assertTrue(rejection.getMessage(), rejection.getMessage().contains("bounded full text page"));
-        assertTrue(rejection.getMessage(), rejection.getMessage().contains("lance.admission.bounded_shapes_gated"));
+        assertTrue(rejection.getMessage(), rejection.getMessage().contains("plugins.lance.admission.bounded_shapes_gated"));
         long expectedEstimate = NativeMemoryLimit.invertedIndexEntryEstimateBytes(1_000L) + ScanAdmission.scanBufferEstimateBytes(
             1_000L,
             bounded
@@ -1695,7 +1695,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
                 + "admitted scans: bounded full text page over [perf1b]: inverted index document set of [48.4gb] plus the prefilter "
                 + "[price >= 100.0] materialising 200000000 row addresses over the whole table at [256b] each against an index cache "
                 + "shard of [8gb] plus the hits scan buffers. Drop the scalar filter, attach the table to a node with a larger index "
-                + "cache, or relax lance.admission.bounded_shapes_gated / lance.admission.headroom / lance.admission.enabled.",
+                + "cache, or relax plugins.lance.admission.bounded_shapes_gated / plugins.lance.admission.headroom / plugins.lance.admission.enabled.",
             rejection.getMessage()
         );
         assertEquals(expected, ScanAdmission.lastEstimateBytes());
@@ -2011,7 +2011,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
                     + "(read queue and batches in flight per scan), against an index cache shard of [8gb]"
             )
         );
-        assertTrue(message, message.contains("Lower lance.fragment_path.parallelism"));
+        assertTrue(message, message.contains("Lower plugins.lance.fragment_path.parallelism"));
         assertEquals(expected, ScanAdmission.lastEstimateBytes());
         assertEquals("column_load", ScanAdmission.lastKind());
         assertEquals("request", ScanAdmission.lastSource());
@@ -2068,8 +2068,8 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
                         + "retained by earlier admitted scans: column load of [embedding] over [perf1b]: 32 parallel scans over "
                         + PERF1B_NODE_ROWS
                         + " rows of [4kb] each (read queue and batches in flight per scan), against an index cache shard of [8gb]. "
-                        + "Lower lance.fragment_path.parallelism, spread the table over more data nodes, or relax "
-                        + "lance.admission.headroom / lance.admission.enabled.; the load runs anyway because the reader carries "
+                        + "Lower plugins.lance.fragment_path.parallelism, spread the table over more data nodes, or relax "
+                        + "plugins.lance.admission.headroom / plugins.lance.admission.enabled.; the load runs anyway because the reader carries "
                         + "no request to refuse"
                 )
             );
@@ -2163,7 +2163,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
                     + "shard of [1gb]"
             )
         );
-        assertTrue(message, message.contains("Narrow _source or fields, or lower size, or relax lance.admission.headroom"));
+        assertTrue(message, message.contains("Narrow _source or fields, or lower size, or relax plugins.lance.admission.headroom"));
         assertEquals(8_272_000_000L, rejection.getBytesWanted());
         assertEquals(8_272_000_000L, ScanAdmission.lastEstimateBytes());
         assertEquals("fetch_take", ScanAdmission.lastKind());

@@ -250,7 +250,7 @@ shape it.
 - The Lance native library reads and writes table files and opens object
   store connections itself, outside the JVM. The agent never sees those
   operations, so no `FilePermission` in the plugin policy widens or
-  narrows what a table URI may point at; `lance.allowed_table_roots` is
+  narrows what a table URI may point at; `plugins.lance.allowed_table_roots` is
   the control. The plugin's own Java file access outside the core grants
   is the read of `/proc/meminfo` by `ScanAdmission` and the AWS SDK's
   read of the process user's `~/.aws/credentials` and `~/.aws/config`

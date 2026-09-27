@@ -39,7 +39,7 @@ public class TransportLanceNamespaceUpdateActionTests extends OpenSearchTestCase
             () -> TransportLanceNamespaceUpdateAction.decideRegister(roots, registered("/other/root"), directoryEntry("/other/root"))
         );
         assertEquals(RestStatus.FORBIDDEN, e.status());
-        assertTrue(e.getMessage(), e.getMessage().contains("lance.allowed_table_roots"));
+        assertTrue(e.getMessage(), e.getMessage().contains("plugins.lance.allowed_table_roots"));
     }
 
     public void testAlreadyRegisteredRootShortCircuitsBeforeExistenceCheck() {

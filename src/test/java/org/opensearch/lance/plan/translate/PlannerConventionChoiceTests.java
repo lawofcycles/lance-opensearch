@@ -101,7 +101,7 @@ public class PlannerConventionChoiceTests extends OpenSearchTestCase {
     }
 
     public void testEveryTranslatedShapeHasALuceneFormWhenThePushdownIsOff() throws IOException {
-        // With lance.aggregation.pushdown off the pushed scan costs
+        // With plugins.lance.aggregation.pushdown off the pushed scan costs
         // infinity for every aggregate, so the planner must find the
         // Lucene operator for every tree the translator accepts; a shape
         // without one would come back as the logical plan, which the

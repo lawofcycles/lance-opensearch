@@ -452,7 +452,7 @@ public final class LanceFragmentSearchContext extends SearchContext {
 
     /**
      * Upper bound on the slices {@link ContextIndexSearcher#slices}
-     * cuts the reader's leaves into: {@code lance.fragment_path.slices}
+     * cuts the reader's leaves into: {@code plugins.lance.fragment_path.slices}
      * as the executor read it for this request. The leaves are Lance
      * fragments, one per leaf, and the stock supplier bundles them into
      * at most this many slices by row count; a reader with fewer leaves

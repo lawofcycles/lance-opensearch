@@ -256,7 +256,7 @@ public class LanceSortIT extends LanceRestTestCase {
             assertEquals(descIds, idsOf(hitsOf(readAll(postJson("/" + index + "/_search", desc + "}")))));
 
             Request disable = new Request("PUT", "/_cluster/settings");
-            disable.setJsonEntity("{\"transient\":{\"lance.cache.enabled\":false}}");
+            disable.setJsonEntity("{\"transient\":{\"plugins.lance.cache.enabled\":false}}");
             client().performRequest(disable);
             try {
                 for (int i = 0; i < shapes.length; i++) {
@@ -268,7 +268,7 @@ public class LanceSortIT extends LanceRestTestCase {
                 }
             } finally {
                 Request enable = new Request("PUT", "/_cluster/settings");
-                enable.setJsonEntity("{\"transient\":{\"lance.cache.enabled\":null}}");
+                enable.setJsonEntity("{\"transient\":{\"plugins.lance.cache.enabled\":null}}");
                 client().performRequest(enable);
             }
         }

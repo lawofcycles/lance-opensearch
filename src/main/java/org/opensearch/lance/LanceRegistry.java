@@ -27,7 +27,7 @@ import org.lance.Session;
  * same table could drive the resident set above 100 GiB even though
  * JVM heap stayed at its configured maximum. The shared Session caps
  * the two caches to the node-level limits configured by
- * {@code lance.native_memory.limit}, and {@link Session#sizeBytes()}
+ * {@code plugins.lance.native_memory.limit}, and {@link Session#sizeBytes()}
  * exposes the current usage to the {@code lance_native} circuit breaker.
  */
 public final class LanceRegistry {
@@ -156,7 +156,7 @@ public final class LanceRegistry {
      * Open a Lance dataset at a specific manifest version. When
      * {@code pinnedVersion} is non-empty, the returned dataset is
      * pinned to that Lance version and will not follow subsequent
-     * appends. An index pinned this way carries {@code index.lance.version},
+     * appends. An index pinned this way carries {@code index.plugins.lance.version},
      * which keeps it out of the freshness checks (see
      * {@code LanceIndexFreshnessService}) so refresh does not race with a
      * manifest advance.

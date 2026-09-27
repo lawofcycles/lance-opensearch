@@ -40,7 +40,7 @@ public class TransportLanceAttachActionTests extends OpenSearchTestCase {
         assertNotNull(warning);
         assertEquals(
             "inverted index of [perf1b] (~48.4gb) may not fit one index cache shard (7.9gb); "
-                + "raise lance.native_memory.limit or lower lance.cache.column_share",
+                + "raise plugins.lance.native_memory.limit or lower plugins.lance.cache.column_share",
             warning
         );
 

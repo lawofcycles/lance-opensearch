@@ -277,12 +277,12 @@ public class LanceExplainIT extends LanceRestTestCase {
         try {
             attach(tableUri);
 
-            // lance.aggregation.pushdown is a cost input: off, the pushed
+            // plugins.lance.aggregation.pushdown is a cost input: off, the pushed
             // scan costs infinity and the Lucene operator answers the
             // shape; nothing is refused, so no element is named as
             // unplanned. Back on, the pushed scan wins again.
             Request disable = new Request("PUT", "/_cluster/settings");
-            disable.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":false}}");
+            disable.setJsonEntity("{\"transient\":{\"plugins.lance.aggregation.pushdown\":false}}");
             client().performRequest(disable);
             try {
                 String off = explainOk(indexName, sum);
@@ -296,7 +296,7 @@ public class LanceExplainIT extends LanceRestTestCase {
                 assertFalse("the cost chose, nothing was refused: " + off, parseJson(off).containsKey("unplanned"));
             } finally {
                 Request enable = new Request("PUT", "/_cluster/settings");
-                enable.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":null}}");
+                enable.setJsonEntity("{\"transient\":{\"plugins.lance.aggregation.pushdown\":null}}");
                 client().performRequest(enable);
             }
             String on = explainOk(indexName, sum);
@@ -643,7 +643,7 @@ public class LanceExplainIT extends LanceRestTestCase {
             // within milliseconds of the attach; hold it back so the
             // first explain is observed planning without statistics.
             Request delay = new Request("PUT", "/_cluster/settings");
-            delay.setJsonEntity("{\"transient\":{\"lance.test.statistics_collect_delay\":\"8s\"}}");
+            delay.setJsonEntity("{\"transient\":{\"plugins.lance.test.statistics_collect_delay\":\"8s\"}}");
             client().performRequest(delay);
 
             // Nothing of the earlier tests is still collecting, so the
@@ -695,7 +695,7 @@ public class LanceExplainIT extends LanceRestTestCase {
         } finally {
             try {
                 Request reset = new Request("PUT", "/_cluster/settings");
-                reset.setJsonEntity("{\"transient\":{\"lance.test.statistics_collect_delay\":null}}");
+                reset.setJsonEntity("{\"transient\":{\"plugins.lance.test.statistics_collect_delay\":null}}");
                 client().performRequest(reset);
             } catch (Exception ignored) {}
             deleteQuietly(indexName);

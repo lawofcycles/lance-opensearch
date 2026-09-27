@@ -134,7 +134,7 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
      * Decides what a register request should do, in this order: the
      * allowlist, then the duplicate lookup, then the filesystem existence
      * check. Throws {@link OpenSearchStatusException} (403) for a root
-     * outside {@code lance.allowed_table_roots} and
+     * outside {@code plugins.lance.allowed_table_roots} and
      * {@link IllegalArgumentException} (400) for a filesystem path that is
      * not an existing directory.
      *
@@ -168,7 +168,7 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
         boolean directory = LanceNamespaceMetadata.Entry.TYPE_DIRECTORY.equals(entry.type());
         if (directory && !allowedRoots.allows(entry.rootUri())) {
             throw new OpenSearchStatusException(
-                "path [" + entry.rootUri() + "] is not under any of the configured lance.allowed_table_roots",
+                "path [" + entry.rootUri() + "] is not under any of the configured plugins.lance.allowed_table_roots",
                 RestStatus.FORBIDDEN
             );
         }

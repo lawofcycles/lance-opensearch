@@ -95,7 +95,7 @@ import org.opensearch.search.aggregations.bucket.histogram.InternalDateHistogram
  *       {@code max} on them return the same numbers the doc values
  *       path returns.</li>
  *   <li>The fragments of a node are scanned in up to
- *       {@code lance.aggregation.pushdown_parallelism} groups and the
+ *       {@code plugins.lance.aggregation.pushdown_parallelism} groups and the
  *       per group rows are merged by their full key list before any
  *       bucket is built: counts, sums and value counts add, min and
  *       max take the extreme, {@code avg} travels as a sum and a
@@ -109,7 +109,7 @@ public final class LanceAggregateResults {
 
     /**
      * Bins of a pushed down percentiles histogram, from
-     * {@code lance.aggregation.percentiles_bins}; the plugin stores the
+     * {@code plugins.lance.aggregation.percentiles_bins}; the plugin stores the
      * node setting here at start and every dynamic update after.
      */
     private static volatile int defaultPercentilesBins = LancePlugin.AGGREGATION_PERCENTILES_BINS_SETTING.getDefault(Settings.EMPTY);
@@ -121,7 +121,7 @@ public final class LanceAggregateResults {
     /**
      * How many times {@code shard_size} groups each scan of a single
      * level {@code terms} keeps, from
-     * {@code lance.aggregation.pushdown_topk_slack}; the plugin stores
+     * {@code plugins.lance.aggregation.pushdown_topk_slack}; the plugin stores
      * the node setting here at start and every dynamic update after.
      */
     private static volatile int defaultTopkSlack = LancePlugin.AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING.getDefault(Settings.EMPTY);

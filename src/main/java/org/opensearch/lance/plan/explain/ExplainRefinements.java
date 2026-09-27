@@ -32,7 +32,7 @@ import java.util.Set;
  * builds, part of {@link FragmentPlanRefiner.Reason#SORT_FIELD_TYPE}),
  * {@link FragmentPlanRefiner.Reason#AGGREGATE_RESOLUTION}
  * (the resolution of the pushed aggregate against the mapping and the
- * node's {@code lance.aggregation.pushdown_max_groups}), and
+ * node's {@code plugins.lance.aggregation.pushdown_max_groups}), and
  * {@link FragmentPlanRefiner.Reason#COLUMN_STORE_WARM} (whether the
  * node's column store holds the columns the Lucene aggregators would
  * read and whether they are predicted cheaper than the pushed scan

@@ -14,17 +14,17 @@ The admission gate refuses a Lance scan that would not fit the node's physical m
 
 | setting | scope | default | dynamic | effect |
 |---|---|---|---|---|
-| `lance.admission.enabled` | node | `true` | yes | `false` turns the gate off |
-| `lance.admission.headroom` | node | `8gb` | yes | memory kept free below the available reading; the retained credit may reach into it |
-| `lance.admission.bounded_shapes_gated` | node | `true` | yes | `false` caps a bounded filter page at its limit and restores the pass-through for bounded full text pages |
-| `lance.test.index_cache_shard_share` | node | `0` | yes | test only; overrides the index cache shard share the estimates are compared with |
-| `lance.test.admission_available_memory` | node | empty | yes | test only; scripts the available memory readings |
+| `plugins.lance.admission.enabled` | node | `true` | yes | `false` turns the gate off |
+| `plugins.lance.admission.headroom` | node | `8gb` | yes | memory kept free below the available reading; the retained credit may reach into it |
+| `plugins.lance.admission.bounded_shapes_gated` | node | `true` | yes | `false` caps a bounded filter page at its limit and restores the pass-through for bounded full text pages |
+| `plugins.lance.test.index_cache_shard_share` | node | `0` | yes | test only; overrides the index cache shard share the estimates are compared with |
+| `plugins.lance.test.admission_available_memory` | node | empty | yes | test only; scripts the available memory readings |
 
-The two `lance.test.*` settings are described under [Tables above the Lucene document bound](features.md#tables-above-the-lucene-document-bound); do not set them on a real node.
+The two `plugins.lance.test.*` settings are described under [Tables above the Lucene document bound](features.md#tables-above-the-lucene-document-bound); do not set them on a real node.
 
 ## The decision
 
-- The executor judges each gated scan before it starts, per kind (see [Estimators](#estimators)). The request is refused when `estimate > available - headroom + retained`, where `available` is the node's available physical memory, `headroom` is `lance.admission.headroom` and `retained` is the credit of [Retained memory](#retained-memory) for a scan of the same identity, else zero.
+- The executor judges each gated scan before it starts, per kind (see [Estimators](#estimators)). The request is refused when `estimate > available - headroom + retained`, where `available` is the node's available physical memory, `headroom` is `plugins.lance.admission.headroom` and `retained` is the credit of [Retained memory](#retained-memory) for a scan of the same identity, else zero.
 - The 429 message reads `[lance_admission] <kind> estimate [X] exceeds available [Y] minus headroom [Z] plus [R] retained by earlier admitted scans: <what the scan is> <what to relax>`. A scan the retained pool does not cover shows `plus [0b] retained`.
 - Available memory is the kernel's `MemAvailable` from `/proc/meminfo`, which counts the reclaimable page cache and slab on top of the free pages. `MemFree` alone reads close to zero on a node whose page cache is warm. Where the file or the line does not exist (macOS, Windows) the gate falls back to the free physical memory.
 - Every estimate at or below the index cache shard share is zero: a cached load is not repeated, and scan buffers smaller than one shard of the cache the node dedicates to Lance are within its sizing.
@@ -46,7 +46,7 @@ A full text scan. The estimate is the sum of four parts; the first three are zer
   - Why positions are counted: the phrase `w000000 w000001 size 10` over 1B rows peaked at 103 GB on one 128 GB node and killed every node of a 4 node cluster after being admitted at the document set alone.
 - The hits scan buffers: one row in ten of the table for an unbounded shape, the top-k limit for a bounded page, at 12 bytes per row, doubled.
 - The row addresses the scan's SQL prefilter materialises when a `bool` with scalar `filter` / `must_not` clauses was fused into one Lance scan: one row in five of the table (`FILTER_MATCH_RATIO_UNKNOWN`) at 256 bytes each (`FILTER_SCAN_BYTES_PER_MATCHING_ROW`), the same term `filter_scan` and `aggregate_scan` charge for Lance's `MaterializeIndexExec`. When several full text leaves each carry a prefilter (a `bool` the planner did not fuse), every distinct prefilter SQL is charged once. For `bool(must [match body w000100], filter [range price >= 100]) size 10` over 1B rows on a 128 GB node the 429 message reads
-  `[lance_admission] fts estimate [96.1gb] exceeds available [81.9gb] minus headroom [8gb] plus [0b] retained by earlier admitted scans: bounded full text page over [perf1b]: inverted index document set of [48.4gb] plus the prefilter [price >= 100.0] materialising 200000000 row addresses over the whole table at [256b] each against an index cache shard of [8gb] plus the hits scan buffers. Drop the scalar filter, attach the table to a node with a larger index cache, or relax lance.admission.bounded_shapes_gated / lance.admission.headroom / lance.admission.enabled.`
+  `[lance_admission] fts estimate [96.1gb] exceeds available [81.9gb] minus headroom [8gb] plus [0b] retained by earlier admitted scans: bounded full text page over [perf1b]: inverted index document set of [48.4gb] plus the prefilter [price >= 100.0] materialising 200000000 row addresses over the whole table at [256b] each against an index cache shard of [8gb] plus the hits scan buffers. Drop the scalar filter, attach the table to a node with a larger index cache, or relax plugins.lance.admission.bounded_shapes_gated / plugins.lance.admission.headroom / plugins.lance.admission.enabled.`
   - Where the figure comes from: 1B rows at one in five is 200M row addresses, at 256 bytes 51.2 GB. With the 48.4 GB document set the shape reaches 96.1 GB, above the 88 GB a 128 GB node has after the 8 GB headroom, so it is refused there.
 
 ### `scalar_index`
@@ -68,7 +68,7 @@ The native scan of a scalar filter (`LanceScanFilterQuery`) and the sorted, limi
 - The decoded batches in flight: `batch_readahead`, the CPU count, times 8192 rows times the row width, doubled.
 - The scan's read queue: at most 2 GiB, Lance's `io_buffer_size`, and at most the scanned bytes.
 - The per fragment bit sets the filter keeps (one bit per row) are heap and are judged against the request breaker's room, not against physical memory.
-- A bounded filter page is judged on every matching row, because the index result is materialised before the limit applies. `lance.admission.bounded_shapes_gated: false` caps it at its limit and restores the pass-through for bounded full text pages.
+- A bounded filter page is judged on every matching row, because the index result is materialised before the limit applies. `plugins.lance.admission.bounded_shapes_gated: false` caps it at its limit and restores the pass-through for bounded full text pages.
 
 ### `vector_index`
 
@@ -83,7 +83,7 @@ A `lance_knn` scan. Zero when the probed bytes fit the shard share; zero without
 
 A pushed aggregate. Zero when the sum fits the shard share.
 
-- Per parallel scan (`lance.aggregation.pushdown_parallelism` fragment groups) the read queue (at most 2 GiB and at most the group's rows times the projected row width) plus the batches in flight, summed over the scans, over the rows the filter keeps.
+- Per parallel scan (`plugins.lance.aggregation.pushdown_parallelism` fragment groups) the read queue (at most 2 GiB and at most the group's rows times the projected row width) plus the batches in flight, summed over the scans, over the rows the filter keeps.
 - For a filtered aggregate, the row addresses the filter's scalar indexes materialise at 256 bytes each (`FILTER_SCAN_BYTES_PER_MATCHING_ROW`, the filter scan's constant). The materialised rows are the table's rows times the sum over the filter's columns with a scalar index of each predicate's selectivity (one over the distinct count for an equality on a column whose index reports one, else one row in five).
   - Why the whole table and every predicate: Lance's `MaterializeIndexExec` evaluates the filter's index expression over the whole table before it keeps the scan's fragments, and evaluates every indexed predicate of an `AND` or `OR` on its own index and holds each result until it combines them.
   - Example: `range price [100,200) + terms(category)` over 1B rows is 200M row addresses, 51.2 GB, on top of the scans' buffers.
@@ -94,7 +94,7 @@ A pushed aggregate. Zero when the sum fits the shard share.
 
 The scans that read a column into the off-heap column store or into heap when an aggregation or a sort faults it in through the Lucene path, and the heap copy of a column the store had no room for.
 
-- The scans: the read queue plus the batches in flight of each parallel scan (`lance.fragment_path.parallelism` fragment groups), summed over the scans. The read queue is at most 2 GiB and at most the group's rows times the column's row width, the Arrow width plus the 8 byte row address. This is the per scan term of `aggregate_scan`, with nothing materialised. Zero when the sum fits the shard share. Judged before the first scan opens, on the request's ticket, so a refusal is the request's 429: `[lance_admission] column_load estimate [192.2gb] exceeds available [56gb] minus headroom [8gb] plus [0b] retained by earlier admitted scans: column load of [embedding] over [perf1b]: 32 parallel scans over 250000000 rows of [4kb] each (read queue and batches in flight per scan), against an index cache shard of [8gb]. Lower lance.fragment_path.parallelism, spread the table over more data nodes, or relax lance.admission.headroom / lance.admission.enabled.`
+- The scans: the read queue plus the batches in flight of each parallel scan (`plugins.lance.fragment_path.parallelism` fragment groups), summed over the scans. The read queue is at most 2 GiB and at most the group's rows times the column's row width, the Arrow width plus the 8 byte row address. This is the per scan term of `aggregate_scan`, with nothing materialised. Zero when the sum fits the shard share. Judged before the first scan opens, on the request's ticket, so a refusal is the request's 429: `[lance_admission] column_load estimate [192.2gb] exceeds available [56gb] minus headroom [8gb] plus [0b] retained by earlier admitted scans: column load of [embedding] over [perf1b]: 32 parallel scans over 250000000 rows of [4kb] each (read queue and batches in flight per scan), against an index cache shard of [8gb]. Lower plugins.lance.fragment_path.parallelism, spread the table over more data nodes, or relax plugins.lance.admission.headroom / plugins.lance.admission.enabled.`
   - Where the figure comes from: a 1024 dimension float32 column is 4104 bytes per row with the row address, so on a 64 vCPU node each of the 32 scans holds its 2 GiB read queue plus 64 batches of 8192 rows, doubled, 6 GiB, 192 GiB over the 32 scans; a node reading 64 GB available has 56 GB after the headroom.
   - The shard engine's reader carries no request ticket. Its column loads are judged and recorded the same way, but a refusal is logged at WARN and the load runs, because nothing would answer the 429 and the column has to be read.
 - The heap copy: the request breaker judges it before the allocation (`lance_heap_column:<column>`, see [limitations.md](limitations.md)) and the gate records the charge and the refusal under this kind.
@@ -104,8 +104,8 @@ The scans that read a column into the off-heap column store or into heap when an
 The take by row address that reads the projected columns of a page's hits (`_rowaddr IN (...)`, one scan per chunk of at most 4096 hits per fragment). Zero when the chunk's batches fit the shard share.
 
 - The estimate is the chunk's rows times the row width, doubled for the batches in flight. The row width is the sum of the projected columns' Arrow widths (32 bytes for a string, `dimension × 4` for a float32 vector, the numeric type's width) plus the 8 byte row address. The projection is what the request renders: the surfaced columns its `_source` filter and `fields` keep, plus the primary key for `_id`. A row the fetch cache serves is not in the chunk, so a page served from the cache opens no take and is not judged.
-- Lance answers the predicate as a take, so nothing is materialised beyond the rows asked for and no read queue fills ahead of them. The heap copy of the decoded rows is not in the estimate; the heap the fetch cache keeps of them is bounded by `lance.fetch_cache.size`.
-- Judged before the chunk's scan opens, on the request's ticket, so a refusal is the request's 429. A page of a million rows (`index.max_result_window` raised, or a deep `search_after`) rendering a text body and a 1024 dimension embedding on a node reading 8 GB available with the default headroom reads: `[lance_admission] fetch_take estimate [7.7gb] exceeds available [0b] minus headroom [8gb] plus [0b] retained by earlier admitted scans: fetch take over [perf1b]: taking 1000000 rows of 2 columns for the page at [4kb] per row (the columns' Arrow widths plus the row address), doubled for the batches in flight, against an index cache shard of [1gb]. Narrow _source or fields, or lower size, or relax lance.admission.headroom / lance.admission.enabled.`
+- Lance answers the predicate as a take, so nothing is materialised beyond the rows asked for and no read queue fills ahead of them. The heap copy of the decoded rows is not in the estimate; the heap the fetch cache keeps of them is bounded by `plugins.lance.fetch_cache.size`.
+- Judged before the chunk's scan opens, on the request's ticket, so a refusal is the request's 429. A page of a million rows (`index.max_result_window` raised, or a deep `search_after`) rendering a text body and a 1024 dimension embedding on a node reading 8 GB available with the default headroom reads: `[lance_admission] fetch_take estimate [7.7gb] exceeds available [0b] minus headroom [8gb] plus [0b] retained by earlier admitted scans: fetch take over [perf1b]: taking 1000000 rows of 2 columns for the page at [4kb] per row (the columns' Arrow widths plus the row address), doubled for the batches in flight, against an index cache shard of [1gb]. Narrow _source or fields, or lower size, or relax plugins.lance.admission.headroom / plugins.lance.admission.enabled.`
   - Where the figure comes from: a Utf8 body at 32 bytes, a 1024 dimension float32 embedding at 4096 bytes and the row address at 8 bytes are 4136 bytes per row; a million rows doubled are 8.27 GB, above a 1 GB shard share, against nothing left after the headroom.
 - The shard engine's reader (a `GET /<index>/_doc/<id>`) takes one row through the same path without a request ticket; a refusal is thrown all the same, because the take is the request's own work.
 
@@ -120,7 +120,7 @@ How the pool is filled:
 - When a non zero estimate is admitted with no other gated request in flight, the gate samples `MemAvailable` and the process resident set.
 - When that request's scan completes with no other gated scan running, it adds `MemAvailable` before minus `MemAvailable` after, capped by the resident set growth over the same interval (memory another process took meanwhile is not this process's to reuse).
 - Every gated scan (full text, filter, sorted page, nearest, aggregate, column load, fetch take) brackets itself so the pool samples its completion.
-- The pool is not credited while a gated request is in flight or a gated scan runs (that memory is in use), nor when the process resident set exceeds `lance.native_memory.limit` plus the JVM heap by more than the pool (something the plugin does not account holds memory).
+- The pool is not credited while a gated request is in flight or a gated scan runs (that memory is in use), nor when the process resident set exceeds `plugins.lance.native_memory.limit` plus the JVM heap by more than the pool (something the plugin does not account holds memory).
 
 How the pool is bounded:
 
@@ -136,7 +136,7 @@ Who is credited:
 - A scan of the same identity is judged on `MemAvailable - headroom + pool`. A scan of any other identity is judged on `MemAvailable - headroom` alone, because it does not reuse what the earlier scan left, and once admitted it starts the pool over under its own identity.
   - Why: a filtered aggregate on another index admitted on the credit of an earlier one allocated its own row address set on top and killed the node.
 - Because the credit depends on the identity and not on which node the scan lands on, the coordinator's gate and the shard nodes' gates lean the same way for a given scan: all of them credit a repeat of the shape that filled their pools, none of them credits a different shape.
-- The credit lets the transient peak of the repeated scan reach into the headroom by up to the credited amount. That is why the pool is capped by what the process actually kept and why `lance.admission.headroom` keeps its default of 8 GB.
+- The credit lets the transient peak of the repeated scan reach into the headroom by up to the credited amount. That is why the pool is capped by what the process actually kept and why `plugins.lance.admission.headroom` keeps its default of 8 GB.
 
 ## Observing the gate
 

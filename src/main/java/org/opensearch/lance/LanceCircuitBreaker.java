@@ -121,7 +121,7 @@ public final class LanceCircuitBreaker {
      * Report the two native footprints the plugin owns as one reading:
      * the Lance Session's index and metadata caches and the fragment
      * path's off-heap column cache. Both share the
-     * {@code lance.native_memory.limit} budget, so {@code _nodes/stats/breaker}
+     * {@code plugins.lance.native_memory.limit} budget, so {@code _nodes/stats/breaker}
      * shows their sum under {@code lance_native}.
      */
     public static void updateUsage(long sessionBytes, long columnCacheBytes) {

@@ -66,7 +66,7 @@ public final class TransportLanceRefsAction extends HandledTransportAction<Lance
             listener.onFailure(new IndexNotFoundException(indexName));
             return;
         }
-        String tableUri = metadata.getSettings().get(LanceEngineFactory.TABLE_SETTING);
+        String tableUri = LanceEngineFactory.tableOf(metadata.getSettings());
         if (tableUri == null) {
             listener.onFailure(new IllegalArgumentException("index " + indexName + " is not a Lance index"));
             return;

@@ -13,7 +13,7 @@ import org.opensearch.lance.StorageOptions;
 
 /**
  * Where a given node should open a Lance-backed index's table: the source
- * table for {@code index.lance.index_placement = in_table} (the default),
+ * table for {@code index.plugins.lance.index_placement = in_table} (the default),
  * or this node's shallow clone for {@code node_local} when one exists.
  *
  * <p>This is the resolution point for the data-node open paths (the shard
@@ -36,7 +36,7 @@ public record LanceTableLocation(String uri, StorageOptions storageOptions, bool
      */
     public static LanceTableLocation forNode(IndexSettings indexSettings) {
         Settings settings = indexSettings.getSettings();
-        String source = settings.get(LanceEngineFactory.TABLE_SETTING);
+        String source = LanceEngineFactory.tableOf(settings);
         StorageOptions sourceOptions = StorageOptions.fromIndexSettings(settings);
         if (!LanceLocalClones.isNodeLocal(settings)) {
             return new LanceTableLocation(source, sourceOptions, false);

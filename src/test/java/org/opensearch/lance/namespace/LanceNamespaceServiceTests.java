@@ -170,7 +170,7 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
 
     public void testPollLeavesAnExistingIndexOfTheTableAloneWithoutOpeningIt() throws Exception {
         // The manager's cycle only lists catalogs and creates indexes.
-        // A table whose index exists (index.lance.table equals the table
+        // A table whose index exists (index.plugins.lance.table equals the table
         // path) is left to the node holding its shard: no dataset open,
         // no refresh, no mapping update, nothing through the client. The
         // table path here does not exist on disk, so an open would have

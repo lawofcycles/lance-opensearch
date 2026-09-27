@@ -59,19 +59,19 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 public class LanceEngineFactoryTests extends EngineTestCase {
 
     public void testTableSettingKey() {
-        assertEquals("index.lance.table", LanceEngineFactory.TABLE_SETTING);
+        assertEquals("index.plugins.lance.table", LanceEngineFactory.TABLE_SETTING);
     }
 
     public void testPrimaryKeyFieldSettingKey() {
-        assertEquals("index.lance.primary_key_field", LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING);
+        assertEquals("index.plugins.lance.primary_key_field", LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING);
     }
 
     public void testPrimaryKeyTypeSettingKey() {
-        assertEquals("index.lance.primary_key_type", LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING);
+        assertEquals("index.plugins.lance.primary_key_type", LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING);
     }
 
     public void testMultiFieldsSettingKey() {
-        assertEquals("index.lance.multi_fields", LanceEngineFactory.MULTI_FIELDS_SETTING);
+        assertEquals("index.plugins.lance.multi_fields", LanceEngineFactory.MULTI_FIELDS_SETTING);
     }
 
     public void testMultiFieldsSerialiseDeserialiseRoundTrip() {

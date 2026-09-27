@@ -186,7 +186,7 @@ planning pass fired.
 `cacheable` says whether a `_search` with the body would be answered from the coordinator's
 [result cache](features.md#result-cache) on a repeat while the table stays at its version:
 `true`, or `false` with `cacheable_reason` naming why (`size > 0`, `from > 0`, `dls` when a
-reader wrapper is installed, `disabled` when `lance.request_cache.enabled` is false on the node
+reader wrapper is installed, `disabled` when `plugins.lance.request_cache.enabled` is false on the node
 that answered). A search's own `request_cache=false` and a target of several indexes are not
 visible to explain, which takes one index and a body. Absent when the plan failed, since nothing
 runs.
@@ -222,7 +222,7 @@ of a tree compete under one root. A body with no plan under either convention (`
 The planner compares candidates by `LanceCost`, which reads Calcite's three cost slots with its
 own meaning: predicted latency in milliseconds (the objective), predicted native bytes and
 predicted heap bytes (budgets checked as hard constraints against the node's
-`lance.native_memory.limit` and the JVM heap; a candidate within both budgets always beats one
+`plugins.lance.native_memory.limit` and the JVM heap; a candidate within both budgets always beats one
 outside them, and among candidates on the same side of the budgets milliseconds decide). Nothing
 predicts real byte usage yet, so the two byte slots carry small placeholder figures.
 
@@ -271,7 +271,7 @@ rating held as 1 to 5, whatever the row count; a column with nulls reports no sm
 keeps the guess below); a date histogram's domain is its interval over an
 assumed ten year span; a range or filters key counts its bands. A `terms` key over a column with
 neither bound is guessed as a tenth of the rows, Calcite's default, and a tree with such a key is
-priced with the guess but not judged against `lance.aggregation.pushdown_max_groups` (below). The
+priced with the guess but not judged against `plugins.lance.aggregation.pushdown_max_groups` (below). The
 group count decides two terms on each side: the hash table penalty above a million groups, and on
 the pushed side the merge of the group rows every parallel scan returns, so a two level tree whose
 second level is guessed on a billion rows is priced as a billion groups, which sends it to the
@@ -287,18 +287,18 @@ between a first request that answers in seconds and one that waits minutes for t
 statistics ([architecture.md](architecture.md) has the details and the `pending` and
 `planned_without` counters). The run's inputs come from the caller as `plan/cost/CostInputs`: the number of
 data nodes the request fans out to, the storage kind of the table URI, this node's CPUs, and four
-settings read at their current values, `lance.aggregation.pushdown_parallelism` (the scan's
-parallelism), `lance.fragment_path.slices` (the aggregator path's parallelism),
-`lance.aggregation.pushdown` and `lance.aggregation.pushdown_max_groups`. The coordinator and
+settings read at their current values, `plugins.lance.aggregation.pushdown_parallelism` (the scan's
+parallelism), `plugins.lance.fragment_path.slices` (the aggregator path's parallelism),
+`plugins.lance.aggregation.pushdown` and `plugins.lance.aggregation.pushdown_max_groups`. The coordinator and
 the explain endpoint build their inputs through the same `RequestPlanner.clusterInputs`, so the
 two plan a body the same way on the same cluster; a data node planning for itself (in tests)
 uses one local node. The same body can therefore explain differently on a single node and on a
 six node cluster, and the cost printed by explain is the cluster's figure, not a node's.
 
 The two aggregation routing settings are cost inputs, not gates in front of the planner.
-`lance.aggregation.pushdown: false` prices every pushed aggregate as infinite (`cost=[{ms=inf,
+`plugins.lance.aggregation.pushdown: false` prices every pushed aggregate as infinite (`cost=[{ms=inf,
 ...}]` never appears in a winning plan, so explain shows the `LuceneAggregateExec` alternative
-with nothing `unplanned`). `lance.aggregation.pushdown_max_groups` is applied when the planner
+with nothing `unplanned`). `plugins.lance.aggregation.pushdown_max_groups` is applied when the planner
 can estimate the group rows the executor would hold from the statistics (every key domain known:
 a bitmap distinct count, a BTree value range over an integer column, a date interval, a range or
 filter count, cut to the `shard_size`
@@ -359,17 +359,17 @@ the previous guards left it.
 3. `aggregate_resolution`. A pushed aggregate whose fields do not resolve against the mapping, or
    whose group estimate from the request shape (the product of the levels' `shard_size`; a
    `range` or `filters` level counts its bucket count plus one) exceeds
-   `lance.aggregation.pushdown_max_groups`, goes to the aggregators.
+   `plugins.lance.aggregation.pushdown_max_groups`, goes to the aggregators.
 4. `column_store_warm`. Over an object store table, a pushed aggregate goes to the aggregators
    when the node's column store already holds every column they would read for every fragment of
    the request and the coordinator's shipped prediction for the aggregators over resident columns
    is below its prediction for the scan. The coordinator ships both predictions and the column
    names next to the pushed aggregate. Over a local table the resident cost equals the cost the
    planner already compared, so this never fires there; below the fitted range the shipped costs
-   are zero. Nothing warms the column store at attach (`lance.attach.warm_indexes` warms the
+   are zero. Nothing warms the column store at attach (`plugins.lance.attach.warm_indexes` warms the
    Lance index cache, not the column store); once a Lucene side request has loaded the aggregated
    columns of an object store table into the store (an aggregation the planner did not push, a
-   run with `lance.aggregation.pushdown: false`), the node answers later pushed eligible
+   run with `plugins.lance.aggregation.pushdown: false`), the node answers later pushed eligible
    aggregations over the same table from the store instead of scanning the object store again.
 
 Each guard that fires increments its counter under `plan.refinements` in `GET /_plugins/_lance/stats`, and

@@ -38,7 +38,7 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
 
     /**
      * The exact value {@code LanceOverrides.toJson()} persists for
-     * {@link #INDEXES_CLAUSE} in the {@code index.lance.overrides}
+     * {@link #INDEXES_CLAUSE} in the {@code index.plugins.lance.overrides}
      * setting. Key order is not part of the contract (the REST layer
      * parses the body into an unordered map), so assertions compare the
      * parsed structure.
@@ -289,13 +289,13 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
     }
 
     /**
-     * The {@code index.lance.overrides} value of {@code index} from a
+     * The {@code index.plugins.lance.overrides} value of {@code index} from a
      * {@code GET /{index}/_settings} body, or {@code null} when the
      * setting is absent.
      */
     private static String overridesSetting(String settingsBody, String index) {
         Object value = parseJson(settingsBody).get(index);
-        for (String step : new String[] { "settings", "index", "lance", "overrides" }) {
+        for (String step : new String[] { "settings", "index", "plugins", "lance", "overrides" }) {
             if (!(value instanceof Map<?, ?> map)) {
                 return null;
             }
@@ -305,14 +305,14 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
     }
 
     /**
-     * Assert the persisted {@code index.lance.overrides} value of
+     * Assert the persisted {@code index.plugins.lance.overrides} value of
      * {@code index} equals {@code expectedJson}, comparing the parsed
      * structure so key order does not matter.
      */
     private static void assertOverridesSetting(String settingsBody, String index, String expectedJson) {
         String actual = overridesSetting(settingsBody, index);
-        assertNotNull("expected an index.lance.overrides value: " + settingsBody, actual);
-        assertEquals("index.lance.overrides of " + index + ": " + actual, parseJson(expectedJson), parseJson(actual));
+        assertNotNull("expected an index.plugins.lance.overrides value: " + settingsBody, actual);
+        assertEquals("index.plugins.lance.overrides of " + index + ": " + actual, parseJson(expectedJson), parseJson(actual));
     }
 
     /**

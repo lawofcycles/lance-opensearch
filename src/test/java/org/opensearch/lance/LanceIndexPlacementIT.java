@@ -22,7 +22,7 @@ import org.opensearch.client.ResponseException;
 import org.opensearch.common.io.PathUtils;
 
 /**
- * {@code index.lance.index_placement = node_local}: attach a table whose
+ * {@code index.plugins.lance.index_placement = node_local}: attach a table whose
  * directory the OpenSearch process cannot write to, build FTS indexes
  * into per-node shallow clones, query them, and verify the source
  * directory stays untouched, while the same build with the default

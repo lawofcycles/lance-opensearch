@@ -176,7 +176,7 @@ public class LanceProfileIT extends LanceRestTestCase {
         String index = tableName;
         try {
             Request off = new Request("PUT", "/_cluster/settings");
-            off.setJsonEntity("{\"transient\":{\"lance.fetch_cache.enabled\":false}}");
+            off.setJsonEntity("{\"transient\":{\"plugins.lance.fetch_cache.enabled\":false}}");
             client().performRequest(off);
             Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
@@ -215,7 +215,7 @@ public class LanceProfileIT extends LanceRestTestCase {
         } finally {
             try {
                 Request on = new Request("PUT", "/_cluster/settings");
-                on.setJsonEntity("{\"transient\":{\"lance.fetch_cache.enabled\":null}}");
+                on.setJsonEntity("{\"transient\":{\"plugins.lance.fetch_cache.enabled\":null}}");
                 client().performRequest(on);
             } catch (Exception ignored) {}
             try {

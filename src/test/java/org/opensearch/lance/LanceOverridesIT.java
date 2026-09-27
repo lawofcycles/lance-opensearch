@@ -46,7 +46,7 @@ public class LanceOverridesIT extends LanceRestTestCase {
 
             // The canonical JSON lands in the new setting only.
             String settings = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_settings")));
-            assertTrue("expected index.lance.overrides in settings: " + settings, settings.contains("\"overrides\""));
+            assertTrue("expected index.plugins.lance.overrides in settings: " + settings, settings.contains("\"overrides\""));
             assertFalse("multi_fields setting must not be written by new attaches: " + settings, settings.contains("multi_fields"));
 
             // ISO date range on the Int64 column: March holds rows 2 and 3.
@@ -168,7 +168,7 @@ public class LanceOverridesIT extends LanceRestTestCase {
     public void testLegacyMultiFieldsClauseStillResolvesSubField() throws Exception {
         // The legacy clause folds into overrides at parse time and the
         // sub-field keeps answering term queries. Indexes created by
-        // earlier builds persist the spec in index.lance.multi_fields;
+        // earlier builds persist the spec in index.plugins.lance.multi_fields;
         // that fallback is pinned by LanceOverridesTests since a Final
         // setting cannot be injected through REST.
         String suffix = "legacymf-" + randomAlphaOfLength(8).toLowerCase(java.util.Locale.ROOT);

@@ -41,7 +41,7 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
  * {@link LanceTestCluster} fixture (writes a Lance table, registers its
  * directory as a namespace, waits for the polling loop to surface it as an
  * index) and small JSON / request helpers. The cluster is configured with
- * {@code lance.namespace.poll_cadence=1s} (see {@code build.gradle}) so
+ * {@code plugins.lance.namespace.poll_cadence=1s} (see {@code build.gradle}) so
  * surfacing does not add ten seconds per test.
  */
 // Lance JNI spins up native worker threads that outlive a single test

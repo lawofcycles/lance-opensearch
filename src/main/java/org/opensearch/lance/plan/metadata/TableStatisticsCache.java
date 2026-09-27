@@ -344,7 +344,7 @@ public final class TableStatisticsCache {
     /**
      * Make every collection started from now on wait {@code millis}
      * before it reads the table; zero clears the wait. A test hook
-     * ({@code lance.test.statistics_collect_delay}) that lets a request
+     * ({@code plugins.lance.test.statistics_collect_delay}) that lets a request
      * against a small table observe the plan made without statistics.
      */
     public void setCollectDelayMillis(long millis) {

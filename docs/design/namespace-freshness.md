@@ -56,7 +56,7 @@ changed. The manager receives fewer requests and none of them are no-ops.
 
 The shard lifecycle is what ties a check to a node. A Lance backed index has one shard and no
 replica, so exactly one node holds it. The service registers a started Lance backed shard through
-`IndexEventListener.afterIndexShardStarted`, checks it at `lance.namespace.poll_cadence`, and
+`IndexEventListener.afterIndexShardStarted`, checks it at `plugins.lance.namespace.poll_cadence`, and
 unregisters it in `beforeIndexShardClosed`. A node restart or a shard relocation therefore moves
 the check with the shard, and the first check after a shard starts derives the mapping once even
 when the version did not move, because the table may have changed while no node held the shard.
@@ -71,7 +71,7 @@ shard and answers whether the version moved, the served and the target version, 
 mapping changed.
 
 The runtime cost of the freshness service follows from the shard lifecycle. Each tracked index
-has one scheduled task on the generic thread pool at `lance.namespace.poll_cadence`, and each
+has one scheduled task on the generic thread pool at `plugins.lance.namespace.poll_cadence`, and each
 task opens the latest manifest of the table through the node-scoped `LanceRegistry.SESSION`. A
 node holding N Lance backed shards therefore runs N tasks per cycle, and the object store reads
 grow linearly with the number of Lance backed shards on the node. The freshness check and the

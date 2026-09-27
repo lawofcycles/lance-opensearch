@@ -213,7 +213,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
             assertTrue("with the collision as the reason: " + body, body.contains("name collision"));
             assertTrue("the plain index is untouched: " + body, body.contains("\"surfaced\":[]"));
             String settings = readAll(client().performRequest(new Request("GET", "/" + clashing + "/_settings")));
-            assertFalse("the plain index stays plain: " + settings, settings.contains("index.lance.table"));
+            assertFalse("the plain index stays plain: " + settings, settings.contains("index.plugins.lance.table"));
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + clashing));
@@ -254,7 +254,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 4);
         String indexName = tableName;
-        updateClusterSetting("lance.namespace.resurface_guard_grace", "3s");
+        updateClusterSetting("plugins.lance.namespace.resurface_guard_grace", "3s");
         try {
             Response register = postJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             assertEquals(RestStatus.OK.getStatus(), register.getStatusLine().getStatusCode());
@@ -265,7 +265,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
             // A poll cycle inside the grace skips the table and says why.
             String polled = readAll(postJson("/_plugins/_lance/namespace/_poll?name=" + scratchDir.toString(), ""));
             assertTrue("expected the table skipped within the grace: " + polled, polled.contains("\"index\":\"" + indexName + "\""));
-            assertTrue(polled, polled.contains("deleted within lance.namespace.resurface_guard_grace"));
+            assertTrue(polled, polled.contains("deleted within plugins.lance.namespace.resurface_guard_grace"));
             ResponseException stillGone = expectThrows(
                 ResponseException.class,
                 () -> client().performRequest(new Request("GET", "/" + indexName))
@@ -302,7 +302,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
             try {
                 deleteJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             } catch (Exception ignored) {}
-            updateClusterSetting("lance.namespace.resurface_guard_grace", "1h");
+            updateClusterSetting("plugins.lance.namespace.resurface_guard_grace", "1h");
         }
     }
 
@@ -314,7 +314,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         String tableName = "demo-" + suffix;
         LanceTableFactory.writeTable(scratchDir, tableName, 4);
         String indexName = tableName;
-        updateClusterSetting("lance.namespace.resurface_guard_grace", "0");
+        updateClusterSetting("plugins.lance.namespace.resurface_guard_grace", "0");
         try {
             postJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=yellow&timeout=30s"));
@@ -325,7 +325,10 @@ public class LanceNamespaceIT extends LanceRestTestCase {
             // case the trigger finds the index and reports nothing; either
             // way the index exists when the trigger returns.
             String polled = readAll(postJson("/_plugins/_lance/namespace/_poll?name=" + scratchDir.toString(), ""));
-            assertFalse("grace=0 disables the guard: " + polled, polled.contains("deleted within lance.namespace.resurface_guard_grace"));
+            assertFalse(
+                "grace=0 disables the guard: " + polled,
+                polled.contains("deleted within plugins.lance.namespace.resurface_guard_grace")
+            );
             Response recovered = client().performRequest(
                 new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=yellow&timeout=30s")
             );
@@ -341,7 +344,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
             try {
                 deleteJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             } catch (Exception ignored) {}
-            updateClusterSetting("lance.namespace.resurface_guard_grace", "1h");
+            updateClusterSetting("plugins.lance.namespace.resurface_guard_grace", "1h");
         }
     }
 

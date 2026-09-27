@@ -73,7 +73,7 @@ import org.opensearch.lance.rest.RestAttachAction;
  * or {@code train=false} (extend with existing centroids and codebook).
  *
  * Recovery. Automatic paths (surface / syncTable) pass the node-level
- * {@code lance.builder.max_rows}; the manual endpoint passes
+ * {@code plugins.lance.builder.max_rows}; the manual endpoint passes
  * {@code Long.MAX_VALUE} so operators can force a build on tables the auto
  * path skipped. Skip conditions and recovery are documented in decision 33.
  */
@@ -683,9 +683,15 @@ public final class LanceIndexBuilder {
             return OptionalLong.empty();
         }
         if (rows > maxRows) {
-            LOG.warn("skipping {} build over {}: table has {} rows, exceeds lance.builder.max_rows={}", kind, targetColumns, rows, maxRows);
+            LOG.warn(
+                "skipping {} build over {}: table has {} rows, exceeds plugins.lance.builder.max_rows={}",
+                kind,
+                targetColumns,
+                rows,
+                maxRows
+            );
             for (String column : targetColumns) {
-                result.addSkipped(column, "table has " + rows + " rows, exceeds lance.builder.max_rows=" + maxRows);
+                result.addSkipped(column, "table has " + rows + " rows, exceeds plugins.lance.builder.max_rows=" + maxRows);
             }
             return OptionalLong.empty();
         }

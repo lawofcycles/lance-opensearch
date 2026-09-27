@@ -17,13 +17,13 @@ Every other tree runs through OpenSearch's stock aggregators over the fragment l
 
 | setting | scope | default | dynamic | effect |
 |---|---|---|---|---|
-| `lance.aggregation.pushdown` | node | `true` | yes | `false` prices every pushed aggregate as infinite, so the aggregators answer |
-| `lance.aggregation.pushdown_parallelism` | node | half the CPUs the JVM sees, at least 1 | yes, 1 to 32 | fragment groups each executor scans at once; `1` is a single scan per executor |
-| `lance.aggregation.pushdown_max_groups` | node | `1000000` | no | bound on the estimated group rows, applied by the planner and by the executor |
-| `lance.aggregation.percentiles_bins` | node | `4096` | yes, 16 to 1,000,000 | bins of a pushed down tdigest percentiles histogram |
-| `lance.aggregation.pushdown_topk_slack` | node | `4` | yes, 1 to 64 | how many times `shard_size` groups each scan of a single top-k ordered `terms` level retains |
+| `plugins.lance.aggregation.pushdown` | node | `true` | yes | `false` prices every pushed aggregate as infinite, so the aggregators answer |
+| `plugins.lance.aggregation.pushdown_parallelism` | node | half the CPUs the JVM sees, at least 1 | yes, 1 to 32 | fragment groups each executor scans at once; `1` is a single scan per executor |
+| `plugins.lance.aggregation.pushdown_max_groups` | node | `1000000` | no | bound on the estimated group rows, applied by the planner and by the executor |
+| `plugins.lance.aggregation.percentiles_bins` | node | `4096` | yes, 16 to 1,000,000 | bins of a pushed down tdigest percentiles histogram |
+| `plugins.lance.aggregation.pushdown_topk_slack` | node | `4` | yes, 1 to 64 | how many times `shard_size` groups each scan of a single top-k ordered `terms` level retains |
 
-`lance.aggregation.pushdown: false` is a cost input, for before / after comparisons: the planner never chooses the pushed aggregate and explain shows `LuceneAggregateExec` with nothing `unplanned`.
+`plugins.lance.aggregation.pushdown: false` is a cost input, for before / after comparisons: the planner never chooses the pushed aggregate and explain shows `LuceneAggregateExec` with nothing `unplanned`.
 
 ## Filter encodings
 
@@ -67,7 +67,7 @@ How a pushed tree behaves:
 - A nested `terms` applies the same rules inside each parent bucket, and the rows of a parent bucket the truncation drops are dropped with it.
 - `histogram` and `date_histogram` return every bucket; `min_doc_count: 0` filling stays with the coordinator's reduce.
 - Rows with a null bucket key open no bucket at that level but count toward the enclosing bucket and `hits.total`.
-- A single `terms` level ordered by `_count` descending or by one of its own single value metric children (`sum`, `avg`, `min`, `max`, `value_count`; named as `m` or `m.value`) does not hold every group: each scan keeps the best `shard_size * lance.aggregation.pushdown_topk_slack` groups in a primitive heap and adds every other group's count to `sum_other_doc_count`.
+- A single `terms` level ordered by `_count` descending or by one of its own single value metric children (`sum`, `avg`, `min`, `max`, `value_count`; named as `m` or `m.value`) does not hold every group: each scan keeps the best `shard_size * plugins.lance.aggregation.pushdown_topk_slack` groups in a primitive heap and adds every other group's count to `sum_other_doc_count`.
   - The merge sums the counts a key earned in different scans before the final `shard_size` cut, and the doc count error the coordinator derives from the smallest returned bucket covers a key a scan dropped the way it covers a term a shard did not return.
   - A slack large enough to retain every group makes the result exact.
   - Plans with a `percentiles` metric, `_key` orders, nested levels and `composite` keep every group.
@@ -75,7 +75,7 @@ How a pushed tree behaves:
 
 ### `percentiles`
 
-tdigest `percentiles` / `percentile_ranks` take two rounds of scans: the first returns the field's minimum and maximum (with the other measures), the second groups the rows by equal width bin over `[min, max]` with `lance.aggregation.percentiles_bins` bins and counts them. The executor feeds each bin's rows to the TDigest of the request's `compression` as one value at each bin edge and the rest at the bin's centre.
+tdigest `percentiles` / `percentile_ranks` take two rounds of scans: the first returns the field's minimum and maximum (with the other measures), the second groups the rows by equal width bin over `[min, max]` with `plugins.lance.aggregation.percentiles_bins` bins and counts them. The executor feeds each bin's rows to the TDigest of the request's `compression` as one value at each bin edge and the rest at the bin's centre.
 
 - Every value the digest sees is within half a bin width (`(max - min) / bins / 2`) of a real value, so the histogram itself is accurate to the bin width. The TDigest then adds its own interpolation error, which is larger for a digest built from a few thousand weighted points than for one built from every document.
   - Measured: on a 20M row table with a long tailed `price`, the pushdown's p95 was 0.16 % of the range from the exact value, the aggregators' 0.01 %; both p50 within 0.03 %.
@@ -92,8 +92,8 @@ tdigest `percentiles` / `percentile_ranks` take two rounds of scans: the first r
 ## How the executor builds the buckets
 
 - The executor reads Lance's group rows column-wise into primitive arrays (keys as one `long` each, string keys through a byte dictionary, counts and plain measures in parallel arrays), so a scan over millions of groups allocates no objects per row.
-- Each executor scans its fragments in up to `lance.aggregation.pushdown_parallelism` contiguous groups at once (Lance runs the aggregate of one scan on a single thread) and merges the group rows by key before building its buckets, so `shard_size`, `sum_other_doc_count` and the error bound keep the meaning of a single scan per node. The extra scans run on the node's `index_searcher` thread pool; when that pool has no free thread the request's own thread scans the remaining groups.
-- Nested `terms` levels multiply the key combinations the scan may return. `lance.aggregation.pushdown_max_groups` bounds them in two places:
+- Each executor scans its fragments in up to `plugins.lance.aggregation.pushdown_parallelism` contiguous groups at once (Lance runs the aggregate of one scan on a single thread) and merges the group rows by key before building its buckets, so `shard_size`, `sum_other_doc_count` and the error bound keep the meaning of a single scan per node. The extra scans run on the node's `index_searcher` thread pool; when that pool has no free thread the request's own thread scans the remaining groups.
+- Nested `terms` levels multiply the key combinations the scan may return. `plugins.lance.aggregation.pushdown_max_groups` bounds them in two places:
   - The coordinator's planner estimates the group rows the executor would hold from the table statistics (the distinct counts of the bitmap indexes, the value ranges of the BTree indexes over integer columns, the date intervals, the range and filter counts, capped at the row count, and cut to the `shard_size` retention of a single count or metric ordered `terms` level) and prices the pushed scan as infinite when the estimate exceeds the bound, so the plan is the Lucene operator and explain shows it.
     - A key whose column has neither a distinct count nor an integer range (no bitmap index and no BTree over an integer column, or a `histogram`) has no statistics estimate, and a tree with such a key is not judged against the bound by the planner.
   - The executor estimates the groups again from the request shape (the product of the levels' `shard_size`; a `range` / `filters` level counts as its bucket count plus one) and refuses the shipped pushed aggregate when its own estimate exceeds the same bound; the refusal is counted as `plan.refinements.aggregate_resolution` in `GET /_plugins/_lance/stats` and the request runs on the aggregators. This second bound protects the executor's group state when the statistics said fewer groups than the request shape implies, or said nothing.
@@ -103,7 +103,7 @@ tdigest `percentiles` / `percentile_ranks` take two rounds of scans: the first r
 - Requests with a full-text or `lance_knn` query, a `post_filter`, hits (`size > 0`), or a reader wrapper (security plugin DLS / FLS).
 - `terms` on a `list<utf8>` column, arithmetic metrics on `keyword`, `histogram` on `date` / `boolean` fields, `range` on `keyword` / `boolean`, `date_range` on a non date field, scripts and `value_type`.
 - A tree carrying a `cardinality` (by cost, see above) or a pipeline aggregation ([features.md](features.md#aggregations)).
-- A group estimate above `lance.aggregation.pushdown_max_groups`.
+- A group estimate above `plugins.lance.aggregation.pushdown_max_groups`.
 
 ## Observing the plan
 

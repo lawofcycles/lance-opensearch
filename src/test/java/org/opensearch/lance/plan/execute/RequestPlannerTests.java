@@ -416,7 +416,7 @@ public class RequestPlannerTests extends OpenSearchTestCase {
 
     public void testRoutingSettingsReachThePlanAsCostInputs() throws IOException {
         // The coordinator no longer pre decides what the planner sees:
-        // lance.aggregation.pushdown and pushdown_max_groups travel in
+        // plugins.lance.aggregation.pushdown and pushdown_max_groups travel in
         // the CostInputs and the plan kind follows them, with nothing
         // named as unplanned because the translator accepted the tree.
         String terms = "{\"size\":0,\"aggs\":{\"by\":{\"terms\":{\"field\":\"category\"}}}}";

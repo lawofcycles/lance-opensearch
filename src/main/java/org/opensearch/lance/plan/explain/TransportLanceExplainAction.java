@@ -68,8 +68,8 @@ import java.io.IOException;
  * the same {@link CostInputs} the coordinator would plan with (the
  * cluster's data node count, the table URI's storage kind, this node's
  * CPUs, the two parallelism settings, and the aggregation routing
- * settings {@code lance.aggregation.pushdown} and
- * {@code lance.aggregation.pushdown_max_groups}, which the cost model
+ * settings {@code plugins.lance.aggregation.pushdown} and
+ * {@code plugins.lance.aggregation.pushdown_max_groups}, which the cost model
  * turns into an infinite pushed cost). The physical text is the coordinator
  * tree over a fan out of one request per data node; at execution the
  * width can differ when the table has fewer fragments than nodes or a
@@ -105,7 +105,7 @@ import java.io.IOException;
  * callers alike.
  *
  * <p>The cost budgets handed to {@link LancePlannerFactory} (the node's
- * {@code lance.native_memory.limit} and the JVM's max heap) feed the
+ * {@code plugins.lance.native_memory.limit} and the JVM's max heap) feed the
  * cost ordering the Volcano run compares candidates with; nothing
  * predicts real byte usage yet, so they act as placeholders.
  */
@@ -150,7 +150,7 @@ public final class TransportLanceExplainAction extends HandledTransportAction<La
             listener.onFailure(new IndexNotFoundException(indexName));
             return;
         }
-        String tableUri = metadata.getSettings().get(LanceEngineFactory.TABLE_SETTING);
+        String tableUri = LanceEngineFactory.tableOf(metadata.getSettings());
         if (tableUri == null || tableUri.isEmpty()) {
             listener.onFailure(new IllegalArgumentException("index " + indexName + " is not a Lance index"));
             return;
@@ -174,7 +174,7 @@ public final class TransportLanceExplainAction extends HandledTransportAction<La
         // holds the table, so the plan below prunes the same fragments
         // the coordinator's plan for this body would.
         LanceSchemas.IndexModel model = LanceSchemas.build(metadata, warmCache, QueryToRex.referencedFields(query));
-        String tableUri = metadata.getSettings().get(LanceEngineFactory.TABLE_SETTING);
+        String tableUri = LanceEngineFactory.tableOf(metadata.getSettings());
         CostInputs inputs = RequestPlanner.clusterInputs(dataNodes(), tableUri, clusterService.getClusterSettings());
         ExecutionShape shape = ExecutionShape.of(source, query);
         RequestPlanner.Planned planned;

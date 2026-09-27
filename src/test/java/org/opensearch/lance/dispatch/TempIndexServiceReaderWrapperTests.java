@@ -85,7 +85,7 @@ public class TempIndexServiceReaderWrapperTests extends OpenSearchSingleNodeTest
         assertNotNull(attached);
         // withTempIndexService refuses an index the node already has, so
         // hand it a copy of the metadata under a fresh name and UUID.
-        // It still carries index.lance.table, which is what the wrapper
+        // It still carries index.plugins.lance.table, which is what the wrapper
         // plugin keys on.
         IndexMetadata detached = IndexMetadata.builder(attached)
             .index(indexName + "-detached")

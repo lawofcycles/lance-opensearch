@@ -11,7 +11,7 @@ import java.util.List;
  * Node-level allowlist for the paths / URIs {@code attach} and
  * {@code namespace} accept as Lance table roots.
  *
- * <p>Configured through the {@code lance.allowed_table_roots} setting, which
+ * <p>Configured through the {@code plugins.lance.allowed_table_roots} setting, which
  * takes a list of prefixes. A candidate path is accepted when its normalised
  * form (guaranteed to end with {@code /}) starts with the normalised form of
  * any configured root. An empty list disables the check so operators can

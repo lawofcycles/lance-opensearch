@@ -150,7 +150,7 @@ public class CostModelPlannerTests extends OpenSearchTestCase {
     }
 
     public void testPushdownOffPricesThePushedScanAsInfiniteAtEverySize() throws IOException {
-        // lance.aggregation.pushdown: false is a cost input: the pushed
+        // plugins.lance.aggregation.pushdown: false is a cost input: the pushed
         // scan costs infinity, so the Lucene operator wins for the
         // shapes the pushed scan otherwise takes (the unsliced local
         // node, where all three shapes measured faster pushed), on the

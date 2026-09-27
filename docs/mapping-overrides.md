@@ -1,6 +1,6 @@
 # Mapping overrides and index type selection
 
-The attach body and the namespace register body take two optional clauses next to the table: `overrides`, per column mapping rules that change the OpenSearch type the plugin derives from the Arrow schema, and `indexes`, the Lance index type the build creates per column. Both persist in the `index.lance.overrides` index setting and are re-applied on every manifest version advance. [features.md](features.md#mapping-type-coverage) lists the types the derivation picks without an override.
+The attach body and the namespace register body take two optional clauses next to the table: `overrides`, per column mapping rules that change the OpenSearch type the plugin derives from the Arrow schema, and `indexes`, the Lance index type the build creates per column. Both persist in the `index.plugins.lance.overrides` index setting and are re-applied on every manifest version advance. [features.md](features.md#mapping-type-coverage) lists the types the derivation picks without an override.
 
 - [Mapping overrides](#mapping-overrides)
   - [`type: date`](#type-date)
@@ -114,7 +114,7 @@ How queries run:
 
 How the backfill runs:
 
-- The source column is scanned in fragment order, each batch of 4,096 rows is tokenized as one task on the generic thread pool with at most `lance.attach.backfill_threads` running at once (node setting, dynamic, default half the CPUs the JVM sees, at least 1), and the token batches are handed to Lance's `AddColumns` in source order, which writes them into the table's own data files.
+- The source column is scanned in fragment order, each batch of 4,096 rows is tokenized as one task on the generic thread pool with at most `plugins.lance.attach.backfill_threads` running at once (node setting, dynamic, default half the CPUs the JVM sees, at least 1), and the token batches are handed to Lance's `AddColumns` in source order, which writes them into the table's own data files.
 - Nothing is spooled to a local disk and no free space is checked on the node: the backfill needs no disk of its own, and memory stays bounded by the batches in flight (twice the thread count, source text plus tokens).
 - The table grows by about the size of the source column (the derived column stores the tokens, joined by spaces), and then by the inverted index over it.
 - Expected rate: about 165,000 rows per second per thread for 250 byte English values with the `english` analyzer, so a 20M row column takes about 8 s of tokenizing on 16 threads before Lance writes the column and builds its index. The Lance side of `AddColumns` and the index build are Lance's own cost and are not affected by the thread setting.
@@ -160,8 +160,8 @@ Validation answers 400 naming the column and the reason:
 ### Persistence
 
 - `POST /_plugins/_lance/namespace` accepts the same `overrides` object and applies it to every table it surfaces under the root. A column a table lacks is skipped for that table (logged at debug) while the full list is persisted, so the override applies once a later manifest adds the column.
-- Overrides are persisted as canonical JSON in the `index.lance.overrides` index setting. The freshness check's re-derivation reads the setting back and re-applies it on every manifest version advance, so overrides survive schema changes; an override whose column disappears is kept in the setting and skipped until the column returns.
-- Indexes created before this setting existed keep resolving their sub-fields from the legacy `index.lance.multi_fields` setting.
+- Overrides are persisted as canonical JSON in the `index.plugins.lance.overrides` index setting. The freshness check's re-derivation reads the setting back and re-applies it on every manifest version advance, so overrides survive schema changes; an override whose column disappears is kept in the setting and skipped until the column returns.
+- Indexes created before this setting existed keep resolving their sub-fields from the legacy `index.plugins.lance.multi_fields` setting.
 - The setting is dynamic because the check itself rewrites it when the table renames an overridden column (the override follows the column, see [Schema drift](features.md#schema-drift)) or resets one to a type the override no longer fits. An operator can also edit it with `PUT /{index}/_settings`, but a manual edit only takes effect at the next mapping re-derivation and reader reopen, so re-attaching is the predictable way to change overrides by hand.
 
 ## Index type selection
@@ -212,6 +212,6 @@ Vector defaults and minimums:
 
 Where the preference lives:
 
-- The preference persists inside the `index.lance.overrides` setting (under a top-level `indexes` key), so the re-derivation on manifest version advance carries it like the mapping overrides, and the namespace register applies it leniently per table (a table without the column skips it).
+- The preference persists inside the `index.plugins.lance.overrides` setting (under a top-level `indexes` key), so the re-derivation on manifest version advance carries it like the mapping overrides, and the namespace register applies it leniently per table (a table without the column skips it).
 - `POST /_plugins/_lance/build_indexes/{index}` accepts the same `indexes` object in its body as a one-shot override of the persisted preference for that build only; nothing is persisted. `optimize: true` merges whatever index exists regardless of its type.
 - `GET /_plugins/_lance/stats` reports, per index, the Lance index types present per column under `indices.<index>.index_types` (`{"rating": ["ZoneMap"], "embedding": ["IVF_FLAT"]}`, read from `describeIndices` once per stats call), so an operator can verify the preference took effect. When the index has a reader wrapper installed (a security plugin's DLS/FLS wrapper), `index_types`, `renamed_fields`, `rows`, `shard_reader_rows` and `nested_docs` are omitted and the entry carries `lucene_bound_exceeded` alone: Lance's index metadata, the mapping's rename entries and the row counts do not pass through the wrapper, and the report must not reveal column names or rows the wrapper hides.

@@ -304,7 +304,7 @@ public class LanceDispatchActionFilter implements ActionFilter {
                 return false;
             }
             Settings settings = indexMetadata.getSettings();
-            String tableSetting = settings.get(LanceEngineFactory.TABLE_SETTING);
+            String tableSetting = LanceEngineFactory.tableOf(settings);
             if (tableSetting == null || tableSetting.isEmpty()) {
                 return false;
             }

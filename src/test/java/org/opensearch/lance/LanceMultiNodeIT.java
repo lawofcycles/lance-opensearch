@@ -849,8 +849,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             String before = readAll(postJson("/" + indexName + "/_search", sorted));
             assertEquals(List.of("2-2", "2-0", "1-2", "1-0", "0-2", "0-0"), hitIds(before));
 
-            updateClusterSetting("lance.test.index_cache_shard_share", "1b");
-            updateClusterSetting("lance.admission.headroom", "1pb");
+            updateClusterSetting("plugins.lance.test.index_cache_shard_share", "1b");
+            updateClusterSetting("plugins.lance.admission.headroom", "1pb");
             try {
                 ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/" + indexName + "/_search", sorted));
                 int status = failure.getResponse().getStatusLine().getStatusCode();
@@ -859,8 +859,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 assertTrue("expected circuit_breaking_exception: " + body, body.contains("circuit_breaking_exception"));
                 assertTrue("expected the admission label: " + body, body.contains("lance_admission"));
             } finally {
-                updateClusterSetting("lance.admission.headroom", null);
-                updateClusterSetting("lance.test.index_cache_shard_share", null);
+                updateClusterSetting("plugins.lance.admission.headroom", null);
+                updateClusterSetting("plugins.lance.test.index_cache_shard_share", null);
             }
             String after = readAll(postJson("/" + indexName + "/_search", sorted));
             assertEquals(hitIds(before), hitIds(after));
@@ -1267,7 +1267,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             // With the probe limit below the match count, the shapes
             // that need every match repeat their scan restricted to the
             // node's fragments and must still agree with the oracle.
-            updateClusterSetting("lance.fts.subset_probe_limit", "50");
+            updateClusterSetting("plugins.lance.fts.subset_probe_limit", "50");
             for (String shape : shapes) {
                 assertFragmentPathMatchesStockSearch(indexName, shape);
             }
@@ -1290,7 +1290,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             });
         } finally {
             try {
-                updateClusterSetting("lance.fts.subset_probe_limit", null);
+                updateClusterSetting("plugins.lance.fts.subset_probe_limit", null);
             } catch (Exception ignored) {}
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
@@ -1555,7 +1555,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             // The default probe limit is above the 300 matches, then a
             // probe limit below them; the scan counts must not move.
             for (String probeLimit : new String[] { null, "50" }) {
-                updateClusterSetting("lance.fts.subset_probe_limit", probeLimit);
+                updateClusterSetting("plugins.lance.fts.subset_probe_limit", probeLimit);
 
                 // The page scan of ten rows fills on every executor, so
                 // the count only scan follows it: two scans per node.
@@ -1601,7 +1601,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             });
         } finally {
             try {
-                updateClusterSetting("lance.fts.subset_probe_limit", null);
+                updateClusterSetting("plugins.lance.fts.subset_probe_limit", null);
             } catch (Exception ignored) {}
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
@@ -1732,7 +1732,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
      * The Substrait aggregation pushdown on three executors, each
      * holding one fragment of the interleaved fixture (ids
      * {@code i % 3 == f} on fragment {@code f}). With
-     * {@code lance.aggregation.pushdown} on and off the responses have
+     * {@code plugins.lance.aggregation.pushdown} on and off the responses have
      * to be identical: for {@code terms} that covers the merge of three
      * per node partials, {@code sum_other_doc_count} and
      * {@code doc_count_error_upper_bound} included. With
@@ -1812,7 +1812,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             assertEquals(298, extractIntPath(sizeTwo, "aggregations", "by_id", "sum_other_doc_count"));
             assertEquals(3, extractIntPath(sizeTwo, "aggregations", "by_id", "doc_count_error_upper_bound"));
 
-            updateClusterSetting("lance.aggregation.pushdown", "false");
+            updateClusterSetting("plugins.lance.aggregation.pushdown", "false");
             try {
                 for (int i = 0; i < shapes.size(); i++) {
                     Map<String, Object> viaAggregators = parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(i) + "}")));
@@ -1820,7 +1820,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                     assertEquals(shapes.get(i), viaAggregators.get("hits"), pushed.get(i).get("hits"));
                 }
             } finally {
-                updateClusterSetting("lance.aggregation.pushdown", null);
+                updateClusterSetting("plugins.lance.aggregation.pushdown", null);
             }
             // Every data node took part: the pushdown ran on three
             // executors, not on one node holding every fragment.
@@ -1904,7 +1904,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 assertEquals(300, extractIntPath(pushedSketches.get(0), "aggregations", "u", "value"));
                 assertEquals(3, extractIntPath(pushedSketches.get(1), "aggregations", "k", "value"));
 
-                updateClusterSetting("lance.aggregation.pushdown", "false");
+                updateClusterSetting("plugins.lance.aggregation.pushdown", "false");
                 try {
                     for (int i = 0; i < exact.size(); i++) {
                         Map<String, Object> viaAggregators = parse(
@@ -1914,7 +1914,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                         assertEquals(exact.get(i), viaAggregators.get("hits"), pushed.get(i).get("hits"));
                     }
                 } finally {
-                    updateClusterSetting("lance.aggregation.pushdown", null);
+                    updateClusterSetting("plugins.lance.aggregation.pushdown", null);
                 }
                 // The pushdown answered on every data node for the exact
                 // shapes and the percentiles shape (the stock search path and
@@ -2035,7 +2035,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         );
         try {
             updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", "DEBUG");
-            updateClusterSetting("lance.aggregation.pushdown_parallelism", "4");
+            updateClusterSetting("plugins.lance.aggregation.pushdown_parallelism", "4");
             Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
@@ -2069,8 +2069,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             // the pushdown cuts the terms once per executor, as one slice
             // does, while several slices each cut their own share and
             // report the doc count error of the merge.
-            updateClusterSetting("lance.aggregation.pushdown", "false");
-            updateClusterSetting("lance.fragment_path.slices", "1");
+            updateClusterSetting("plugins.lance.aggregation.pushdown", "false");
+            updateClusterSetting("plugins.lance.fragment_path.slices", "1");
             try {
                 for (int i = 0; i < shapes.size(); i++) {
                     Map<String, Object> viaAggregators = parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(i) + "}")));
@@ -2078,8 +2078,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                     assertEquals(shapes.get(i), viaAggregators.get("hits"), pushed.get(i).get("hits"));
                 }
             } finally {
-                updateClusterSetting("lance.aggregation.pushdown", null);
-                updateClusterSetting("lance.fragment_path.slices", null);
+                updateClusterSetting("plugins.lance.aggregation.pushdown", null);
+                updateClusterSetting("plugins.lance.fragment_path.slices", null);
             }
             // Every executor announced its answers, and with twelve
             // fragments over three nodes at least one of them merged
@@ -2101,7 +2101,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             });
         } finally {
             try {
-                updateClusterSetting("lance.aggregation.pushdown_parallelism", null);
+                updateClusterSetting("plugins.lance.aggregation.pushdown_parallelism", null);
             } catch (Exception ignored) {}
             try {
                 updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", null);
@@ -2428,8 +2428,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             "\"size\":0,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"id\",\"percents\":[10,50,90],\"hdr\":{\"number_of_significant_value_digits\":3}}}}" };
         try {
             updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", "DEBUG");
-            updateClusterSetting("lance.aggregation.pushdown", "false");
-            updateClusterSetting("lance.fragment_path.slices", "2");
+            updateClusterSetting("plugins.lance.aggregation.pushdown", "false");
+            updateClusterSetting("plugins.lance.fragment_path.slices", "2");
             Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
@@ -2468,7 +2468,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             int expectedRequests = fragmentPathRequests;
             String marker = "lance.dispatch: fragment path slices for ["
                 + indexName
-                + "]: 4 leaves in 2 slices (lance.fragment_path.slices 2)";
+                + "]: 4 leaves in 2 slices (plugins.lance.fragment_path.slices 2)";
             assertBusy(() -> {
                 Map<String, Integer> perNode = new HashMap<>();
                 for (String line : clusterLogLines()) {
@@ -2485,8 +2485,8 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         } finally {
             for (String key : new String[] {
                 "logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction",
-                "lance.aggregation.pushdown",
-                "lance.fragment_path.slices" }) {
+                "plugins.lance.aggregation.pushdown",
+                "plugins.lance.fragment_path.slices" }) {
                 try {
                     updateClusterSetting(key, null);
                 } catch (Exception ignored) {}
@@ -2535,7 +2535,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
      * A heap column load the request breaker refuses on one executor
      * reaches the client as HTTP 429. Four fragments of 400 rows over
      * three data nodes put fragments 0 and 3 on the first node and one
-     * fragment on each of the other two; with {@code lance.cache.enabled}
+     * fragment on each of the other two; with {@code plugins.lance.cache.enabled}
      * off every executor materialises {@code rating} in heap, about
      * 3.3 KB per fragment, on top of the 5 KB every aggregator reserves
      * on the same breaker when it is built. A request breaker limit of
@@ -2556,9 +2556,9 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         String sum = "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}";
-        updateClusterSetting("lance.aggregation.pushdown", "false");
-        updateClusterSetting("lance.cache.enabled", "false");
-        updateClusterSetting("lance.fragment_path.slices", "1");
+        updateClusterSetting("plugins.lance.aggregation.pushdown", "false");
+        updateClusterSetting("plugins.lance.cache.enabled", "false");
+        updateClusterSetting("plugins.lance.fragment_path.slices", "1");
         try {
             Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
@@ -2605,9 +2605,9 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 assertEquals("fragments went to " + assignments, 3, assignments.size());
             });
         } finally {
-            updateClusterSetting("lance.cache.enabled", null);
-            updateClusterSetting("lance.aggregation.pushdown", null);
-            updateClusterSetting("lance.fragment_path.slices", null);
+            updateClusterSetting("plugins.lance.cache.enabled", null);
+            updateClusterSetting("plugins.lance.aggregation.pushdown", null);
+            updateClusterSetting("plugins.lance.fragment_path.slices", null);
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
@@ -2736,7 +2736,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
      * leaves one after the other or side by side, so the side by side
      * part is pinned through the cluster log: a debug logger on
      * {@code LanceStoredFields} names the thread of every take, and with
-     * {@code lance.fragment_path.parallelism} raised to 4 (the default is
+     * {@code plugins.lance.fragment_path.parallelism} raised to 4 (the default is
      * half the processors, 1 on a small CI runner) the takes of this
      * table run on more threads than there are data nodes. An executor
      * that takes its leaves one after the other uses exactly one thread,
@@ -2752,7 +2752,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String indexName = tableName;
         try {
             updateClusterSetting("logger.org.opensearch.lance.engine.LanceStoredFields", "DEBUG");
-            updateClusterSetting("lance.fragment_path.parallelism", "4");
+            updateClusterSetting("plugins.lance.fragment_path.parallelism", "4");
             Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
@@ -2838,7 +2838,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 updateClusterSetting("logger.org.opensearch.lance.engine.LanceStoredFields", null);
             } catch (Exception ignored) {}
             try {
-                updateClusterSetting("lance.fragment_path.parallelism", null);
+                updateClusterSetting("plugins.lance.fragment_path.parallelism", null);
             } catch (Exception ignored) {}
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
@@ -2961,7 +2961,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            updateClusterSetting("lance.attach.warm_indexes", "none");
+            updateClusterSetting("plugins.lance.attach.warm_indexes", "none");
             assertEquals("fixture assumes every node coordinates and executes", 3, dataNodeCount());
             // Nothing of the earlier tests is still collecting, so the
             // counters below move for this table alone.
@@ -3034,7 +3034,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
             try {
-                updateClusterSetting("lance.attach.warm_indexes", null);
+                updateClusterSetting("plugins.lance.attach.warm_indexes", null);
             } catch (Exception ignored) {}
         }
     }
@@ -3679,7 +3679,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             "{\"size\":0,\"track_total_hits\":true,\"query\":{\"range\":{\"id\":{\"gte\":30,\"lt\":100}}}}" };
         try {
             assertEquals("fixture assumes two fragments per data node", 3, dataNodeCount());
-            updateClusterSetting("lance.test.max_docs_per_reader", "20");
+            updateClusterSetting("plugins.lance.test.max_docs_per_reader", "20");
             String attach = readAll(postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}"));
             assertEquals(attach, 6, extractIntPath(attach, "fragments"));
             assertTrue(attach, attach.contains("\"lucene_bound_exceeded\":true"));
@@ -3746,7 +3746,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             // GET through the Lance scan filter reaches rows outside the
             // shard reader; a body no plan answers (a highlighter) is
             // refused with 400 naming the element.
-            updateClusterSetting("lance.test.max_docs_per_reader", "4");
+            updateClusterSetting("plugins.lance.test.max_docs_per_reader", "4");
             String pkAttach = readAll(postJson("/_plugins/_lance/attach", "{\"table\":\"" + pkTableUri + "\"}"));
             assertTrue(pkAttach, pkAttach.contains("\"lucene_bound_exceeded\":true"));
             client().performRequest(new Request("GET", "/_cluster/health/" + pkTable + "?wait_for_status=green&timeout=60s"));
@@ -3767,7 +3767,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
 
             // The default bound gives one request per node and the same
             // answers.
-            updateClusterSetting("lance.test.max_docs_per_reader", null);
+            updateClusterSetting("plugins.lance.test.max_docs_per_reader", null);
             for (int i = 0; i < requests.length; i++) {
                 Map<String, Object> oneGroup = parse(readAll(postJson("/" + tableName + "/_search", requests[i])));
                 assertEquals(requests[i], sourceIds(grouped.get(i)), sourceIds(oneGroup));
@@ -3780,7 +3780,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             }
         } finally {
             try {
-                updateClusterSetting("lance.test.max_docs_per_reader", null);
+                updateClusterSetting("plugins.lance.test.max_docs_per_reader", null);
             } catch (Exception ignored) {}
             for (String index : List.of(tableName, pkTable)) {
                 try {

@@ -210,7 +210,7 @@ There is no directory to mount into the container and nothing for the namespace 
 
 ## 4. Register the namespace
 
-Register the directory once per namespace path. The plugin polls the directory every ten seconds (configurable via `lance.namespace.poll_cadence`) and auto-surfaces every `*.lance` directory found underneath as an OpenSearch index.
+Register the directory once per namespace path. The plugin polls the directory every ten seconds (configurable via `plugins.lance.namespace.poll_cadence`) and auto-surfaces every `*.lance` directory found underneath as an OpenSearch index.
 
 ```
 curl -X POST http://localhost:9200/_plugins/_lance/namespace \
@@ -242,7 +242,7 @@ curl -X POST http://localhost:9200/_plugins/_lance/attach \
 
 The call is idempotent; a second attach on the same table returns `already_attached: true`.
 
-Every endpoint of the plugin lives under `/_plugins/_lance/`. In 0.1.0 the previous paths (`/_lance/attach`, `/_lance/namespace`, `/_lance/build_indexes/{index}`, `/_lance/refs/{index}`, `/_lance/stats`, `/_lance/stats/{node_id}`, `/{index}/_lance/explain`, `/{index}/_lance/sync`) still answer, with a deprecation `Warning` header on the response and a line in the node's deprecation log naming the new path. They are removed in the next minor release.
+Every endpoint of the plugin lives under `/_plugins/_lance/`, the node settings under `plugins.lance.*` and the index settings under `index.plugins.lance.*`. In 0.1.0 the previous paths (`/_lance/attach`, `/_lance/namespace`, `/_lance/build_indexes/{index}`, `/_lance/refs/{index}`, `/_lance/stats`, `/_lance/stats/{node_id}`, `/{index}/_lance/explain`, `/{index}/_lance/sync`) still answer, with a deprecation `Warning` header on the response and a line in the node's deprecation log naming the new path. The previous setting names, `lance.*` and `index.lance.*`, are accepted the same way: a value under an old key is read when the new key is absent, and every read of an old key logs a deprecation warning (a `Warning` header on the request that read it). An index created under the old keys keeps opening; attach and the namespace poll write the new keys only. The old paths and the old setting names are removed in the next minor release.
 
 ### Point at S3, GCS, or Azure with storage_options
 
@@ -271,7 +271,7 @@ The same shape works on `POST /_plugins/_lance/namespace`; every table auto-surf
 
 Values must be strings. The plugin does not enumerate a fixed allowlist; whatever keys Lance's Rust `object_store` recognises for the URI scheme reach it verbatim. When `storage_options` is omitted, Lance falls back to its normal environment-variable path (`AWS_*` / `GCS_*` / `AZURE_*`).
 
-Options are persisted as `index.lance.storage_options.<key>` on the created index, so a single node can address two buckets with different credentials at the same time. The credential keys (any name containing `secret`, `password`, `token`, `key`, `authorization` or `credential`) are withheld from `GET /<index>/_settings`, `GET /<index>` and the cluster state API; region, endpoint and `allow_http` stay visible. A snapshot of the index still carries every option, credentials included ([limitations.md](limitations.md#storage-and-credentials)).
+Options are persisted as `index.plugins.lance.storage_options.<key>` on the created index, so a single node can address two buckets with different credentials at the same time. The credential keys (any name containing `secret`, `password`, `token`, `key`, `authorization` or `credential`) are withheld from `GET /<index>/_settings`, `GET /<index>` and the cluster state API; region, endpoint and `allow_http` stay visible. A snapshot of the index still carries every option, credentials included ([limitations.md](limitations.md#storage-and-credentials)).
 
 ## 5. Verify: run the query shapes
 
@@ -624,10 +624,10 @@ The plan text format will change as the planner grows; read it, do not parse it.
 
 If you rewrite the table externally (Python `dataset.append`, `dataset.update`, `merge_insert`, or a Ray / Spark writer), the freshness check on the node holding the index's shard picks up the new manifest version within one cadence period and swaps the shard's reader. Queries reflect the new data after the next check fires. No `_refresh`, `_close`, or shard reallocation is needed.
 
-Force a faster check by lowering `lance.namespace.poll_cadence` (node-level setting, minimum 1s; it is the cadence of both the catalog listing on the cluster manager and the freshness check on the shard's node) in `opensearch.yml`, or run the check now with `POST /_plugins/_lance/sync/demo`:
+Force a faster check by lowering `plugins.lance.namespace.poll_cadence` (node-level setting, minimum 1s; it is the cadence of both the catalog listing on the cluster manager and the freshness check on the shard's node) in `opensearch.yml`, or run the check now with `POST /_plugins/_lance/sync/demo`:
 
 ```
-lance.namespace.poll_cadence: 1s
+plugins.lance.namespace.poll_cadence: 1s
 ```
 
 ### How the plugin thinks about indexes
@@ -660,7 +660,7 @@ When Lance advances to a new version, the plugin exposes it as soon as the next 
 
 Lance's own scanner produces a mixed execution plan for FTS and knn: covered fragments use the existing index, uncovered fragments run a flat scan, and the results are unioned by the query engine, so an incremental append never slows down queries hitting the previously-covered fragments.
 
-The `index.lance.uncovered_fragment_policy` setting accepts `wait` alongside the default `immediate`. Both values expose the new version immediately; `wait` is reserved for a future async-optimize implementation, and setting it logs an informational message so operators are aware that the plugin does not run auto-optimize.
+The `index.plugins.lance.uncovered_fragment_policy` setting accepts `wait` alongside the default `immediate`. Both values expose the new version immediately; `wait` is reserved for a future async-optimize implementation, and setting it logs an informational message so operators are aware that the plugin does not run auto-optimize.
 
 ### Serving an object store table from local NVMe
 
@@ -716,16 +716,16 @@ Should Lance's object store layer gain a read-through disk cache of its own (the
 
 ### Cap Lance's native memory footprint
 
-Lance keeps its inverted-index and metadata caches in native memory, outside the JVM heap. The plugin installs a single Lance `Session` at startup so every table on a node shares the same caches. The upper bound is set by `lance.native_memory.limit`, a node-level setting that accepts either a byte value or a percentage of the memory left after the JVM heap is subtracted from physical memory. The default is `40%`, which scales with instance size and leaves room for the k-NN plugin's own memory budget on nodes that host both plugins.
+Lance keeps its inverted-index and metadata caches in native memory, outside the JVM heap. The plugin installs a single Lance `Session` at startup so every table on a node shares the same caches. The upper bound is set by `plugins.lance.native_memory.limit`, a node-level setting that accepts either a byte value or a percentage of the memory left after the JVM heap is subtracted from physical memory. The default is `40%`, which scales with instance size and leaves room for the k-NN plugin's own memory budget on nodes that host both plugins.
 
 ```
-lance.native_memory.limit: 40%      # default; percent of (physical - heap)
-lance.native_memory.limit: 10gb     # or an absolute byte value
+plugins.lance.native_memory.limit: 40%      # default; percent of (physical - heap)
+plugins.lance.native_memory.limit: 10gb     # or an absolute byte value
 ```
 
-The parsed value is split first by `lance.cache.column_share` (default 0.4), which goes to the off-heap column store; the rest belongs to the Lance `Session` and is split 6:1 between the index cache and the metadata cache, mirroring Lance's own default ratio. This is a static setting, so a change requires a rolling restart to take effect.
+The parsed value is split first by `plugins.lance.cache.column_share` (default 0.4), which goes to the off-heap column store; the rest belongs to the Lance `Session` and is split 6:1 between the index cache and the metadata cache, mirroring Lance's own default ratio. This is a static setting, so a change requires a rolling restart to take effect.
 
-On startup the plugin logs the resolved sizes so the operator can confirm the split, for example `installed shared Lance Session: limit [37gb] -> index cache [15.9gb] (shards 2, share 7.9gb per shard), metadata cache [3.1gb], column cache [14.8gb], unused [3gb] (from lance.native_memory.limit [40%], lance.cache.column_share [0.4], 16 cpus)`.
+On startup the plugin logs the resolved sizes so the operator can confirm the split, for example `installed shared Lance Session: limit [37gb] -> index cache [15.9gb] (shards 2, share 7.9gb per shard), metadata cache [3.1gb], column cache [14.8gb], unused [3gb] (from plugins.lance.native_memory.limit [40%], plugins.lance.cache.column_share [0.4], 16 cpus)`.
 
 The index cache does not receive its whole 6/7 share, and the log line says why. Lance backs the index cache with a sharded cache whose shards do not borrow capacity from one another, and an entry heavier than one shard's share is refused without an error. The plugin therefore chooses, within the 6/7 budget, the capacity whose share per shard is largest, hands that to Lance and leaves the difference unused; it is not given to the column store.
 
@@ -733,7 +733,7 @@ The index cache does not receive its whole 6/7 share, and the log line says why.
 - An inverted index is kept as one entry per full-text column (about 52 bytes per row, 4.8 GiB at 100M rows), so a cache whose share is below that reloads the index from storage on every full-text query.
 - The candidates the plugin compares are the budget itself and each `k * 4 GiB - 1` for `k = 2, 4, 8, ...`.
 - `GET /_plugins/_lance/stats` reports the chosen capacity, shard count and share under `native_memory`, and `POST /_plugins/_lance/attach` logs a warning when a table's estimated inverted index entry is heavier than the share.
-- To raise the share, raise `lance.native_memory.limit` or lower `lance.cache.column_share`; with the choice above a larger budget never yields a smaller share.
+- To raise the share, raise `plugins.lance.native_memory.limit` or lower `plugins.lance.cache.column_share`; with the choice above a larger budget never yields a smaller share.
 
 ### Circuit breaker for Lance native memory
 
@@ -743,16 +743,16 @@ The plugin registers a `lance_native` circuit breaker with OpenSearch's standard
 curl -sS localhost:9200/_nodes/stats/breaker | jq '.nodes[].breakers.lance_native'
 ```
 
-The breaker's byte limit mirrors `lance.native_memory.limit`, and the plugin samples `Session.sizeBytes()` on a background scheduler (every 5 seconds by default) to keep the breaker's accounting close to the real footprint. FTS and knn query paths call the breaker before starting a native scan; if the usage has caught up to the limit the query is rejected with a `CircuitBreakingException` (HTTP 429), which stays transient because the next polling tick or an LRU eviction will let the next request through.
+The breaker's byte limit mirrors `plugins.lance.native_memory.limit`, and the plugin samples `Session.sizeBytes()` on a background scheduler (every 5 seconds by default) to keep the breaker's accounting close to the real footprint. FTS and knn query paths call the breaker before starting a native scan; if the usage has caught up to the limit the query is rejected with a `CircuitBreakingException` (HTTP 429), which stays transient because the next polling tick or an LRU eviction will let the next request through.
 
 Two cluster settings tune this:
 
 ```
-lance.native_memory.circuit_breaker.enabled: true       # default; toggle enforcement
-lance.native_memory.circuit_breaker.poll_interval: 5s   # default; how fast the sampler catches up
+plugins.lance.native_memory.circuit_breaker.enabled: true       # default; toggle enforcement
+plugins.lance.native_memory.circuit_breaker.poll_interval: 5s   # default; how fast the sampler catches up
 ```
 
-Both are dynamic, so changes take effect without a restart. The byte limit itself is not directly configurable through the breaker; it always follows `lance.native_memory.limit` so operators reason about one number.
+Both are dynamic, so changes take effect without a restart. The byte limit itself is not directly configurable through the breaker; it always follows `plugins.lance.native_memory.limit` so operators reason about one number.
 
 ### Inspect the snapshot and column cache
 
@@ -862,23 +862,23 @@ How to read it:
 
 - `snapshots.count` is normally the number of Lance-backed shards on the node (each shard reader holds its version's snapshot) plus any version a request is still reading. It grows by one when a table advances and the poll has not refreshed the shard yet, and comes back down when the poll retires the old version. A `retired` value that stays above zero means a reader of an old version has not closed.
 - `snapshot_build_count` should stop growing once every table version in use has been seen; `snapshot_hit_count` grows with every `_search`. Builds that keep growing on a table that is not changing mean requests are not finding the cached version. `dataset_open_count` also grows by one for every request the node coordinates (the coordinator opens the table to enumerate its fragments, or to learn its version when the index follows the table), except a result cache hit on an index pinned to a version, which opens nothing.
-- `column_store.bytes` against `limit_bytes` tells you how much of `lance.cache.column_share` is in use. `loads` grows on the first request that reads a column of a fragment, `hits` on every later one.
-  - `budget_misses` above zero means requests fell back to heap loads because the store was full; raise `lance.cache.column_share` or `lance.native_memory.limit`, or reduce the number of columns aggregated or sorted on.
+- `column_store.bytes` against `limit_bytes` tells you how much of `plugins.lance.cache.column_share` is in use. `loads` grows on the first request that reads a column of a fragment, `hits` on every later one.
+  - `budget_misses` above zero means requests fell back to heap loads because the store was full; raise `plugins.lance.cache.column_share` or `plugins.lance.native_memory.limit`, or reduce the number of columns aggregated or sorted on.
   - `heap_fallback_bytes` is the heap those loads currently hold on the request circuit breaker, and `heap_fallback_rejections` counts the loads the breaker refused (HTTP 429 to the client); a rising rejection count means the columns that miss the store are too large for `indices.breaker.request.limit` on this node.
-- `native_memory.estimated_bytes` is what the breaker enforces against `lance.native_memory.limit`; it lags `session_bytes + column_store_bytes` by at most one `lance.native_memory.circuit_breaker.poll_interval`. Compare it with the process RSS to see how much of the native footprint the plugin accounts for.
+- `native_memory.estimated_bytes` is what the breaker enforces against `plugins.lance.native_memory.limit`; it lags `session_bytes + column_store_bytes` by at most one `plugins.lance.native_memory.circuit_breaker.poll_interval`. Compare it with the process RSS to see how much of the native footprint the plugin accounts for.
 - `native_memory.index_cache_capacity`, `index_cache_shards` and `index_cache_shard_share` are the index cache the plugin handed Lance at startup and the shard layout Lance derives from it (see "Cap Lance's native memory footprint"). `index_cache_shard_share` is the heaviest entry the cache admits; a table whose inverted index is heavier than it (about 52 bytes per row per full-text column) is reloaded on every full-text query.
-- `warm_up` is the index warm-up of the section below: `mode` is the value of `lance.attach.warm_indexes` on the node, and `tables` has one entry per Lance-backed index the node has seen since it started. A table whose entry stays `running` for minutes on an object store is reading its indexes page by page; the INFO log shows one line per index as it finishes.
+- `warm_up` is the index warm-up of the section below: `mode` is the value of `plugins.lance.attach.warm_indexes` on the node, and `tables` has one entry per Lance-backed index the node has seen since it started. A table whose entry stays `running` for minutes on an object store is reading its indexes page by page; the INFO log shows one line per index as it finishes.
   - Each table entry carries the table, the manifest version the warm-up read, the mode it ran under, its `state` (`pending`, `running`, `done`, `failed`, `skipped` for mode `none`, `cancelled` when the index was deleted first), when it started, how long it took, and one entry per Lance index.
   - Each index entry carries `name`, `type`, `column`, `state`, `seconds`, and a `detail` when it failed or was skipped.
 - `plan` is what the node did with the plans the coordinator shipped: `refinements` counts, per reason, the pushed operations the node moved to the Lucene side, and `executed` counts the fragment requests the Lance scan answered against the ones Lucene's collector and aggregators answered. "Aggregations: where they run" below explains the four reasons.
   - `statistics` is the planner's table statistics cache on the node: `tables` (table versions held), `collect_millis_total` (time spent collecting them), `pending` (collections started and not finished; zero also when none was started), `planned_without` (requests the node planned without statistics because their version was not collected yet) and `failures` (collections that threw; a counter that keeps climbing means the table cannot be read for its statistics at all, and the node's `WARN` log names why).
   - Every data node collects the statistics of a freshly attached table, so `tables` moves on each of them within seconds of the attach; on a table of billions of rows `pending` stays at one for the minutes the collection takes while the requests keep answering, and a request planned meanwhile is one `planned_without`.
 - `fetch` counts the `_rowaddr IN (...)` take scans the node ran for the rows behind hits (`stored_fields_takes`, one per leaf that holds a hit of a page) and for the sort or aggregation column of a small full-text or vector hit set (`column_takes`), with the rows and columns they asked for and their wall time. `take_millis_total` set against the `took` of the requests the node served over the same interval says how much of the request time the fetch is.
-- `fetch_cache` is the node's cache of the rows behind hits, per cell and per table version: a page the node fetched before is rendered from it without a take (`rows_served`), and `hits` and `misses` count the cells looked up. The settings are `lance.fetch_cache.enabled`, `size`, `max_entry_size` and `expire`; [features.md](features.md#fetch-cache) has the key and the rules.
+- `fetch_cache` is the node's cache of the rows behind hits, per cell and per table version: a page the node fetched before is rendered from it without a take (`rows_served`), and `hits` and `misses` count the cells looked up. The settings are `plugins.lance.fetch_cache.enabled`, `size`, `max_entry_size` and `expire`; [features.md](features.md#fetch-cache) has the key and the rules.
 
 The endpoint is read only. With the security plugin, grant `cluster:monitor/lance/stats`.
 
-The response also carries a `request_cache` section (not shown above): the coordinator's result cache. It keeps the reduced answer of every `size: 0` request against one Lance backed index and serves the same body again while the table stays at the version the answer was computed from, so a dashboard refreshing the same aggregation scans the table once per table version rather than once per refresh. The settings are `lance.request_cache.enabled`, `size`, `max_entry_size` and `expire`; [features.md](features.md#result-cache) has the key and the rules.
+The response also carries a `request_cache` section (not shown above): the coordinator's result cache. It keeps the reduced answer of every `size: 0` request against one Lance backed index and serves the same body again while the table stays at the version the answer was computed from, so a dashboard refreshing the same aggregation scans the table once per table version rather than once per refresh. The settings are `plugins.lance.request_cache.enabled`, `size`, `max_entry_size` and `expire`; [features.md](features.md#result-cache) has the key and the rules.
 
 - `hits` and `misses` tell how often that happens on the node you asked; `skipped` counts the requests the cache does not take (a body with hits, a target of several indexes, `request_cache=false`).
 - An append to the table is a new version and a miss, `POST /<index>/_cache/clear?request=true` drops the index's entries on every node, and `GET /_plugins/_lance/explain/<index>` answers `cacheable` for a body.
@@ -897,14 +897,14 @@ The plugin therefore warms the indexes of every Lance-backed index on every data
 - A warm-up that fails logs a WARN line and leaves the request path unchanged.
 
 ```
-lance.attach.warm_indexes: metadata   # default; none | metadata | all; dynamic
+plugins.lance.attach.warm_indexes: metadata   # default; none | metadata | all; dynamic
 ```
 
 - `none`: nothing is read. The stats record the index with `state: skipped`.
 - `metadata`: every index is opened. BTree: the page lookup (`page_lookup.lance`, a few KB per thousand pages). Bitmap: the keys. Full-text: the token dictionaries (63 MB and 5.5 s on a 20M row column; about 3 bytes per row). IVF: the centroids and one partition. The pages, bitmaps, posting lists and doc lengths a query needs are still read by the first query that needs them, so on a large BTree the first `term` still pays for its pages; what this mode removes is the open of every index (the token dictionaries dominate) and the round trips before the first page read.
 - `all`: `metadata`, plus every BTree page, every bitmap and every IVF partition (full-text indexes are opened as under `metadata`: their posting lists are only reachable by token). The read is one object store request per page, in parallel up to the CPU count, so on the 20M table it read 45,000 objects and 820 MB in 57 s.
   - The pages are useful only while they stay in the Session index cache: when the index files of a table (full-text ones excluded) add up to more than half of `native_memory.index_cache_capacity`, the warm-up opens the indexes only, as under `metadata`, and says so in the `detail` of every index entry.
-  - Size the cache with `lance.native_memory.limit` before choosing `all` for a table whose BTrees are large; a 1B row BTree is about 4.7 GB of pages per column.
+  - Size the cache with `plugins.lance.native_memory.limit` before choosing `all` for a table whose BTrees are large; a 1B row BTree is about 4.7 GB of pages per column.
 
 Changing the setting affects warm-ups that start after the change; re-attach the index (or restart the node) to warm an already attached table under a different mode. The `lance_warm_up` pool is a fixed pool of one thread with a queue of 1,000 tables (`thread_pool.lance_warm_up.queue_size`); `GET /_cat/thread_pool/lance_warm_up?v&h=node_name,active,queue` shows whether a warm-up is running.
 
@@ -913,9 +913,9 @@ Changing the setting affects warm-ups that start after the change; re-attach the
 With more than one data node each node executes a share of the table's fragments, but a full-text query still looks the whole table up from the inverted index and keeps its own rows, because passing Lance a fragment list makes it read `_rowid` over those fragments first. Shapes whose hits scan needs every match (aggregations, sort by a field, post_filter) run that lookup as a probe whose row limit is derived from the rows the node covers, through three dynamic cluster settings:
 
 ```
-lance.fts.subset_probe_ratio: 0.03        # default; share of the rows the node covers that the probe may return
-lance.fts.subset_probe_min_rows: 10000    # default; floor of the probe limit
-lance.fts.subset_probe_limit: 1000000     # default; cap of the probe limit
+plugins.lance.fts.subset_probe_ratio: 0.03        # default; share of the rows the node covers that the probe may return
+plugins.lance.fts.subset_probe_min_rows: 10000    # default; floor of the probe limit
+plugins.lance.fts.subset_probe_limit: 1000000     # default; cap of the probe limit
 ```
 
 The effective probe limit is `min(subset_probe_limit, max(subset_probe_min_rows, floor(covered rows * subset_probe_ratio)))`. When the lookup returns that many rows the node discards them and repeats the scan restricted to its fragments. On a 20M row table over 3 nodes the limit is 200,000, so a term with 500,000 matches takes the restricted scan and a term with a few hits stays on the index-only lookup. The exact count behind `track_total_hits: true` and `_count` does not probe: every node runs one count only scan restricted to its fragments, so the count costs one index lookup per node whatever the match count.
@@ -930,9 +930,9 @@ Before each native scan or index load starts, the executor estimates what it wil
 Lance allocates native memory the plugin's breakers never see: an inverted index document set or the matching pages of a BTree that do not fit one index cache shard, the IVF partitions a nearest scan probes, the row addresses a filtered scan materialises, the read queue and decoded batches of every scan. On a table large enough for the node any of these ends the node with a kernel OOM kill. Three dynamic cluster settings control the gate:
 
 ```
-lance.admission.enabled: true              # default; false admits every shape
-lance.admission.headroom: 8gb              # default; available memory kept out of reach of a scan
-lance.admission.bounded_shapes_gated: true # default; false admits bounded full text pages ungated and judges a bounded filter page on its limit
+plugins.lance.admission.enabled: true              # default; false admits every shape
+plugins.lance.admission.headroom: 8gb              # default; available memory kept out of reach of a scan
+plugins.lance.admission.bounded_shapes_gated: true # default; false admits bounded full text pages ungated and judges a bounded filter page on its limit
 ```
 
 The 429 message names the kind of scan (`fts`, `scalar_index`, `vector_index`, `filter_scan`, `aggregate_scan`, `column_load`, `fetch_take`), the estimate, the available memory, the headroom and what to relax. `GET /_plugins/_lance/stats` reports the decisions under `admission`, with one rejection counter per kind.
@@ -958,13 +958,13 @@ Between the two ways the planner decides by cost ([query-plan.md](query-plan.md#
 
 When the cost chose the aggregators, explain shows `LuceneAggregateExec` and nothing under `unplanned`; `unplanned` appears only when the translator could not spell the tree (`aggregation type [multi_terms]`, `bucket tree deeper than 3 levels`, ...).
 
-Two settings are inputs to the same cost comparison rather than switches in front of it: `lance.aggregation.pushdown: false` prices every pushed aggregate as infinite, and `lance.aggregation.pushdown_max_groups` (node setting, default `1000000`) does the same for a tree whose group rows, estimated from the table statistics, exceed the bound.
+Two settings are inputs to the same cost comparison rather than switches in front of it: `plugins.lance.aggregation.pushdown: false` prices every pushed aggregate as infinite, and `plugins.lance.aggregation.pushdown_max_groups` (node setting, default `1000000`) does the same for a tree whose group rows, estimated from the table statistics, exceed the bound.
 
 A data node may still move a pushed aggregate (or a pushed page or full text clause) to the Lucene side for what only it can judge. There are four such reasons ([query-plan.md](query-plan.md#refinements)), counted per node under `plan.refinements` in `GET /_plugins/_lance/stats`, and the two the coordinator can predict from the mapping are listed under `refinements_possible` by the explain endpoint:
 
 - `security_wrapper`: a reader wrapper (the security plugin's DLS / FLS) is installed on the index, so a pushed aggregate, a pushed page and a pushed full text clause go to the aggregators, the collector and the Lucene composition of the query, which the wrapper filters. A pushed `lance_knn` and the filter SQL survive the wrapper.
 - `sort_field_type`: the pushed page orders by a column whose Lucene sort field carries a format the scan cannot type its sort values from (an `ip` override column), so the page goes to the collector.
-- `aggregate_resolution`: the pushed aggregate's fields do not resolve against the node's mapping, or the executor's own group estimate from the request shape (the product of the `terms` levels' `shard_size`, a `range` / `filters` level as its bucket count plus one) exceeds `lance.aggregation.pushdown_max_groups`; the aggregators run.
+- `aggregate_resolution`: the pushed aggregate's fields do not resolve against the node's mapping, or the executor's own group estimate from the request shape (the product of the `terms` levels' `shard_size`, a `range` / `filters` level as its bucket count plus one) exceeds `plugins.lance.aggregation.pushdown_max_groups`; the aggregators run.
 - `column_store_warm`: over an object store table, the node's off heap column store already holds every column the aggregators would read for every fragment of the request, and the aggregators over resident columns are predicted cheaper than scanning the object store again (the coordinator ships both predicted costs with the plan). Nothing warms the column store at attach, so this fires only after a Lucene side request has loaded the columns; over a local table it never fires.
 
 `plan.executed` next to it counts, per node, the fragment requests the Lance scan answered (`pushed_scan`) and the ones Lucene's collector and aggregators answered (`lucene`, which includes every full text or `lance_knn` page), so a request whose explain says `PUSHED_SCAN` should move the first counter:
@@ -988,11 +988,11 @@ A data node may still move a pushed aggregate (or a pushed page or full text cla
 Settings that steer the pushed scan, all dynamic cluster settings unless noted:
 
 ```
-lance.aggregation.pushdown: true              # default; false prices every pushed aggregate as infinite, so the aggregators answer
-lance.aggregation.pushdown_parallelism: 4     # default: half the CPUs the JVM sees (at least 1, at most 32)
-lance.aggregation.pushdown_max_groups: 1000000 # node setting; bound on the estimated group rows of a pushed tree
-lance.aggregation.percentiles_bins: 4096      # default; bins of a pushed down tdigest percentiles histogram (16 to 1000000)
-lance.aggregation.pushdown_topk_slack: 4      # default; per scan retention of a top-k ordered terms, in multiples of shard_size (1 to 64)
+plugins.lance.aggregation.pushdown: true              # default; false prices every pushed aggregate as infinite, so the aggregators answer
+plugins.lance.aggregation.pushdown_parallelism: 4     # default: half the CPUs the JVM sees (at least 1, at most 32)
+plugins.lance.aggregation.pushdown_max_groups: 1000000 # node setting; bound on the estimated group rows of a pushed tree
+plugins.lance.aggregation.percentiles_bins: 4096      # default; bins of a pushed down tdigest percentiles histogram (16 to 1000000)
+plugins.lance.aggregation.pushdown_topk_slack: 4      # default; per scan retention of a top-k ordered terms, in multiples of shard_size (1 to 64)
 ```
 
 Lance aggregates one scan on a single thread, so a node that holds many fragments cuts them into `pushdown_parallelism` contiguous groups, scans the groups at once on the `index_searcher` thread pool and merges the group rows before it builds its buckets. Set it to `1` to compare against a single scan; raise it up to the node's core count when a `terms` over many rows is slower than the same request with the pushdown priced out.
@@ -1006,14 +1006,14 @@ A single `terms` level ordered by `_count` (the default) or by one of its own si
 Every other aggregation, and every page of hits, runs through OpenSearch's collectors over the executor's fragments. Two dynamic cluster settings decide how many threads an executor uses for that:
 
 ```
-lance.fragment_path.parallelism: 4            # default: half the CPUs the JVM sees (at least 1, at most 32)
-lance.fragment_path.slices: 4                 # default: half the CPUs the JVM sees (at least 1, at most 32)
+plugins.lance.fragment_path.parallelism: 4            # default: half the CPUs the JVM sees (at least 1, at most 32)
+plugins.lance.fragment_path.slices: 4                 # default: half the CPUs the JVM sees (at least 1, at most 32)
 ```
 
 `parallelism` is the number of Lance scans an executor runs side by side when it reads a column into memory. `slices` is the number of slices it cuts its fragments into when it collects: each slice collects on its own `index_searcher` pool thread with its own collector, the way concurrent segment search does on a shard, and the slice results are reduced on the executor.
 
 - Set `slices` to `1` to collect on one thread in fragment order; the tdigest `percentiles` and `cardinality` sketches are then built once per executor instead of once per slice.
-- Raise `slices` towards the node's core count when an aggregation that the scan does not compute (`multi_terms`, `cardinality`, any tree under a full text or `lance_knn` query, or `terms` with `lance.aggregation.pushdown: false`) keeps one core busy while the others idle.
+- Raise `slices` towards the node's core count when an aggregation that the scan does not compute (`multi_terms`, `cardinality`, any tree under a full text or `lance_knn` query, or `terms` with `plugins.lance.aggregation.pushdown: false`) keeps one core busy while the others idle.
 - With the log level of `org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction` at `DEBUG`, each request logs the number of leaves and slices it collected.
 
 ### The coordinator thread pool
@@ -1046,7 +1046,7 @@ curl -X DELETE http://localhost:9200/_plugins/_lance/namespace \
 curl -X DELETE http://localhost:9200/demo
 ```
 
-Deleting a Lance-backed index while its namespace is still registered is honoured for `lance.namespace.resurface_guard_grace` (default one hour); after that the catalog listing recreates the index if the table is still there.
+Deleting a Lance-backed index while its namespace is still registered is honoured for `plugins.lance.namespace.resurface_guard_grace` (default one hour); after that the catalog listing recreates the index if the table is still there.
 
 ## 8. Troubleshooting
 

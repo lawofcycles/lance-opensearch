@@ -32,6 +32,7 @@ import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.lance.LanceOverrides;
+import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.dispatch.LanceCoordinatorThreads;
@@ -74,7 +75,7 @@ import org.opensearch.transport.client.Client;
  * from the first check and from every move, so the requests this node
  * coordinates find them; a move also asks every data node to collect
  * them, since no other node observes the move. A pinned index
- * ({@code index.lance.version}) never advances and is not tracked. A
+ * ({@code index.plugins.lance.version}) never advances and is not tracked. A
  * {@code node_local} index only has its reader advanced; its mapping is
  * maintained by the build action from the clones.
  *
@@ -103,7 +104,6 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
     private static final Logger LOG = LogManager.getLogger(LanceIndexFreshnessService.class);
 
     static final String REFRESH_SOURCE = "lance freshness";
-    private static final String UNCOVERED_FRAGMENT_POLICY_SETTING = "index.lance.uncovered_fragment_policy";
 
     /**
      * What one check found and did; the answer of {@code POST /_plugins/_lance/sync/{index}}.
@@ -267,10 +267,10 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
      */
     Tracked track(TrackedShard shard) {
         Settings settings = shard.settings();
-        if (settings.get(LanceEngineFactory.TABLE_SETTING, "").isEmpty()) {
+        if (LancePlugin.TABLE_SETTING.get(settings).isEmpty()) {
             return null;
         }
-        if (settings.getAsLong(LanceEngineFactory.VERSION_SETTING, -1L) >= 0) {
+        if (LancePlugin.VERSION_SETTING.get(settings) >= 0) {
             return null;
         }
         Tracked entry = new Tracked(shard);
@@ -328,8 +328,8 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         Tracked entry = tracked.get(indexName);
         if (entry == null) {
             Settings settings = indexShard.indexSettings().getIndexMetadata().getSettings();
-            if (settings.getAsLong(LanceEngineFactory.VERSION_SETTING, -1L) >= 0) {
-                return Outcome.notChecked(indexName, "the index is pinned to index.lance.version and never advances");
+            if (LancePlugin.VERSION_SETTING.get(settings) >= 0) {
+                return Outcome.notChecked(indexName, "the index is pinned to index.plugins.lance.version and never advances");
             }
             entry = track(new IndexShardHandle(indexShard, servedVersions));
             if (entry == null) {
@@ -363,9 +363,9 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         TrackedShard shard = entry.shard;
         String indexName = shard.indexName();
         Settings settings = shard.settings();
-        String table = settings.get(LanceEngineFactory.TABLE_SETTING);
+        String table = LanceEngineFactory.tableOf(settings);
         StorageOptions storageOptions = StorageOptions.fromIndexSettings(settings);
-        String tagSetting = settings.get(LanceEngineFactory.TAG_SETTING, "");
+        String tagSetting = LancePlugin.TAG_SETTING.get(settings);
         String tag = tagSetting.isEmpty() ? null : tagSetting;
         boolean nodeLocal = LanceLocalClones.isNodeLocal(settings);
         long served = nodeLocal ? nodeLocalServedVersion(indexName, shard) : shard.servedVersion();
@@ -453,7 +453,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         // still stands, because the mapping the index should have has
         // not changed and the update that failed has not been retried.
         if (derivation != null) {
-            if ("wait".equals(settings.get(UNCOVERED_FRAGMENT_POLICY_SETTING, "immediate"))) {
+            if ("wait".equals(LancePlugin.UNCOVERED_FRAGMENT_POLICY_SETTING.get(settings))) {
                 // `wait` is accepted but converges with the immediate
                 // branch: the plugin never writes to a user table, so
                 // folding appended fragments into the existing indexes is
@@ -634,7 +634,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
     private void warnWaitPolicyOnce(String indexName) {
         if (warnedWaitPolicy.add(indexName)) {
             LOG.info(
-                "index [{}] has index.lance.uncovered_fragment_policy=wait, but the plugin no longer runs auto-optimize on the user's Lance table. "
+                "index [{}] has index.plugins.lance.uncovered_fragment_policy=wait, but the plugin no longer runs auto-optimize on the user's Lance table. "
                     + "Index maintenance is expected to happen outside OpenSearch (Python, Ray, Spark, or the Lance Java SDK) or via "
                     + "an explicit POST /_plugins/_lance/build_indexes/{{index}} call. The wait value is accepted for a future async-optimize implementation.",
                 indexName

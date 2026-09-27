@@ -37,6 +37,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.lance.LanceOverrides;
+import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
@@ -160,7 +161,7 @@ public final class LanceNamespaceService implements Closeable {
      * @param warmCache    fragment path snapshot cache to retire entries
      *                     from when an index is deleted; {@code null}
      *                     when there is none (tests)
-     * @param allowedRoots the {@code lance.allowed_table_roots} allowlist,
+     * @param allowedRoots the {@code plugins.lance.allowed_table_roots} allowlist,
      *                     applied to the table locations rest / glue
      *                     catalogs return before their tables surface
      */
@@ -212,7 +213,7 @@ public final class LanceNamespaceService implements Closeable {
 
     /**
      * Reactive setter for the dynamic
-     * {@code lance.namespace.resurface_guard_grace} node setting. Zero
+     * {@code plugins.lance.namespace.resurface_guard_grace} node setting. Zero
      * or negative disables the guard (poll re-surfaces immediately).
      */
     public void setResurfaceGrace(TimeValue newGrace) {
@@ -252,7 +253,7 @@ public final class LanceNamespaceService implements Closeable {
                 if (prevMeta == null) {
                     continue;
                 }
-                String table = prevMeta.getSettings().get(LanceEngineFactory.TABLE_SETTING);
+                String table = LanceEngineFactory.tableOf(prevMeta.getSettings());
                 if (table == null || table.isEmpty()) {
                     continue;
                 }
@@ -616,10 +617,10 @@ public final class LanceNamespaceService implements Closeable {
      *
      * <p>A directory registration builds the table path from its root
      * and the table name, exactly the shape the persisted
-     * {@code index.lance.table} setting relies on. A rest or glue
+     * {@code index.plugins.lance.table} setting relies on. A rest or glue
      * registration asks the catalog itself through
      * {@code describeTable}; the returned location is validated
-     * against {@code lance.allowed_table_roots} before anything
+     * against {@code plugins.lance.allowed_table_roots} before anything
      * surfaces, because for these types the register call had no root
      * the allowlist could gate.
      */
@@ -663,7 +664,7 @@ public final class LanceNamespaceService implements Closeable {
         if (!allowedRoots.allows(location)) {
             if (warnedDisallowedLocation.add(entry.name() + ":" + indexName)) {
                 LOG.warn(
-                    "table {} from namespace {} resolves to {}, outside the configured lance.allowed_table_roots; skipping",
+                    "table {} from namespace {} resolves to {}, outside the configured plugins.lance.allowed_table_roots; skipping",
                     indexName,
                     entry.name(),
                     location
@@ -674,7 +675,7 @@ public final class LanceNamespaceService implements Closeable {
                     entry.name(),
                     indexName,
                     indexName,
-                    "location " + location + " is outside lance.allowed_table_roots"
+                    "location " + location + " is outside plugins.lance.allowed_table_roots"
                 )
             );
             return;
@@ -703,7 +704,7 @@ public final class LanceNamespaceService implements Closeable {
 
     /**
      * Create the index for {@code table} unless one exists. An existing
-     * index that carries {@code index.lance.table} equal to the table is
+     * index that carries {@code index.plugins.lance.table} equal to the table is
      * the one an earlier cycle (or attach) created for it, and the node
      * holding its shard keeps it fresh; any other index under the name
      * is a name collision, warned once and left alone. A name deleted
@@ -720,7 +721,7 @@ public final class LanceNamespaceService implements Closeable {
     ) {
         IndexMetadata existing = state.metadata().index(indexName);
         if (existing != null) {
-            String existingTable = existing.getSettings().get(LanceEngineFactory.TABLE_SETTING, "");
+            String existingTable = LancePlugin.TABLE_SETTING.get(existing.getSettings());
             if (existingTable.equals(table)) {
                 // Present again after a restore or a rebuild: a tombstone
                 // recorded for the name no longer describes anything.
@@ -753,7 +754,12 @@ public final class LanceNamespaceService implements Closeable {
         // and every poll recreates the index unconditionally.
         if (resurfaceGuard.shouldSkipSurface(indexName, table)) {
             report.skipped.add(
-                new PollReport.SkippedTable(namespaceName, indexName, indexName, "deleted within lance.namespace.resurface_guard_grace")
+                new PollReport.SkippedTable(
+                    namespaceName,
+                    indexName,
+                    indexName,
+                    "deleted within plugins.lance.namespace.resurface_guard_grace"
+                )
             );
             return;
         }

@@ -161,7 +161,7 @@ public final class TransportLanceStatsAction extends TransportNodesAction<
     private List<LanceNodeStats.IndexReaderStats> indexReaderStats() {
         List<LanceNodeStats.IndexReaderStats> stats = new ArrayList<>();
         for (IndexService indexService : indicesService) {
-            String table = indexService.getIndexSettings().getSettings().get(LanceEngineFactory.TABLE_SETTING);
+            String table = LanceEngineFactory.tableOf(indexService.getIndexSettings().getSettings());
             if (table == null || table.isEmpty()) {
                 continue;
             }

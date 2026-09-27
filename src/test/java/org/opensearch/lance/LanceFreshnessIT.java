@@ -108,7 +108,7 @@ public class LanceFreshnessIT extends LanceRestTestCase {
             LanceTableFactory.appendRows(tableUri, 6, 4);
             Map<String, Object> outcome = sync(indexName);
             assertEquals(false, outcome.get("checked"));
-            assertTrue("reason names the pin: " + outcome, ((String) outcome.get("reason")).contains("index.lance.version"));
+            assertTrue("reason names the pin: " + outcome, ((String) outcome.get("reason")).contains("index.plugins.lance.version"));
             assertEquals(false, outcome.get("moved"));
             assertEquals("a pinned index keeps its rows", 6, engineDocCount(indexName));
         } finally {

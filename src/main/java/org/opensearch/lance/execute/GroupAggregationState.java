@@ -950,7 +950,7 @@ final class GroupAggregationState {
      * The bounded selection of one scan of the single level
      * {@code terms} shape ordered by {@code _count} or by one single
      * value metric: at most {@code limit} groups ({@code shard_size}
-     * times {@code lance.aggregation.pushdown_topk_slack}) are kept in
+     * times {@code plugins.lance.aggregation.pushdown_topk_slack}) are kept in
      * a primitive heap whose top is the weakest retained group under
      * the request order (count descending or the metric in its
      * direction, key ascending as the tie breaker); a row that does not

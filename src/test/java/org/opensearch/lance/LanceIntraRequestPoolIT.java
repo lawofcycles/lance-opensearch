@@ -25,7 +25,7 @@ public class LanceIntraRequestPoolIT extends LanceRestTestCase {
     public void testCollectionSlicesRunOnTheIndexSearcherPool() throws Exception {
         try (LanceTestCluster fixture = LanceTestCluster.setUpMultiFragment(12, 4, "slicepool")) {
             Request slices = new Request("PUT", "/_cluster/settings");
-            slices.setJsonEntity("{\"transient\":{\"lance.fragment_path.slices\":3}}");
+            slices.setJsonEntity("{\"transient\":{\"plugins.lance.fragment_path.slices\":3}}");
             client().performRequest(slices);
             try {
                 long before = completedOnIndexSearcherPool();
@@ -40,7 +40,7 @@ public class LanceIntraRequestPoolIT extends LanceRestTestCase {
                 assertBusy(() -> assertThat(completedOnIndexSearcherPool(), greaterThan(before)));
             } finally {
                 Request reset = new Request("PUT", "/_cluster/settings");
-                reset.setJsonEntity("{\"transient\":{\"lance.fragment_path.slices\":null}}");
+                reset.setJsonEntity("{\"transient\":{\"plugins.lance.fragment_path.slices\":null}}");
                 client().performRequest(reset);
             }
         }

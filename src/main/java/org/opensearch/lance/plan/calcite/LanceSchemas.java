@@ -12,6 +12,7 @@ import org.lance.Dataset;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.lance.LanceMappingMeta;
+import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
@@ -245,7 +246,7 @@ public final class LanceSchemas {
      * later serves search requests.
      *
      * @param indexMetadata cluster state metadata of a Lance backed
-     *     index; the caller has already checked {@code index.lance.table}
+     *     index; the caller has already checked {@code index.plugins.lance.table}
      *     is present
      * @param warmCache the node's snapshot cache
      */
@@ -267,18 +268,18 @@ public final class LanceSchemas {
     public static IndexModel build(IndexMetadata indexMetadata, LanceWarmCache warmCache, Set<String> queryFields) throws IOException {
         String indexName = indexMetadata.getIndex().getName();
         Settings settings = indexMetadata.getSettings();
-        String tableUri = settings.get(LanceEngineFactory.TABLE_SETTING);
+        String tableUri = LanceEngineFactory.tableOf(settings);
         StorageOptions storageOptions = StorageOptions.fromIndexSettings(settings);
-        long pinnedVersion = settings.getAsLong(LanceEngineFactory.VERSION_SETTING, -1L);
-        String tag = settings.get(LanceEngineFactory.TAG_SETTING, "");
+        long pinnedVersion = LancePlugin.VERSION_SETTING.get(settings);
+        String tag = LancePlugin.TAG_SETTING.get(settings);
         if (pinnedVersion < 0 && !tag.isEmpty()) {
             pinnedVersion = LanceRegistry.resolveTagVersion(tableUri, storageOptions, tag);
         }
         Optional<Long> version = pinnedVersion >= 0 ? Optional.of(pinnedVersion) : Optional.empty();
-        String pkField = settings.get(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, "");
+        String pkField = LancePlugin.PRIMARY_KEY_FIELD_SETTING.get(settings);
         LancePrimaryKeyType pkType = pkField.isEmpty()
             ? LancePrimaryKeyType.NONE
-            : LancePrimaryKeyType.fromSetting(settings.get(LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING, "long"));
+            : LancePrimaryKeyType.fromSetting(LancePlugin.PRIMARY_KEY_TYPE_SETTING.get(settings));
         LanceOverrides overrides = LanceOverrides.of(settings);
         Map<String, LinkedHashMap<String, String>> multiFields = overrides.subFields();
         Map<String, String> renamedFields = new LinkedHashMap<>();

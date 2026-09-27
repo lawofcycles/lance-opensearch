@@ -14,7 +14,7 @@ import org.opensearch.client.Response;
 import org.opensearch.core.rest.RestStatus;
 
 /**
- * The {@code index.lance.tag} setting is Dynamic: an operator repointing
+ * The {@code index.plugins.lance.tag} setting is Dynamic: an operator repointing
  * the tag with {@code PUT /{index}/_settings} on a running index takes
  * effect on the next namespace poll cycle without a detach or reattach.
  * Attaches an index following tag {@code v1} (at manifest version A),
@@ -62,11 +62,11 @@ public class LanceNamespaceTagDynamicIT extends LanceRestTestCase {
             // Dynamic, so PUT /_settings updates cluster state without
             // a detach.
             Request updateSettings = new Request("PUT", "/" + indexName + "/_settings");
-            updateSettings.setJsonEntity("{\"index.lance.tag\":\"v2\"}");
+            updateSettings.setJsonEntity("{\"index.plugins.lance.tag\":\"v2\"}");
             updateSettings.setOptions(updateSettings.getOptions().toBuilder().addHeader("Content-Type", "application/json"));
             Response updateResponse = client().performRequest(updateSettings);
             assertEquals(
-                "PUT /_settings for index.lance.tag=v2 failed: " + readAll(updateResponse),
+                "PUT /_settings for index.plugins.lance.tag=v2 failed: " + readAll(updateResponse),
                 RestStatus.OK.getStatus(),
                 updateResponse.getStatusLine().getStatusCode()
             );
@@ -74,7 +74,7 @@ public class LanceNamespaceTagDynamicIT extends LanceRestTestCase {
             // The setting is visible in _settings straight away.
             String settingsBody = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_settings")));
             assertTrue(
-                "expected index.lance.tag=v2 to persist after PUT /_settings: " + settingsBody,
+                "expected index.plugins.lance.tag=v2 to persist after PUT /_settings: " + settingsBody,
                 settingsBody.contains("\"tag\":\"v2\"")
             );
 
@@ -95,7 +95,7 @@ public class LanceNamespaceTagDynamicIT extends LanceRestTestCase {
             // Repointing back is a move too: the poll compares for
             // inequality, not for a forward advance.
             Request repointBack = new Request("PUT", "/" + indexName + "/_settings");
-            repointBack.setJsonEntity("{\"index.lance.tag\":\"v1\"}");
+            repointBack.setJsonEntity("{\"index.plugins.lance.tag\":\"v1\"}");
             repointBack.setOptions(repointBack.getOptions().toBuilder().addHeader("Content-Type", "application/json"));
             Response repointResponse = client().performRequest(repointBack);
             assertEquals(RestStatus.OK.getStatus(), repointResponse.getStatusLine().getStatusCode());

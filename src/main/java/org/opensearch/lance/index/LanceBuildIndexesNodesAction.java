@@ -9,7 +9,7 @@ import org.opensearch.action.ActionType;
 
 /**
  * Internal fan-out leg of {@link LanceBuildIndexesAction} for indexes
- * attached with {@code index.lance.index_placement = node_local}: every
+ * attached with {@code index.plugins.lance.index_placement = node_local}: every
  * data node builds the requested indexes into its own shallow clone and
  * reports its outcome. Invoked by {@link TransportLanceBuildIndexesAction}
  * after it has resolved the index and its placement; a security plugin

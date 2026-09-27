@@ -21,7 +21,7 @@ import org.opensearch.test.OpenSearchTestCase;
  */
 public class NativeMemoryLimitTests extends OpenSearchTestCase {
 
-    private static final String KEY = "lance.native_memory.limit";
+    private static final String KEY = "plugins.lance.native_memory.limit";
 
     public void testParsesAbsoluteByteValues() {
         assertEquals(10L * 1024 * 1024 * 1024, NativeMemoryLimit.parse("10gb", KEY));

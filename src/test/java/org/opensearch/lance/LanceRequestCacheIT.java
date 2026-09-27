@@ -141,7 +141,7 @@ public class LanceRequestCacheIT extends LanceRestTestCase {
             readAll(postJson("/" + index + "/_search", SUM));
             assertTrue(count(requestCache(), "entries") >= 1L);
             Request off = new Request("PUT", "/_cluster/settings");
-            off.setJsonEntity("{\"transient\":{\"lance.request_cache.enabled\":false}}");
+            off.setJsonEntity("{\"transient\":{\"plugins.lance.request_cache.enabled\":false}}");
             client().performRequest(off);
             try {
                 Map<String, Object> disabled = requestCache();
@@ -159,7 +159,7 @@ public class LanceRequestCacheIT extends LanceRestTestCase {
                 assertEquals("disabled", explain.get("cacheable_reason"));
             } finally {
                 Request on = new Request("PUT", "/_cluster/settings");
-                on.setJsonEntity("{\"transient\":{\"lance.request_cache.enabled\":null}}");
+                on.setJsonEntity("{\"transient\":{\"plugins.lance.request_cache.enabled\":null}}");
                 client().performRequest(on);
             }
             assertEquals(true, requestCache().get("enabled"));
@@ -171,7 +171,7 @@ public class LanceRequestCacheIT extends LanceRestTestCase {
         try (LanceTestCluster fixture = LanceTestCluster.setUp(6, "rcacheexp")) {
             String index = fixture.indexName();
             Request expire = new Request("PUT", "/_cluster/settings");
-            expire.setJsonEntity("{\"transient\":{\"lance.request_cache.expire\":\"1s\"}}");
+            expire.setJsonEntity("{\"transient\":{\"plugins.lance.request_cache.expire\":\"1s\"}}");
             client().performRequest(expire);
             try {
                 readAll(postJson("/" + index + "/_search", SUM));
@@ -193,7 +193,7 @@ public class LanceRequestCacheIT extends LanceRestTestCase {
                 }, 10, TimeUnit.SECONDS);
             } finally {
                 Request reset = new Request("PUT", "/_cluster/settings");
-                reset.setJsonEntity("{\"transient\":{\"lance.request_cache.expire\":null}}");
+                reset.setJsonEntity("{\"transient\":{\"plugins.lance.request_cache.expire\":null}}");
                 client().performRequest(reset);
             }
             client().performRequest(new Request("DELETE", "/" + index));

@@ -10,7 +10,7 @@ import org.opensearch.action.ActionType;
 /**
  * Runs one catalog listing cycle now on the elected cluster manager,
  * behind {@code POST /_plugins/_lance/namespace/_poll}. The cycle is the one the
- * manager runs at {@code lance.namespace.poll_cadence}: list every
+ * manager runs at {@code plugins.lance.namespace.poll_cadence}: list every
  * registration (or the one named), create an index for each table that
  * has none, and report what was surfaced and what was skipped.
  *

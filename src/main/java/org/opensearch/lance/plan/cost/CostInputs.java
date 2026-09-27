@@ -20,8 +20,8 @@ import java.util.Objects;
  * uses {@link #local()}.
  *
  * <p>The two settings that used to gate the aggregation pushdown outside
- * the planner are cost inputs: {@code lance.aggregation.pushdown} off and
- * a group estimate above {@code lance.aggregation.pushdown_max_groups}
+ * the planner are cost inputs: {@code plugins.lance.aggregation.pushdown} off and
+ * a group estimate above {@code plugins.lance.aggregation.pushdown_max_groups}
  * both make the pushed scan's cost infinite, so the planner implements
  * the aggregate through the Lucene operator and explain shows that
  * choice as a cost decision.
@@ -32,14 +32,14 @@ import java.util.Objects;
  * @param cpusPerNode CPUs of one data node; the planning node's own
  *     count stands in for the cluster's, since the nodes are assumed
  *     to match
- * @param pushdownParallelism effective {@code lance.aggregation.pushdown_parallelism}:
+ * @param pushdownParallelism effective {@code plugins.lance.aggregation.pushdown_parallelism}:
  *     how many Lance scans a pushed aggregate runs side by side on one
  *     node
- * @param slices effective {@code lance.fragment_path.slices}: how many
+ * @param slices effective {@code plugins.lance.fragment_path.slices}: how many
  *     collector threads the Lucene aggregator path runs on one node
- * @param pushdownEnabled effective {@code lance.aggregation.pushdown}:
+ * @param pushdownEnabled effective {@code plugins.lance.aggregation.pushdown}:
  *     false prices every pushed aggregate as infinite
- * @param maxGroups effective {@code lance.aggregation.pushdown_max_groups}:
+ * @param maxGroups effective {@code plugins.lance.aggregation.pushdown_max_groups}:
  *     a pushed aggregate whose statistics based estimate of the group
  *     rows the executor holds exceeds it is priced as infinite
  */
@@ -49,7 +49,7 @@ public record CostInputs(int nodes, StorageKind storage, int cpusPerNode, int pu
     /** Upper bound of both parallelism settings, as {@code LancePlugin} registers them. */
     public static final int MAX_PARALLELISM = 32;
 
-    /** Default of {@code lance.aggregation.pushdown_max_groups}, as {@code LancePlugin} registers it. */
+    /** Default of {@code plugins.lance.aggregation.pushdown_max_groups}, as {@code LancePlugin} registers it. */
     public static final long DEFAULT_MAX_GROUPS = 1_000_000L;
 
     public CostInputs {

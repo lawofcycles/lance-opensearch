@@ -432,7 +432,7 @@ public final class LanceNamespaceMetadata implements Metadata.Custom {
          * listings, or {@code toString}: anything whose name contains
          * one of {@link StorageOptions#SENSITIVE_KEY_WORDS}
          * (case-insensitive). The same words drive the settings filter
-         * on {@code index.lance.storage_options.*}, so what is redacted
+         * on {@code index.plugins.lance.storage_options.*}, so what is redacted
          * here is what the settings APIs withhold.
          */
         public static boolean isSensitiveConfigKey(String key) {

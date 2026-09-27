@@ -47,18 +47,18 @@ public class LanceAttachIT extends LanceRestTestCase {
     }
 
     public void testCreateIndexRejectsLanceTableSetting() throws IOException {
-        // PUT /{index} with index.lance.table would wire the engine
+        // PUT /{index} with index.plugins.lance.table would wire the engine
         // without deriving a mapping; the request is rejected and points
         // at POST /_plugins/_lance/attach instead.
         String indexName = "rawput-" + randomAlphaOfLength(6).toLowerCase(Locale.ROOT);
         Request create = new Request("PUT", "/" + indexName);
-        create.setJsonEntity("{\"settings\":{\"index.lance.table\":\"/tmp/does-not-matter.lance\"}}");
+        create.setJsonEntity("{\"settings\":{\"index.plugins.lance.table\":\"/tmp/does-not-matter.lance\"}}");
         create.setOptions(create.getOptions().toBuilder().addHeader("Content-Type", "application/json"));
         ResponseException failure = expectThrows(ResponseException.class, () -> client().performRequest(create));
         int status = failure.getResponse().getStatusLine().getStatusCode();
-        assertEquals("expected 400 for direct PUT with index.lance.table, saw " + status, 400, status);
+        assertEquals("expected 400 for direct PUT with index.plugins.lance.table, saw " + status, 400, status);
         String body = readAll(failure.getResponse());
-        assertTrue("expected error to mention [index.lance.table]: " + body, body.contains("index.lance.table"));
+        assertTrue("expected error to mention [index.plugins.lance.table]: " + body, body.contains("index.plugins.lance.table"));
         assertTrue("expected error to point at /_plugins/_lance/attach: " + body, body.contains("/_plugins/_lance/attach"));
     }
 
@@ -114,7 +114,7 @@ public class LanceAttachIT extends LanceRestTestCase {
     private static void setMaxDocsPerReader(String value) throws IOException {
         Request request = new Request("PUT", "/_cluster/settings");
         String encoded = value == null ? "null" : "\"" + value + "\"";
-        request.setJsonEntity("{\"transient\":{\"lance.test.max_docs_per_reader\":" + encoded + "}}");
+        request.setJsonEntity("{\"transient\":{\"plugins.lance.test.max_docs_per_reader\":" + encoded + "}}");
         assertEquals(RestStatus.OK.getStatus(), client().performRequest(request).getStatusLine().getStatusCode());
     }
 
@@ -156,7 +156,7 @@ public class LanceAttachIT extends LanceRestTestCase {
     public void testAttachAcceptsStorageOptionsAndPersistsInSettings() throws Exception {
         // Local filesystem tables ignore object-store credentials, so this
         // only checks that storage_options are parsed, persisted under
-        // index.lance.storage_options.<key>, and do not break the open.
+        // index.plugins.lance.storage_options.<key>, and do not break the open.
         String suffix = "attachso-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -254,7 +254,7 @@ public class LanceAttachIT extends LanceRestTestCase {
 
     public void testAttachOmittingStorageOptionsPersistsNothing() throws Exception {
         // Absent storage_options must not seed any
-        // index.lance.storage_options.* setting; callers use the absence
+        // index.plugins.lance.storage_options.* setting; callers use the absence
         // to detect that an index carries no per-table options.
         String suffix = "attachnoso-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
@@ -330,10 +330,10 @@ public class LanceAttachIT extends LanceRestTestCase {
                 extractIntPath(latestAfterDelete, "hits", "total", "value")
             );
 
-            // index.lance.version keeps the pin across node restarts.
+            // index.plugins.lance.version keeps the pin across node restarts.
             Response settings = client().performRequest(new Request("GET", "/" + pinnedIndex + "/_settings"));
             String settingsBody = readAll(settings);
-            assertTrue("expected index.lance.version=1 to persist: " + settingsBody, settingsBody.contains("\"version\":\"1\""));
+            assertTrue("expected index.plugins.lance.version=1 to persist: " + settingsBody, settingsBody.contains("\"version\":\"1\""));
         } finally {
             for (String idx : new String[] { latestIndex, pinnedIndex }) {
                 try {
@@ -500,7 +500,7 @@ public class LanceAttachIT extends LanceRestTestCase {
             assertEquals(RestStatus.OK.getStatus(), attachPinned.getStatusLine().getStatusCode());
 
             String settingsBody = readAll(client().performRequest(new Request("GET", "/" + tagIndex + "/_settings")));
-            assertTrue("expected index.lance.tag=v1 to persist: " + settingsBody, settingsBody.contains("\"tag\":\"v1\""));
+            assertTrue("expected index.plugins.lance.tag=v1 to persist: " + settingsBody, settingsBody.contains("\"tag\":\"v1\""));
 
             ensureGreen(tagIndex);
             ensureGreen(pinnedIndex);

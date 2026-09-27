@@ -156,7 +156,7 @@ public class LanceFetchCacheIT extends LanceRestTestCase {
             readAll(postJson("/" + index + "/_search", page("", "asc", 10)));
             assertTrue(count(fetchCache(), "entries") >= 10L * COLUMNS);
             Request off = new Request("PUT", "/_cluster/settings");
-            off.setJsonEntity("{\"transient\":{\"lance.fetch_cache.enabled\":false}}");
+            off.setJsonEntity("{\"transient\":{\"plugins.lance.fetch_cache.enabled\":false}}");
             client().performRequest(off);
             try {
                 Map<String, Object> disabled = fetchCache();
@@ -175,7 +175,7 @@ public class LanceFetchCacheIT extends LanceRestTestCase {
                 assertEquals(0L, count(after, "entries"));
             } finally {
                 Request on = new Request("PUT", "/_cluster/settings");
-                on.setJsonEntity("{\"transient\":{\"lance.fetch_cache.enabled\":null}}");
+                on.setJsonEntity("{\"transient\":{\"plugins.lance.fetch_cache.enabled\":null}}");
                 client().performRequest(on);
             }
             assertEquals(true, fetchCache().get("enabled"));

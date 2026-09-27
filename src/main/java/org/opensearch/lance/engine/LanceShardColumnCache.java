@@ -271,7 +271,7 @@ public final class LanceShardColumnCache {
                     + "/"
                     + new ByteSizeValue(bytes)
                     + "] because the column store had no room for it; raise indices.breaker.request.limit,"
-                    + " raise lance.cache.column_share, or spread the fragments over more nodes",
+                    + " raise plugins.lance.cache.column_share, or spread the fragments over more nodes",
                 refused.getBytesWanted(),
                 refused.getByteLimit(),
                 refused.getDurability()

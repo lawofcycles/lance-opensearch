@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 import org.apache.logging.log4j.LogManager;
@@ -140,14 +141,42 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         );
     }
 
+    /*
+     * Every setting of the plugin has two registered keys: the current
+     * one under plugins.lance (node scope) or index.plugins.lance (index
+     * scope), and the deprecated one under lance or index.lance that the
+     * first preview releases used. The current setting names the
+     * deprecated one as its fallback, so a node whose opensearch.yml
+     * still carries the old key and an index whose cluster state was
+     * written with the old key keep their values, and reading them logs
+     * one deprecation warning per key. The code reads only the current
+     * settings; attach and the namespace poll write only the current
+     * keys. The deprecated settings are registered so the old keys stay
+     * valid for one release.
+     */
+
+    public static final Setting<String> TABLE_SETTING_DEPRECATED = Setting.simpleString(
+        "index.lance.table",
+        Setting.Property.IndexScope,
+        Setting.Property.Final,
+        Setting.Property.Deprecated
+    );
     public static final Setting<String> TABLE_SETTING = Setting.simpleString(
         LanceEngineFactory.TABLE_SETTING,
+        TABLE_SETTING_DEPRECATED,
         Setting.Property.IndexScope,
         Setting.Property.Final
     );
+    public static final Setting<String> PRIMARY_KEY_FIELD_SETTING_DEPRECATED = Setting.simpleString(
+        "index.lance.primary_key_field",
+        "",
+        Setting.Property.IndexScope,
+        Setting.Property.Final,
+        Setting.Property.Deprecated
+    );
     public static final Setting<String> PRIMARY_KEY_FIELD_SETTING = Setting.simpleString(
         LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING,
-        "",
+        PRIMARY_KEY_FIELD_SETTING_DEPRECATED,
         Setting.Property.IndexScope,
         Setting.Property.Final
     );
@@ -160,16 +189,32 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * setting has no meaning when
      * {@link #PRIMARY_KEY_FIELD_SETTING} is empty (the table has no PK).
      */
-    public static final Setting<String> PRIMARY_KEY_TYPE_SETTING = Setting.simpleString(
-        LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING,
+    public static final Setting<String> PRIMARY_KEY_TYPE_SETTING_DEPRECATED = Setting.simpleString(
+        "index.lance.primary_key_type",
         "long",
         LancePlugin::validatePrimaryKeyType,
         Setting.Property.IndexScope,
+        Setting.Property.Final,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<String> PRIMARY_KEY_TYPE_SETTING = Setting.simpleString(
+        LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING,
+        LancePlugin::validatePrimaryKeyType,
+        PRIMARY_KEY_TYPE_SETTING_DEPRECATED,
+        Setting.Property.IndexScope,
         Setting.Property.Final
+    );
+    public static final Setting<Long> VERSION_SETTING_DEPRECATED = Setting.longSetting(
+        "index.lance.version",
+        -1L,
+        -1L,
+        Setting.Property.IndexScope,
+        Setting.Property.Final,
+        Setting.Property.Deprecated
     );
     public static final Setting<Long> VERSION_SETTING = Setting.longSetting(
         LanceEngineFactory.VERSION_SETTING,
-        -1L,
+        VERSION_SETTING_DEPRECATED,
         -1L,
         Setting.Property.IndexScope,
         Setting.Property.Final
@@ -184,9 +229,16 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * the next poll after the update refreshes the reader onto the
      * version the new tag points at.
      */
+    public static final Setting<String> TAG_SETTING_DEPRECATED = Setting.simpleString(
+        "index.lance.tag",
+        "",
+        Setting.Property.IndexScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
     public static final Setting<String> TAG_SETTING = Setting.simpleString(
         LanceEngineFactory.TAG_SETTING,
-        "",
+        TAG_SETTING_DEPRECATED,
         Setting.Property.IndexScope,
         Setting.Property.Dynamic
     );
@@ -195,9 +247,16 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * engine can rehydrate keyword sub-fields on shard open. Empty
      * means no sub-fields declared.
      */
+    public static final Setting<String> MULTI_FIELDS_SETTING_DEPRECATED = Setting.simpleString(
+        "index.lance.multi_fields",
+        "",
+        Setting.Property.IndexScope,
+        Setting.Property.Final,
+        Setting.Property.Deprecated
+    );
     public static final Setting<String> MULTI_FIELDS_SETTING = Setting.simpleString(
         LanceEngineFactory.MULTI_FIELDS_SETTING,
-        "",
+        MULTI_FIELDS_SETTING_DEPRECATED,
         Setting.Property.IndexScope,
         Setting.Property.Final
     );
@@ -212,16 +271,31 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * overridden column (the override follows the column to its new
      * name) or resets one to a type the override no longer fits.
      */
+    public static final Setting<String> OVERRIDES_SETTING_DEPRECATED = Setting.simpleString(
+        "index.lance.overrides",
+        "",
+        Setting.Property.IndexScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
     public static final Setting<String> OVERRIDES_SETTING = Setting.simpleString(
         LanceEngineFactory.OVERRIDES_SETTING,
-        "",
+        OVERRIDES_SETTING_DEPRECATED,
         Setting.Property.IndexScope,
         Setting.Property.Dynamic
     );
-    public static final Setting<String> UNCOVERED_FRAGMENT_POLICY_SETTING = Setting.simpleString(
+    public static final Setting<String> UNCOVERED_FRAGMENT_POLICY_SETTING_DEPRECATED = Setting.simpleString(
         "index.lance.uncovered_fragment_policy",
         "immediate",
         LancePlugin::validateUncoveredFragmentPolicy,
+        Setting.Property.IndexScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<String> UNCOVERED_FRAGMENT_POLICY_SETTING = Setting.simpleString(
+        LanceEngineFactory.UNCOVERED_FRAGMENT_POLICY_SETTING,
+        LancePlugin::validateUncoveredFragmentPolicy,
+        UNCOVERED_FRAGMENT_POLICY_SETTING_DEPRECATED,
         Setting.Property.IndexScope,
         Setting.Property.Dynamic
     );
@@ -235,16 +309,31 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * index between placements would strand the structures already
      * built in the other location.
      */
-    public static final Setting<String> INDEX_PLACEMENT_SETTING = Setting.simpleString(
-        LanceEngineFactory.INDEX_PLACEMENT_SETTING,
+    public static final Setting<String> INDEX_PLACEMENT_SETTING_DEPRECATED = Setting.simpleString(
+        "index.lance.index_placement",
         LanceLocalClones.PLACEMENT_IN_TABLE,
         LancePlugin::validateIndexPlacement,
         Setting.Property.IndexScope,
+        Setting.Property.Final,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<String> INDEX_PLACEMENT_SETTING = Setting.simpleString(
+        LanceEngineFactory.INDEX_PLACEMENT_SETTING,
+        LancePlugin::validateIndexPlacement,
+        INDEX_PLACEMENT_SETTING_DEPRECATED,
+        Setting.Property.IndexScope,
         Setting.Property.Final
     );
-    public static final Setting<TimeValue> NAMESPACE_POLL_CADENCE_SETTING = Setting.timeSetting(
+    public static final Setting<TimeValue> NAMESPACE_POLL_CADENCE_SETTING_DEPRECATED = Setting.timeSetting(
         "lance.namespace.poll_cadence",
         TimeValue.timeValueSeconds(10),
+        TimeValue.timeValueSeconds(1),
+        Setting.Property.NodeScope,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<TimeValue> NAMESPACE_POLL_CADENCE_SETTING = Setting.timeSetting(
+        "plugins.lance.namespace.poll_cadence",
+        NAMESPACE_POLL_CADENCE_SETTING_DEPRECATED,
         TimeValue.timeValueSeconds(1),
         Setting.Property.NodeScope
     );
@@ -257,27 +346,56 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * indexes that were surfaced or attached by this plugin; ordinary
      * OpenSearch indexes are never in the tombstone list.
      */
-    public static final Setting<TimeValue> NAMESPACE_RESURFACE_GRACE_SETTING = Setting.timeSetting(
+    public static final Setting<TimeValue> NAMESPACE_RESURFACE_GRACE_SETTING_DEPRECATED = Setting.timeSetting(
         "lance.namespace.resurface_guard_grace",
         TimeValue.timeValueHours(1),
         TimeValue.timeValueMillis(0),
         Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<TimeValue> NAMESPACE_RESURFACE_GRACE_SETTING = Setting.timeSetting(
+        "plugins.lance.namespace.resurface_guard_grace",
+        NAMESPACE_RESURFACE_GRACE_SETTING_DEPRECATED,
+        TimeValue.timeValueMillis(0),
+        Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
-    public static final Setting<Long> BUILDER_MAX_ROWS_SETTING = Setting.longSetting(
+    public static final Setting<Long> BUILDER_MAX_ROWS_SETTING_DEPRECATED = Setting.longSetting(
         "lance.builder.max_rows",
         1_000_000L,
         1L,
+        Setting.Property.NodeScope,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Long> BUILDER_MAX_ROWS_SETTING = Setting.longSetting(
+        "plugins.lance.builder.max_rows",
+        BUILDER_MAX_ROWS_SETTING_DEPRECATED,
+        1L,
         Setting.Property.NodeScope
     );
-    public static final Setting<List<String>> ALLOWED_TABLE_ROOTS_SETTING = Setting.listSetting(
+    public static final Setting<List<String>> ALLOWED_TABLE_ROOTS_SETTING_DEPRECATED = Setting.listSetting(
         "lance.allowed_table_roots",
         List.of(),
-        java.util.function.Function.identity(),
+        Function.identity(),
+        Setting.Property.NodeScope,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<List<String>> ALLOWED_TABLE_ROOTS_SETTING = Setting.listSetting(
+        "plugins.lance.allowed_table_roots",
+        ALLOWED_TABLE_ROOTS_SETTING_DEPRECATED,
+        Function.identity(),
         Setting.Property.NodeScope
+    );
+    public static final Setting<Settings> STORAGE_OPTIONS_SETTING_DEPRECATED = Setting.groupSetting(
+        StorageOptions.DEPRECATED_INDEX_SETTING_PREFIX,
+        Setting.Property.IndexScope,
+        Setting.Property.Final,
+        Setting.Property.Deprecated
     );
     public static final Setting<Settings> STORAGE_OPTIONS_SETTING = Setting.groupSetting(
         StorageOptions.INDEX_SETTING_PREFIX,
+        STORAGE_OPTIONS_SETTING_DEPRECATED,
         Setting.Property.IndexScope,
         Setting.Property.Final
     );
@@ -297,10 +415,17 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * setting is node-scoped only, so a change requires a rolling
      * restart to take effect.
      */
-    public static final Setting<String> NATIVE_MEMORY_LIMIT_SETTING = Setting.simpleString(
+    public static final Setting<String> NATIVE_MEMORY_LIMIT_SETTING_DEPRECATED = Setting.simpleString(
         "lance.native_memory.limit",
         "40%",
         LancePlugin::validateNativeMemoryLimit,
+        Setting.Property.NodeScope,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<String> NATIVE_MEMORY_LIMIT_SETTING = Setting.simpleString(
+        "plugins.lance.native_memory.limit",
+        LancePlugin::validateNativeMemoryLimit,
+        NATIVE_MEMORY_LIMIT_SETTING_DEPRECATED,
         Setting.Property.NodeScope
     );
 
@@ -314,9 +439,16 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * the Session cache limit so operators have one number to reason
      * about.
      */
-    public static final Setting<Boolean> NATIVE_MEMORY_CB_ENABLED_SETTING = Setting.boolSetting(
+    public static final Setting<Boolean> NATIVE_MEMORY_CB_ENABLED_SETTING_DEPRECATED = Setting.boolSetting(
         "lance.native_memory.circuit_breaker.enabled",
         true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Boolean> NATIVE_MEMORY_CB_ENABLED_SETTING = Setting.boolSetting(
+        "plugins.lance.native_memory.circuit_breaker.enabled",
+        NATIVE_MEMORY_CB_ENABLED_SETTING_DEPRECATED,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -330,9 +462,17 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * far behind the real footprint. Node scoped and dynamic so
      * operators can tune it without a restart.
      */
-    public static final Setting<TimeValue> NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING = Setting.timeSetting(
+    public static final Setting<TimeValue> NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING_DEPRECATED = Setting.timeSetting(
         "lance.native_memory.circuit_breaker.poll_interval",
         TimeValue.timeValueSeconds(5),
+        TimeValue.timeValueSeconds(1),
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<TimeValue> NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING = Setting.timeSetting(
+        "plugins.lance.native_memory.circuit_breaker.poll_interval",
+        NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING_DEPRECATED,
         TimeValue.timeValueSeconds(1),
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
@@ -360,9 +500,17 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * because the underlying semaphore's permit count is fixed at
      * plugin init.
      */
-    public static final Setting<Integer> FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING = Setting.intSetting(
+    public static final Setting<Integer> FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING_DEPRECATED = Setting.intSetting(
         "lance.fragment_dispatch.max_concurrent",
         4,
+        1,
+        128,
+        Setting.Property.NodeScope,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Integer> FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING = Setting.intSetting(
+        "plugins.lance.fragment_dispatch.max_concurrent",
+        FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING_DEPRECATED,
         1,
         128,
         Setting.Property.NodeScope
@@ -377,9 +525,16 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * off retires every snapshot at once and later requests open the
      * table per request as before.
      */
-    public static final Setting<Boolean> CACHE_ENABLED_SETTING = Setting.boolSetting(
+    public static final Setting<Boolean> CACHE_ENABLED_SETTING_DEPRECATED = Setting.boolSetting(
         "lance.cache.enabled",
         true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Boolean> CACHE_ENABLED_SETTING = Setting.boolSetting(
+        "plugins.lance.cache.enabled",
+        CACHE_ENABLED_SETTING_DEPRECATED,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -390,9 +545,16 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * holds. Each snapshot is one open Lance dataset plus a few kilobytes
      * of metadata per fragment. Static, node scope.
      */
-    public static final Setting<Integer> CACHE_MAX_SNAPSHOTS_SETTING = Setting.intSetting(
+    public static final Setting<Integer> CACHE_MAX_SNAPSHOTS_SETTING_DEPRECATED = Setting.intSetting(
         "lance.cache.max_snapshots",
         64,
+        1,
+        Setting.Property.NodeScope,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Integer> CACHE_MAX_SNAPSHOTS_SETTING = Setting.intSetting(
+        "plugins.lance.cache.max_snapshots",
+        CACHE_MAX_SNAPSHOTS_SETTING_DEPRECATED,
         1,
         Setting.Property.NodeScope
     );
@@ -402,9 +564,17 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * off-heap column cache. The remainder goes to the Lance Session's
      * index and metadata caches in their 6:1 ratio. Static, node scope.
      */
-    public static final Setting<Double> CACHE_COLUMN_SHARE_SETTING = Setting.doubleSetting(
+    public static final Setting<Double> CACHE_COLUMN_SHARE_SETTING_DEPRECATED = Setting.doubleSetting(
         "lance.cache.column_share",
         0.4,
+        0.0,
+        0.95,
+        Setting.Property.NodeScope,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Double> CACHE_COLUMN_SHARE_SETTING = Setting.doubleSetting(
+        "plugins.lance.cache.column_share",
+        CACHE_COLUMN_SHARE_SETTING_DEPRECATED,
         0.0,
         0.95,
         Setting.Property.NodeScope
@@ -418,9 +588,16 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * version ({@link LanceRequestCache}). Dynamic: turning it off drops
      * every entry.
      */
-    public static final Setting<Boolean> REQUEST_CACHE_ENABLED_SETTING = Setting.boolSetting(
+    public static final Setting<Boolean> REQUEST_CACHE_ENABLED_SETTING_DEPRECATED = Setting.boolSetting(
         "lance.request_cache.enabled",
         true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Boolean> REQUEST_CACHE_ENABLED_SETTING = Setting.boolSetting(
+        "plugins.lance.request_cache.enabled",
+        REQUEST_CACHE_ENABLED_SETTING_DEPRECATED,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -430,9 +607,15 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * or a percentage of the heap; the same default as
      * {@code indices.requests.cache.size}. Static, node scope.
      */
-    public static final Setting<ByteSizeValue> REQUEST_CACHE_SIZE_SETTING = Setting.memorySizeSetting(
+    public static final Setting<ByteSizeValue> REQUEST_CACHE_SIZE_SETTING_DEPRECATED = Setting.memorySizeSetting(
         "lance.request_cache.size",
         "1%",
+        Setting.Property.NodeScope,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<ByteSizeValue> REQUEST_CACHE_SIZE_SETTING = Setting.memorySizeSetting(
+        "plugins.lance.request_cache.size",
+        REQUEST_CACHE_SIZE_SETTING_DEPRECATED,
         Setting.Property.NodeScope
     );
 
@@ -440,9 +623,15 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * The largest answer the coordinator result cache stores, measured as
      * the serialised size of the reduced aggregations. Static, node scope.
      */
-    public static final Setting<ByteSizeValue> REQUEST_CACHE_MAX_ENTRY_SIZE_SETTING = Setting.byteSizeSetting(
+    public static final Setting<ByteSizeValue> REQUEST_CACHE_MAX_ENTRY_SIZE_SETTING_DEPRECATED = Setting.byteSizeSetting(
         "lance.request_cache.max_entry_size",
         new ByteSizeValue(1, ByteSizeUnit.MB),
+        Setting.Property.NodeScope,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<ByteSizeValue> REQUEST_CACHE_MAX_ENTRY_SIZE_SETTING = Setting.byteSizeSetting(
+        "plugins.lance.request_cache.max_entry_size",
+        REQUEST_CACHE_MAX_ENTRY_SIZE_SETTING_DEPRECATED,
         Setting.Property.NodeScope
     );
 
@@ -451,9 +640,16 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * it was stored; zero (the default) keeps it until the table moves to
      * another version or the cache evicts it. Dynamic.
      */
-    public static final Setting<TimeValue> REQUEST_CACHE_EXPIRE_SETTING = Setting.positiveTimeSetting(
+    public static final Setting<TimeValue> REQUEST_CACHE_EXPIRE_SETTING_DEPRECATED = Setting.positiveTimeSetting(
         "lance.request_cache.expire",
         TimeValue.ZERO,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<TimeValue> REQUEST_CACHE_EXPIRE_SETTING = Setting.positiveTimeSetting(
+        "plugins.lance.request_cache.expire",
+        REQUEST_CACHE_EXPIRE_SETTING_DEPRECATED,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -465,9 +661,16 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * ({@link LanceFetchCache}). Dynamic: turning it off drops every
      * entry.
      */
-    public static final Setting<Boolean> FETCH_CACHE_ENABLED_SETTING = Setting.boolSetting(
+    public static final Setting<Boolean> FETCH_CACHE_ENABLED_SETTING_DEPRECATED = Setting.boolSetting(
         "lance.fetch_cache.enabled",
         true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Boolean> FETCH_CACHE_ENABLED_SETTING = Setting.boolSetting(
+        "plugins.lance.fetch_cache.enabled",
+        FETCH_CACHE_ENABLED_SETTING_DEPRECATED,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -477,9 +680,15 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * percentage of the heap; the same default as
      * {@code indices.requests.cache.size}. Static, node scope.
      */
-    public static final Setting<ByteSizeValue> FETCH_CACHE_SIZE_SETTING = Setting.memorySizeSetting(
+    public static final Setting<ByteSizeValue> FETCH_CACHE_SIZE_SETTING_DEPRECATED = Setting.memorySizeSetting(
         "lance.fetch_cache.size",
         "1%",
+        Setting.Property.NodeScope,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<ByteSizeValue> FETCH_CACHE_SIZE_SETTING = Setting.memorySizeSetting(
+        "plugins.lance.fetch_cache.size",
+        FETCH_CACHE_SIZE_SETTING_DEPRECATED,
         Setting.Property.NodeScope
     );
 
@@ -488,9 +697,15 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * decoded value's heap; a larger cell (a long text, a wide struct)
      * is taken on every request. Static, node scope.
      */
-    public static final Setting<ByteSizeValue> FETCH_CACHE_MAX_ENTRY_SIZE_SETTING = Setting.byteSizeSetting(
+    public static final Setting<ByteSizeValue> FETCH_CACHE_MAX_ENTRY_SIZE_SETTING_DEPRECATED = Setting.byteSizeSetting(
         "lance.fetch_cache.max_entry_size",
         new ByteSizeValue(256, ByteSizeUnit.KB),
+        Setting.Property.NodeScope,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<ByteSizeValue> FETCH_CACHE_MAX_ENTRY_SIZE_SETTING = Setting.byteSizeSetting(
+        "plugins.lance.fetch_cache.max_entry_size",
+        FETCH_CACHE_MAX_ENTRY_SIZE_SETTING_DEPRECATED,
         Setting.Property.NodeScope
     );
 
@@ -499,9 +714,16 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * zero (the default) keeps it until its table version's snapshot
      * closes, its index is deleted or the cache evicts it. Dynamic.
      */
-    public static final Setting<TimeValue> FETCH_CACHE_EXPIRE_SETTING = Setting.positiveTimeSetting(
+    public static final Setting<TimeValue> FETCH_CACHE_EXPIRE_SETTING_DEPRECATED = Setting.positiveTimeSetting(
         "lance.fetch_cache.expire",
         TimeValue.ZERO,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<TimeValue> FETCH_CACHE_EXPIRE_SETTING = Setting.positiveTimeSetting(
+        "plugins.lance.fetch_cache.expire",
+        FETCH_CACHE_EXPIRE_SETTING_DEPRECATED,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -518,9 +740,17 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * {@code _rowid} prefilter read. Dynamic: the next scan picks up
      * a new value. See {@link LanceFtsQuery}.
      */
-    public static final Setting<Integer> FTS_SUBSET_PROBE_LIMIT_SETTING = Setting.intSetting(
+    public static final Setting<Integer> FTS_SUBSET_PROBE_LIMIT_SETTING_DEPRECATED = Setting.intSetting(
         "lance.fts.subset_probe_limit",
         LanceFtsQuery.DEFAULT_SUBSET_PROBE_LIMIT,
+        1,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Integer> FTS_SUBSET_PROBE_LIMIT_SETTING = Setting.intSetting(
+        "plugins.lance.fts.subset_probe_limit",
+        FTS_SUBSET_PROBE_LIMIT_SETTING_DEPRECATED,
         1,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
@@ -535,9 +765,18 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * the default is in {@link LanceFtsQuery#effectiveSubsetProbeLimit}.
      * Dynamic.
      */
-    public static final Setting<Double> FTS_SUBSET_PROBE_RATIO_SETTING = Setting.doubleSetting(
+    public static final Setting<Double> FTS_SUBSET_PROBE_RATIO_SETTING_DEPRECATED = Setting.doubleSetting(
         "lance.fts.subset_probe_ratio",
         LanceFtsQuery.DEFAULT_SUBSET_PROBE_RATIO,
+        0d,
+        1d,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Double> FTS_SUBSET_PROBE_RATIO_SETTING = Setting.doubleSetting(
+        "plugins.lance.fts.subset_probe_ratio",
+        FTS_SUBSET_PROBE_RATIO_SETTING_DEPRECATED,
         0d,
         1d,
         Setting.Property.NodeScope,
@@ -549,9 +788,17 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * hit queries stay on the whole table lookup whatever the ratio
      * gives. Dynamic.
      */
-    public static final Setting<Integer> FTS_SUBSET_PROBE_MIN_ROWS_SETTING = Setting.intSetting(
+    public static final Setting<Integer> FTS_SUBSET_PROBE_MIN_ROWS_SETTING_DEPRECATED = Setting.intSetting(
         "lance.fts.subset_probe_min_rows",
         LanceFtsQuery.DEFAULT_SUBSET_PROBE_MIN_ROWS,
+        1,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Integer> FTS_SUBSET_PROBE_MIN_ROWS_SETTING = Setting.intSetting(
+        "plugins.lance.fts.subset_probe_min_rows",
+        FTS_SUBSET_PROBE_MIN_ROWS_SETTING_DEPRECATED,
         1,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
@@ -567,9 +814,16 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * the behaviour that let a large enough table end the node with a
      * kernel OOM kill. Dynamic. See {@link ScanAdmission}.
      */
-    public static final Setting<Boolean> ADMISSION_ENABLED_SETTING = Setting.boolSetting(
+    public static final Setting<Boolean> ADMISSION_ENABLED_SETTING_DEPRECATED = Setting.boolSetting(
         "lance.admission.enabled",
         true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Boolean> ADMISSION_ENABLED_SETTING = Setting.boolSetting(
+        "plugins.lance.admission.enabled",
+        ADMISSION_ENABLED_SETTING_DEPRECATED,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -580,11 +834,19 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * {@code MemAvailable - headroom} plus the memory earlier admitted
      * scans retained. Dynamic.
      */
-    public static final Setting<ByteSizeValue> ADMISSION_HEADROOM_SETTING = Setting.byteSizeSetting(
+    public static final Setting<ByteSizeValue> ADMISSION_HEADROOM_SETTING_DEPRECATED = Setting.byteSizeSetting(
         "lance.admission.headroom",
         ScanAdmission.DEFAULT_HEADROOM,
         ByteSizeValue.ZERO,
         new ByteSizeValue(Long.MAX_VALUE),
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<ByteSizeValue> ADMISSION_HEADROOM_SETTING = new Setting<>(
+        "plugins.lance.admission.headroom",
+        ADMISSION_HEADROOM_SETTING_DEPRECATED,
+        new Setting.ByteSizeValueParser(ByteSizeValue.ZERO, new ByteSizeValue(Long.MAX_VALUE), "plugins.lance.admission.headroom"),
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -600,9 +862,16 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * filter page is then judged on its limit). Dynamic. See
      * {@link ScanAdmission}.
      */
-    public static final Setting<Boolean> ADMISSION_BOUNDED_SHAPES_GATED_SETTING = Setting.boolSetting(
+    public static final Setting<Boolean> ADMISSION_BOUNDED_SHAPES_GATED_SETTING_DEPRECATED = Setting.boolSetting(
         "lance.admission.bounded_shapes_gated",
         true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Boolean> ADMISSION_BOUNDED_SHAPES_GATED_SETTING = Setting.boolSetting(
+        "plugins.lance.admission.bounded_shapes_gated",
+        ADMISSION_BOUNDED_SHAPES_GATED_SETTING_DEPRECATED,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -615,11 +884,23 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * table's indexes and scans as not fitting the cache; do not change
      * it on a real node. Dynamic.
      */
-    public static final Setting<ByteSizeValue> TEST_INDEX_CACHE_SHARD_SHARE_SETTING = Setting.byteSizeSetting(
+    public static final Setting<ByteSizeValue> TEST_INDEX_CACHE_SHARD_SHARE_SETTING_DEPRECATED = Setting.byteSizeSetting(
         "lance.test.index_cache_shard_share",
         ByteSizeValue.ZERO,
         ByteSizeValue.ZERO,
         new ByteSizeValue(Long.MAX_VALUE),
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<ByteSizeValue> TEST_INDEX_CACHE_SHARD_SHARE_SETTING = new Setting<>(
+        "plugins.lance.test.index_cache_shard_share",
+        TEST_INDEX_CACHE_SHARD_SHARE_SETTING_DEPRECATED,
+        new Setting.ByteSizeValueParser(
+            ByteSizeValue.ZERO,
+            new ByteSizeValue(Long.MAX_VALUE),
+            "plugins.lance.test.index_cache_shard_share"
+        ),
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -633,10 +914,18 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * admission and the reading at the scan's completion) and prove the
      * retained credit; do not set it on a real node. Dynamic.
      */
-    public static final Setting<List<String>> TEST_ADMISSION_AVAILABLE_MEMORY_SETTING = Setting.listSetting(
+    public static final Setting<List<String>> TEST_ADMISSION_AVAILABLE_MEMORY_SETTING_DEPRECATED = Setting.listSetting(
         "lance.test.admission_available_memory",
         List.of(),
         raw -> ByteSizeValue.parseBytesSizeValue(raw, "lance.test.admission_available_memory").getStringRep(),
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<List<String>> TEST_ADMISSION_AVAILABLE_MEMORY_SETTING = Setting.listSetting(
+        "plugins.lance.test.admission_available_memory",
+        TEST_ADMISSION_AVAILABLE_MEMORY_SETTING_DEPRECATED,
+        raw -> ByteSizeValue.parseBytesSizeValue(raw, "plugins.lance.test.admission_available_memory").getStringRep(),
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -650,9 +939,17 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * plans without them and the {@code GET /_plugins/_lance/stats} counters that
      * record it; do not set it on a real node. Dynamic.
      */
-    public static final Setting<TimeValue> TEST_STATISTICS_COLLECT_DELAY_SETTING = Setting.timeSetting(
+    public static final Setting<TimeValue> TEST_STATISTICS_COLLECT_DELAY_SETTING_DEPRECATED = Setting.timeSetting(
         "lance.test.statistics_collect_delay",
         TimeValue.ZERO,
+        TimeValue.ZERO,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<TimeValue> TEST_STATISTICS_COLLECT_DELAY_SETTING = Setting.timeSetting(
+        "plugins.lance.test.statistics_collect_delay",
+        TEST_STATISTICS_COLLECT_DELAY_SETTING_DEPRECATED,
         TimeValue.ZERO,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
@@ -673,9 +970,16 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * leaf readers. Dynamic so the two paths can be compared without a
      * restart.
      */
-    public static final Setting<Boolean> AGGREGATION_PUSHDOWN_SETTING = Setting.boolSetting(
+    public static final Setting<Boolean> AGGREGATION_PUSHDOWN_SETTING_DEPRECATED = Setting.boolSetting(
         "lance.aggregation.pushdown",
         true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Boolean> AGGREGATION_PUSHDOWN_SETTING = Setting.boolSetting(
+        "plugins.lance.aggregation.pushdown",
+        AGGREGATION_PUSHDOWN_SETTING_DEPRECATED,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -696,9 +1000,18 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * the concurrent hash tables bounded on large hosts. 1 restores the
      * single scan.
      */
-    public static final Setting<Integer> AGGREGATION_PUSHDOWN_PARALLELISM_SETTING = Setting.intSetting(
+    public static final Setting<Integer> AGGREGATION_PUSHDOWN_PARALLELISM_SETTING_DEPRECATED = Setting.intSetting(
         "lance.aggregation.pushdown_parallelism",
         Math.max(1, Math.min(32, NativeMemoryLimit.availableCpus() / 2)),
+        1,
+        32,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Integer> AGGREGATION_PUSHDOWN_PARALLELISM_SETTING = Setting.intSetting(
+        "plugins.lance.aggregation.pushdown_parallelism",
+        AGGREGATION_PUSHDOWN_PARALLELISM_SETTING_DEPRECATED,
         1,
         32,
         Setting.Property.NodeScope,
@@ -715,9 +1028,16 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * would hold them all. Static: the executor reads it from the node
      * settings when it plans a request.
      */
-    public static final Setting<Integer> AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING = Setting.intSetting(
+    public static final Setting<Integer> AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING_DEPRECATED = Setting.intSetting(
         "lance.aggregation.pushdown_max_groups",
         1_000_000,
+        1,
+        Setting.Property.NodeScope,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Integer> AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING = Setting.intSetting(
+        "plugins.lance.aggregation.pushdown_max_groups",
+        AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING_DEPRECATED,
         1,
         Setting.Property.NodeScope
     );
@@ -741,9 +1061,18 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * trade-off can be tuned without a restart; the executor reads it
      * when it plans a request.
      */
-    public static final Setting<Integer> AGGREGATION_PERCENTILES_BINS_SETTING = Setting.intSetting(
+    public static final Setting<Integer> AGGREGATION_PERCENTILES_BINS_SETTING_DEPRECATED = Setting.intSetting(
         "lance.aggregation.percentiles_bins",
         4096,
+        16,
+        1_000_000,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Integer> AGGREGATION_PERCENTILES_BINS_SETTING = Setting.intSetting(
+        "plugins.lance.aggregation.percentiles_bins",
+        AGGREGATION_PERCENTILES_BINS_SETTING_DEPRECATED,
         16,
         1_000_000,
         Setting.Property.NodeScope,
@@ -766,9 +1095,18 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * proportionally more retained groups per scan. Dynamic; the
      * executor reads it when it plans a request.
      */
-    public static final Setting<Integer> AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING = Setting.intSetting(
+    public static final Setting<Integer> AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING_DEPRECATED = Setting.intSetting(
         "lance.aggregation.pushdown_topk_slack",
         4,
+        1,
+        64,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Integer> AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING = Setting.intSetting(
+        "plugins.lance.aggregation.pushdown_topk_slack",
+        AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING_DEPRECATED,
         1,
         64,
         Setting.Property.NodeScope,
@@ -789,9 +1127,18 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * the same reason: each scan already keeps Lance's decode threads
      * busy next to the consuming thread. 1 restores the single scan.
      */
-    public static final Setting<Integer> FRAGMENT_PATH_PARALLELISM_SETTING = Setting.intSetting(
+    public static final Setting<Integer> FRAGMENT_PATH_PARALLELISM_SETTING_DEPRECATED = Setting.intSetting(
         "lance.fragment_path.parallelism",
         Math.max(1, Math.min(32, NativeMemoryLimit.availableCpus() / 2)),
+        1,
+        32,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Integer> FRAGMENT_PATH_PARALLELISM_SETTING = Setting.intSetting(
+        "plugins.lance.fragment_path.parallelism",
+        FRAGMENT_PATH_PARALLELISM_SETTING_DEPRECATED,
         1,
         32,
         Setting.Property.NodeScope,
@@ -814,9 +1161,18 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * collects on the request's thread alone, in fragment order, and
      * reduces nothing, which is the behaviour before slicing existed.
      */
-    public static final Setting<Integer> FRAGMENT_PATH_SLICES_SETTING = Setting.intSetting(
+    public static final Setting<Integer> FRAGMENT_PATH_SLICES_SETTING_DEPRECATED = Setting.intSetting(
         "lance.fragment_path.slices",
         Math.max(1, Math.min(32, NativeMemoryLimit.availableCpus() / 2)),
+        1,
+        32,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Integer> FRAGMENT_PATH_SLICES_SETTING = Setting.intSetting(
+        "plugins.lance.fragment_path.slices",
+        FRAGMENT_PATH_SLICES_SETTING_DEPRECATED,
         1,
         32,
         Setting.Property.NodeScope,
@@ -833,9 +1189,17 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * every bitmap and every IVF partition. Dynamic: warm-ups started
      * after the change use the new value.
      */
-    public static final Setting<LanceIndexWarmer.Mode> ATTACH_WARM_INDEXES_SETTING = new Setting<>(
+    public static final Setting<LanceIndexWarmer.Mode> ATTACH_WARM_INDEXES_SETTING_DEPRECATED = new Setting<>(
         "lance.attach.warm_indexes",
         LanceIndexWarmer.Mode.METADATA.settingValue(),
+        LanceIndexWarmer.Mode::parse,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<LanceIndexWarmer.Mode> ATTACH_WARM_INDEXES_SETTING = new Setting<>(
+        "plugins.lance.attach.warm_indexes",
+        ATTACH_WARM_INDEXES_SETTING_DEPRECATED,
         LanceIndexWarmer.Mode::parse,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
@@ -856,9 +1220,18 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * and the dispatch filter read it per request, the engine at every
      * reader open.
      */
-    public static final Setting<Long> MAX_DOCS_PER_READER_SETTING = Setting.longSetting(
+    public static final Setting<Long> MAX_DOCS_PER_READER_SETTING_DEPRECATED = Setting.longSetting(
         "lance.test.max_docs_per_reader",
         IndexWriter.MAX_DOCS,
+        1L,
+        IndexWriter.MAX_DOCS,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Long> MAX_DOCS_PER_READER_SETTING = Setting.longSetting(
+        "plugins.lance.test.max_docs_per_reader",
+        MAX_DOCS_PER_READER_SETTING_DEPRECATED,
         1L,
         IndexWriter.MAX_DOCS,
         Setting.Property.NodeScope,
@@ -877,18 +1250,34 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * memory: twice this many batches of source text and tokens are in
      * flight. Dynamic: read when an attach starts its backfill.
      */
-    public static final Setting<Integer> ATTACH_BACKFILL_THREADS_SETTING = Setting.intSetting(
+    public static final Setting<Integer> ATTACH_BACKFILL_THREADS_SETTING_DEPRECATED = Setting.intSetting(
         "lance.attach.backfill_threads",
         Math.max(1, NativeMemoryLimit.availableCpus() / 2),
+        1,
+        1024,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Deprecated
+    );
+    public static final Setting<Integer> ATTACH_BACKFILL_THREADS_SETTING = Setting.intSetting(
+        "plugins.lance.attach.backfill_threads",
+        ATTACH_BACKFILL_THREADS_SETTING_DEPRECATED,
         1,
         1024,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
 
+    /**
+     * The settings of the plugin, current and deprecated. Reading a
+     * current setting falls back to its deprecated key when the current
+     * one is absent, so an index whose cluster state was written with the
+     * old keys keeps opening after an upgrade; the code reads only the
+     * current settings and writes only the current keys.
+     */
     @Override
     public List<Setting<?>> getSettings() {
-        return List.of(
+        List<Setting<?>> current = List.of(
             TABLE_SETTING,
             PRIMARY_KEY_FIELD_SETTING,
             PRIMARY_KEY_TYPE_SETTING,
@@ -938,10 +1327,65 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             ATTACH_BACKFILL_THREADS_SETTING,
             MAX_DOCS_PER_READER_SETTING
         );
+        List<Setting<?>> deprecated = List.of(
+            TABLE_SETTING_DEPRECATED,
+            PRIMARY_KEY_FIELD_SETTING_DEPRECATED,
+            PRIMARY_KEY_TYPE_SETTING_DEPRECATED,
+            VERSION_SETTING_DEPRECATED,
+            TAG_SETTING_DEPRECATED,
+            MULTI_FIELDS_SETTING_DEPRECATED,
+            OVERRIDES_SETTING_DEPRECATED,
+            UNCOVERED_FRAGMENT_POLICY_SETTING_DEPRECATED,
+            INDEX_PLACEMENT_SETTING_DEPRECATED,
+            NAMESPACE_POLL_CADENCE_SETTING_DEPRECATED,
+            NAMESPACE_RESURFACE_GRACE_SETTING_DEPRECATED,
+            BUILDER_MAX_ROWS_SETTING_DEPRECATED,
+            ALLOWED_TABLE_ROOTS_SETTING_DEPRECATED,
+            STORAGE_OPTIONS_SETTING_DEPRECATED,
+            NATIVE_MEMORY_LIMIT_SETTING_DEPRECATED,
+            NATIVE_MEMORY_CB_ENABLED_SETTING_DEPRECATED,
+            NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING_DEPRECATED,
+            FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING_DEPRECATED,
+            CACHE_ENABLED_SETTING_DEPRECATED,
+            CACHE_MAX_SNAPSHOTS_SETTING_DEPRECATED,
+            CACHE_COLUMN_SHARE_SETTING_DEPRECATED,
+            REQUEST_CACHE_ENABLED_SETTING_DEPRECATED,
+            REQUEST_CACHE_SIZE_SETTING_DEPRECATED,
+            REQUEST_CACHE_MAX_ENTRY_SIZE_SETTING_DEPRECATED,
+            REQUEST_CACHE_EXPIRE_SETTING_DEPRECATED,
+            FETCH_CACHE_ENABLED_SETTING_DEPRECATED,
+            FETCH_CACHE_SIZE_SETTING_DEPRECATED,
+            FETCH_CACHE_MAX_ENTRY_SIZE_SETTING_DEPRECATED,
+            FETCH_CACHE_EXPIRE_SETTING_DEPRECATED,
+            FTS_SUBSET_PROBE_LIMIT_SETTING_DEPRECATED,
+            FTS_SUBSET_PROBE_RATIO_SETTING_DEPRECATED,
+            FTS_SUBSET_PROBE_MIN_ROWS_SETTING_DEPRECATED,
+            ADMISSION_ENABLED_SETTING_DEPRECATED,
+            ADMISSION_HEADROOM_SETTING_DEPRECATED,
+            ADMISSION_BOUNDED_SHAPES_GATED_SETTING_DEPRECATED,
+            TEST_INDEX_CACHE_SHARD_SHARE_SETTING_DEPRECATED,
+            TEST_ADMISSION_AVAILABLE_MEMORY_SETTING_DEPRECATED,
+            TEST_STATISTICS_COLLECT_DELAY_SETTING_DEPRECATED,
+            AGGREGATION_PUSHDOWN_SETTING_DEPRECATED,
+            AGGREGATION_PUSHDOWN_PARALLELISM_SETTING_DEPRECATED,
+            AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING_DEPRECATED,
+            AGGREGATION_PERCENTILES_BINS_SETTING_DEPRECATED,
+            AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING_DEPRECATED,
+            FRAGMENT_PATH_PARALLELISM_SETTING_DEPRECATED,
+            FRAGMENT_PATH_SLICES_SETTING_DEPRECATED,
+            ATTACH_WARM_INDEXES_SETTING_DEPRECATED,
+            ATTACH_BACKFILL_THREADS_SETTING_DEPRECATED,
+            MAX_DOCS_PER_READER_SETTING_DEPRECATED
+        );
+        List<Setting<?>> all = new ArrayList<>(current.size() + deprecated.size());
+        all.addAll(current);
+        all.addAll(deprecated);
+        return all;
     }
 
     /**
-     * The credential entries of {@code index.lance.storage_options.*}
+     * The credential entries of {@code index.plugins.lance.storage_options.*}
+     * (and of the deprecated {@code index.lance.storage_options.*})
      * are withheld from {@code GET /<index>/_settings} and the cluster
      * state API through OpenSearch's settings filter. The patterns come
      * from {@link StorageOptions#SENSITIVE_INDEX_SETTING_PATTERNS}, so
@@ -1017,13 +1461,17 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
 
     private static void validateUncoveredFragmentPolicy(String value) {
         if (!"wait".equals(value) && !"immediate".equals(value)) {
-            throw new IllegalArgumentException("index.lance.uncovered_fragment_policy must be 'wait' or 'immediate', got '" + value + "'");
+            throw new IllegalArgumentException(
+                "index.plugins.lance.uncovered_fragment_policy must be 'wait' or 'immediate', got '" + value + "'"
+            );
         }
     }
 
     private static void validateIndexPlacement(String value) {
         if (!LanceLocalClones.PLACEMENT_IN_TABLE.equals(value) && !LanceLocalClones.PLACEMENT_NODE_LOCAL.equals(value)) {
-            throw new IllegalArgumentException("index.lance.index_placement must be 'in_table' or 'node_local', got '" + value + "'");
+            throw new IllegalArgumentException(
+                "index.plugins.lance.index_placement must be 'in_table' or 'node_local', got '" + value + "'"
+            );
         }
     }
 
@@ -1039,7 +1487,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         }
         if (!"long".equals(value) && !"keyword".equals(value) && !"unsigned_long".equals(value) && !"none".equals(value)) {
             throw new IllegalArgumentException(
-                "index.lance.primary_key_type must be 'long', 'unsigned_long', or 'keyword', got '" + value + "'"
+                "index.plugins.lance.primary_key_type must be 'long', 'unsigned_long', or 'keyword', got '" + value + "'"
             );
         }
     }
@@ -1050,7 +1498,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // IllegalArgumentException on malformed input, which
         // Setting.simpleString surfaces back to the operator as a
         // 400-style validation error.
-        NativeMemoryLimit.parse(value, "lance.native_memory.limit");
+        NativeMemoryLimit.parse(value, "plugins.lance.native_memory.limit");
     }
 
     /**
@@ -1064,7 +1512,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      */
     @Override
     public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
-        if (indexSettings.getSettings().get(LanceEngineFactory.TABLE_SETTING) != null) {
+        if (LanceEngineFactory.isLanceIndex(indexSettings.getSettings())) {
             return Optional.of(new LanceEngineFactory(warmCache, () -> maxDocsPerReader, servedVersions));
         }
         return Optional.empty();
@@ -1085,7 +1533,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     @Override
     public void onIndexModule(IndexModule indexModule) {
         LanceIndexFreshnessService freshness = freshnessService;
-        if (freshness != null && indexModule.getSettings().get(LanceEngineFactory.TABLE_SETTING) != null) {
+        if (freshness != null && LanceEngineFactory.isLanceIndex(indexModule.getSettings())) {
             indexModule.addIndexEventListener(freshness);
         }
     }
@@ -1134,7 +1582,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     public BreakerSettings getCircuitBreaker(Settings settings) {
         // Register a plugin-owned breaker keyed on {@link
         // LanceCircuitBreaker#NAME}. The byte limit mirrors
-        // lance.native_memory.limit so operators have one number to
+        // plugins.lance.native_memory.limit so operators have one number to
         // configure, and the overhead is 1.0 because the accounting we
         // push in from the polling loop is already actual usage, not
         // an estimate that needs scaling. TRANSIENT durability tells
@@ -1210,7 +1658,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         LanceRegistry.initSession(indexCache, metadataCacheBytes);
         LOGGER.info(
             "installed shared Lance Session: limit [{}] -> index cache [{}] (shards {}, share {} per shard), metadata cache [{}], "
-                + "column cache [{}], unused [{}] (from lance.native_memory.limit [{}], lance.cache.column_share [{}], {} cpus)",
+                + "column cache [{}], unused [{}] (from plugins.lance.native_memory.limit [{}], plugins.lance.cache.column_share [{}], {} cpus)",
             NativeMemoryLimit.humanReadable(totalBytes),
             NativeMemoryLimit.humanReadable(indexCache.capacityBytes()),
             indexCache.shards(),
@@ -1268,7 +1716,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         clusterService.getClusterSettings().addSettingsUpdateConsumer(REQUEST_CACHE_EXPIRE_SETTING, requestCache::setExpire);
         clusterService.addListener(requestCache);
         // Node-local shallow clones for indexes attached with
-        // index.lance.index_placement = node_local. The service owns the
+        // index.plugins.lance.index_placement = node_local. The service owns the
         // clone directories under the node's first data path, resolves
         // reads onto them (the warm cache and the engine consult the
         // node-wide instance installed here), and deletes them when the
