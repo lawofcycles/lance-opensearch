@@ -420,9 +420,23 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
             lease = warmCache.acquire(task.indexUuid, task.table, task.storageOptions, version, task.pkField, task.pkType, task.overrides);
         } catch (Exception e) {
             task.start(-1L);
-            task.record(new IndexStatus("", "", "", State.FAILED, 0d, "could not open the table: " + e.getMessage()));
+            task.record(
+                new IndexStatus(
+                    "",
+                    "",
+                    "",
+                    State.FAILED,
+                    0d,
+                    "could not open the table: " + StorageOptions.redactCredentials(e.getMessage())
+                )
+            );
             task.finish(State.FAILED);
-            LOGGER.warn("warm-up of [{}] (table {}) could not open the table", task.indexName, task.table, e);
+            LOGGER.warn(
+                "warm-up of [{}] (table {}) could not open the table",
+                task.indexName,
+                task.table,
+                StorageOptions.redactCredentials(e)
+            );
             return;
         }
         try {
@@ -472,9 +486,9 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
                 done.indexes().size()
             );
         } catch (Exception e) {
-            task.record(new IndexStatus("", "", "", State.FAILED, 0d, e.getMessage()));
+            task.record(new IndexStatus("", "", "", State.FAILED, 0d, StorageOptions.redactCredentials(e.getMessage())));
             task.finish(State.FAILED);
-            LOGGER.warn("warm-up of [{}] (table {}) failed", task.indexName, task.table, e);
+            LOGGER.warn("warm-up of [{}] (table {}) failed", task.indexName, task.table, StorageOptions.redactCredentials(e));
         } finally {
             lease.release();
         }
@@ -553,8 +567,22 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
             return new IndexStatus(name, type, column, State.DONE, seconds, detail);
         } catch (Exception e) {
             double seconds = (System.nanoTime() - startNanos) / 1e9;
-            LOGGER.warn("warm-up of index [{}] ({} on {}) of [{}] failed", name, type, column, task.indexName, e);
-            return new IndexStatus(name, type, column, State.FAILED, seconds, String.valueOf(e.getMessage()));
+            LOGGER.warn(
+                "warm-up of index [{}] ({} on {}) of [{}] failed",
+                name,
+                type,
+                column,
+                task.indexName,
+                StorageOptions.redactCredentials(e)
+            );
+            return new IndexStatus(
+                name,
+                type,
+                column,
+                State.FAILED,
+                seconds,
+                StorageOptions.redactCredentials(String.valueOf(e.getMessage()))
+            );
         }
     }
 

@@ -125,9 +125,12 @@ public final class TransportLanceBuildIndexesNodesAction extends TransportNodesA
                 mappingJson
             );
         } catch (RuntimeException e) {
-            throw e;
+            throw StorageOptions.redactCredentials(e);
         } catch (Exception e) {
-            throw new IllegalStateException("node_local build failed on this node: " + e.getMessage(), e);
+            throw new IllegalStateException(
+                "node_local build failed on this node: " + StorageOptions.redactCredentials(e.getMessage()),
+                StorageOptions.redactCredentials(e)
+            );
         }
     }
 }

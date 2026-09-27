@@ -18,6 +18,7 @@ import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.lance.StorageOptions;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
@@ -67,9 +68,9 @@ public final class TransportLanceNamespaceListAction extends HandledTransportAct
             tables = namespaceService.listTables(identifier);
         } catch (Exception e) {
             throw new OpenSearchStatusException(
-                "list tables for [" + identifier + "] failed: " + e.getMessage(),
+                "list tables for [" + identifier + "] failed: " + StorageOptions.redactCredentials(e.getMessage()),
                 RestStatus.INTERNAL_SERVER_ERROR,
-                e
+                StorageOptions.redactCredentials(e)
             );
         }
         if (tables.isEmpty()) {

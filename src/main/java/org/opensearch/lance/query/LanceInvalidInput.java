@@ -7,6 +7,8 @@ package org.opensearch.lance.query;
 
 import java.util.Objects;
 
+import org.opensearch.lance.StorageOptions;
+
 /**
  * Recognises the exception Lance raises for a request the caller got
  * wrong, so the failure can be answered as a client error.
@@ -108,12 +110,16 @@ public final class LanceInvalidInput {
      * The exception to report for {@code failure}: the Lance
      * {@link IllegalArgumentException} found in its cause chain when
      * there is one, so the status becomes 400 and the reason is Lance's
-     * own message, otherwise {@code failure} unchanged. {@code failure}
-     * must not be null.
+     * own message, otherwise {@code failure} unchanged. A Lance message
+     * that quotes a credential (an object store error body echoing
+     * the access key id) is reported through
+     * {@link StorageOptions#redactCredentials(RuntimeException)}, which
+     * keeps the class and so the status. {@code failure} must not be
+     * null.
      */
     public static Exception unwrap(Exception failure) {
         Objects.requireNonNull(failure, "failure must not be null");
         IllegalArgumentException invalid = find(failure);
-        return invalid == null ? failure : invalid;
+        return invalid == null ? failure : StorageOptions.redactCredentials(invalid);
     }
 }

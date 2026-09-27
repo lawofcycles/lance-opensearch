@@ -309,6 +309,11 @@ public final class LanceLocalClones implements ClusterStateListener {
         } catch (Exception e) {
             resolutionFailures.increment();
             resolutionFailuresByIndex.computeIfAbsent(indexName, k -> new LongAdder()).increment();
+            // The resolution opens the source table, so an object store
+            // error body can be the message; the IOException leaves the
+            // node in a shard failure or a search response, so it and
+            // the log line carry the redacted copy.
+            Exception reported = StorageOptions.redactCredentials(e);
             String message = "lance.index_placement: could not resolve the node-local clone of index ["
                 + indexName
                 + "] under ["
@@ -316,9 +321,9 @@ public final class LanceLocalClones implements ClusterStateListener {
                 + "] for table ["
                 + tableUri
                 + "]: "
-                + e;
-            LOG.warn(message, e);
-            throw new IOException(message, e);
+                + reported;
+            LOG.warn(message, reported);
+            throw new IOException(message, reported);
         }
     }
 
