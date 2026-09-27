@@ -12,12 +12,14 @@ import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.SearchResponseSections;
 import org.opensearch.action.search.ShardSearchFailure;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.document.DocumentField;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.lance.dispatch.LanceFragmentQueryResponse;
 import org.opensearch.script.ScriptService;
+import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
 import org.opensearch.search.SearchShardTarget;
@@ -104,14 +106,28 @@ public final class MergeReducer {
     // order, then node id order within a target). Each inner list
     // is already sorted by the executor and cut to from + size,
     // and carries the target ordinal and row address the merge
-    // breaks ties on.
+    // breaks ties on. A hit an executor deferred carries its score,
+    // sort values and node in place of a rendered SearchHit.
     private final List<List<RankedHit>> perNodeHits = new ArrayList<>();
     // Ordinal of the target whose responses absorbTarget is
     // absorbing; targets arrive one after another in request
     // order, so this is the position of the target in the
     // request's index list.
     private int targetOrdinal = -1;
+    // Per target ordinal: the index name and the shard target every
+    // hit of the target is stamped with (null when the index left the
+    // cluster state).
+    private final List<String> targetNames = new ArrayList<>();
+    private final List<SearchShardTarget> targetShards = new ArrayList<>();
     private final List<InternalAggregations> perNodeAggregations = new ArrayList<>();
+    // The merged, collapsed union of every node's hits and the window
+    // of it the response returns, computed once by page(); pageHits
+    // holds the rendered hit of every window position, filled by the
+    // executors' rendered hits and by render(int, SearchHit) for the
+    // deferred ones.
+    private List<RankedHit> merged;
+    private List<RankedHit> page;
+    private SearchHit[] pageHits;
 
     /** A reducer of a request without {@code collapse}. */
     public MergeReducer(
@@ -171,8 +187,26 @@ public final class MergeReducer {
         this.collapseField = collapseField;
     }
 
-    /** Fold one target's per-node responses (in fan-out order) into the accumulated state. */
+    /**
+     * Fold one target's per-node responses (in fan-out order) into the
+     * accumulated state, for responses whose hits are all rendered
+     * (a response with deferred hits needs the node it came from, see
+     * {@link #absorbTarget(String, List, List, boolean)}).
+     */
     public void absorbTarget(String indexName, List<LanceFragmentQueryResponse> responses, boolean incomplete) {
+        absorbTarget(indexName, responses, null, incomplete);
+    }
+
+    /**
+     * Fold one target's per-node responses (in fan-out order) into the
+     * accumulated state. {@code nodes} names the node every response
+     * came from, in the same order, so a hit an executor deferred can be
+     * fetched from that node; null when no response defers.
+     */
+    public void absorbTarget(String indexName, List<LanceFragmentQueryResponse> responses, List<DiscoveryNode> nodes, boolean incomplete) {
+        if (merged != null) {
+            throw new IllegalStateException("the page has been merged; no target can be absorbed after it");
+        }
         timedOut |= incomplete;
         // Every hit needs a SearchShardTarget so the response
         // envelope carries the {@code _index} key that clients
@@ -189,20 +223,40 @@ public final class MergeReducer {
                 org.opensearch.action.OriginalIndices.NONE
             );
         targetOrdinal++;
-        for (LanceFragmentQueryResponse response : responses) {
+        targetNames.add(indexName);
+        targetShards.add(shardTarget);
+        for (int r = 0; r < responses.size(); r++) {
+            LanceFragmentQueryResponse response = responses.get(r);
             totalMatched += response.matched();
             matchedIsLowerBound |= response.matchedIsLowerBound();
             terminatedEarly = mergeTerminatedEarly(terminatedEarly, response.terminatedEarly());
             // Keep each node's list intact; the sort merge and
-            // the from/size cut run in buildResponse once every
+            // the from/size cut run in page() once every
             // node of every target has answered.
             List<SearchHit> hits = response.hits();
             long[] rowAddrs = response.rowAddrs();
-            List<RankedHit> nodeHits = new ArrayList<>(hits.size());
+            LanceFragmentQueryResponse.DeferredHits deferred = response.deferredHits();
+            List<RankedHit> nodeHits = new ArrayList<>(hits.size() + deferred.size());
             for (int i = 0; i < hits.size(); i++) {
                 SearchHit hit = hits.get(i);
                 stampEnvelope(hit, shardTarget);
                 nodeHits.add(new RankedHit(hit, targetOrdinal, rowAddrs[i]));
+            }
+            if (!deferred.isEmpty()) {
+                if (nodes == null || nodes.get(r) == null) {
+                    throw new IllegalStateException("a response with deferred hits needs the node it came from");
+                }
+                DiscoveryNode node = nodes.get(r);
+                for (int i = 0; i < deferred.size(); i++) {
+                    nodeHits.add(
+                        new RankedHit(
+                            null,
+                            targetOrdinal,
+                            deferred.rowAddrs()[i],
+                            new Deferred(node, deferred.scores()[i], deferred.sortValues()[i], deferred.formats())
+                        )
+                    );
+                }
             }
             perNodeHits.add(nodeHits);
             if (response.aggregations() != null) {
@@ -266,25 +320,73 @@ public final class MergeReducer {
         return new TotalHits(total.value(), TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO);
     }
 
+    /**
+     * The window of the merged page the response returns, computed once:
+     * the per-node sorted lists merged into one ordered list, cut to one
+     * hit per collapse value under {@code collapse}, then to the
+     * {@code from} / {@code size} window. Every node returned up to
+     * {@code from + size} hits, so the merged list always holds the
+     * global top {@code from + size}. A hit whose {@link RankedHit#hit()}
+     * is null was deferred by its executor; the coordinator has it
+     * rendered on the node {@link RankedHit#deferred()} names and hands
+     * the hit to {@link #render}. No target can be absorbed after this
+     * is called.
+     */
+    public List<RankedHit> page() {
+        if (page != null) {
+            return page;
+        }
+        merged = mergeRanked(perNodeHits, sorts);
+        if (collapseField != null) {
+            merged = collapseRanked(merged, collapseField);
+        }
+        if (merged.size() <= from) {
+            page = List.of();
+        } else {
+            page = List.copyOf(merged.subList(from, Math.min(merged.size(), from + size)));
+        }
+        pageHits = new SearchHit[page.size()];
+        for (int i = 0; i < pageHits.length; i++) {
+            pageHits[i] = page.get(i).hit();
+        }
+        return page;
+    }
+
+    /** The index name of the target with ordinal {@code target} ({@link RankedHit#target()}). */
+    public String targetName(int target) {
+        return targetNames.get(target);
+    }
+
+    /**
+     * Hand the reducer the hit the fetch round rendered for position
+     * {@code position} of {@link #page()}: the hit receives the envelope
+     * every hit of its target receives, and the score and sort values
+     * the executor reported for it on the query round.
+     */
+    public void render(int position, SearchHit hit) {
+        page();
+        RankedHit ranked = page.get(position);
+        if (ranked.hit() != null) {
+            throw new IllegalStateException("position " + position + " of the page was rendered by its executor");
+        }
+        Deferred deferred = ranked.deferred();
+        stampEnvelope(hit, targetShards.get(ranked.target()));
+        hit.score(deferred.score());
+        if (deferred.formats() != null) {
+            hit.sortValues(deferred.sortValues(), deferred.formats());
+        }
+        pageHits[position] = hit;
+    }
+
     public SearchResponse buildResponse(long startMillis) {
         long took = System.currentTimeMillis() - startMillis;
-        // Merge the per-node sorted lists into one ordered list,
-        // then apply from/size so the response reflects the
-        // requested pagination window. Every node returned up to
-        // from + size hits, so the merged list always holds the
-        // global top from + size. Under collapse every node returned
-        // its top from + size groups, one hit each, and the merged
-        // list is cut to one hit per value before the window applies.
-        List<SearchHit> hits = mergeHits(perNodeHits, sorts);
-        if (collapseField != null) {
-            hits = collapseHits(hits, collapseField);
-        }
-        SearchHit[] paged;
-        if (hits.size() <= from) {
-            paged = new SearchHit[0];
-        } else {
-            int end = Math.min(hits.size(), from + size);
-            paged = hits.subList(from, end).toArray(new SearchHit[0]);
+        page();
+        SearchHit[] paged = new SearchHit[pageHits.length];
+        for (int i = 0; i < paged.length; i++) {
+            if (pageHits[i] == null) {
+                throw new IllegalStateException("position " + i + " of the page was deferred by its executor and never rendered");
+            }
+            paged[i] = pageHits[i];
         }
         // max_score follows the stock search path's TopDocsCollectorContext: a
         // score ordered page (no sort, or a leading descending _score
@@ -298,8 +400,8 @@ public final class MergeReducer {
         // survives the merge.
         float maxScore = Float.NaN;
         if (scoreOrdered(sorts) || trackScores) {
-            for (SearchHit hit : hits) {
-                float score = hit.getScore();
+            for (RankedHit hit : merged) {
+                float score = hit.score();
                 if (Float.isNaN(score)) {
                     continue;
                 }
@@ -421,13 +523,7 @@ public final class MergeReducer {
      * correct continuation.
      */
     public static List<SearchHit> mergeHits(List<List<RankedHit>> perNodeHits, List<SortBuilder<?>> sorts) {
-        List<RankedHit> ranked = new ArrayList<>();
-        for (List<RankedHit> nodeHits : perNodeHits) {
-            ranked.addAll(nodeHits);
-        }
-        if (ranked.size() > 1) {
-            ranked.sort(hitComparator(sorts));
-        }
+        List<RankedHit> ranked = mergeRanked(perNodeHits, sorts);
         List<SearchHit> out = new ArrayList<>(ranked.size());
         for (RankedHit r : ranked) {
             out.add(r.hit());
@@ -435,14 +531,58 @@ public final class MergeReducer {
         return out;
     }
 
+    /** {@link #mergeHits} keeping the ranked entries, rendered or deferred. */
+    public static List<RankedHit> mergeRanked(List<List<RankedHit>> perNodeHits, List<SortBuilder<?>> sorts) {
+        List<RankedHit> ranked = new ArrayList<>();
+        for (List<RankedHit> nodeHits : perNodeHits) {
+            ranked.addAll(nodeHits);
+        }
+        if (ranked.size() > 1) {
+            ranked.sort(hitComparator(sorts));
+        }
+        return ranked;
+    }
+
     /**
      * A per-node hit with what the merge needs to place it: the
      * ordinal of the index it came from in the request's target list
      * and its Lance row address ({@code fragmentId << 32 | offset}).
      * Row addresses are unique within one table, so the pair is a
-     * total order over every hit of the request.
+     * total order over every hit of the request. {@code hit} is the
+     * rendered hit, or null for a hit the executor deferred, whose
+     * score, sort values and node are then in {@code deferred}.
      */
-    public record RankedHit(SearchHit hit, int target, long rowAddr) {
+    public record RankedHit(SearchHit hit, int target, long rowAddr, Deferred deferred) {
+
+        /** A rendered hit. */
+        public RankedHit(SearchHit hit, int target, long rowAddr) {
+            this(hit, target, rowAddr, null);
+        }
+
+        public RankedHit {
+            if ((hit == null) == (deferred == null)) {
+                throw new IllegalArgumentException("a ranked hit is rendered or deferred");
+            }
+        }
+
+        /** The hit's score: {@link SearchHit#getScore()} of a rendered hit, the executor's figure of a deferred one. */
+        public float score() {
+            return hit != null ? hit.getScore() : deferred.score();
+        }
+
+        /** The hit's raw sort values, or null without a sort. */
+        public Object[] rawSortValues() {
+            return hit != null ? hit.getRawSortValues() : deferred.sortValues();
+        }
+    }
+
+    /**
+     * What a deferred hit carries in place of a rendered one: the data
+     * node whose executor collected it, so the fetch round asks that
+     * node, its score and its raw sort values with the formats that
+     * render them (null formats for a page without a sort).
+     */
+    public record Deferred(DiscoveryNode node, float score, Object[] sortValues, DocValueFormat[] formats) {
     }
 
     /**
@@ -469,6 +609,26 @@ public final class MergeReducer {
         return out;
     }
 
+    /**
+     * {@link #collapseHits} over ranked entries. A collapsed page is
+     * never deferred (the coordinator renders it on the query round,
+     * because the collapse value is a doc value field of the rendered
+     * hit), so every entry carries its hit.
+     */
+    private static List<RankedHit> collapseRanked(List<RankedHit> merged, String collapseField) {
+        Set<Object> seen = new HashSet<>();
+        List<RankedHit> out = new ArrayList<>(merged.size());
+        for (RankedHit ranked : merged) {
+            if (ranked.hit() == null) {
+                throw new IllegalStateException("a collapsed page cannot carry deferred hits");
+            }
+            if (seen.add(collapseValueOf(ranked.hit(), collapseField))) {
+                out.add(ranked);
+            }
+        }
+        return out;
+    }
+
     /** The collapse value of {@code hit}: its doc value field {@code field}'s first value, or null without one. */
     public static Object collapseValueOf(SearchHit hit, String field) {
         DocumentField documentField = hit.field(field);
@@ -478,7 +638,7 @@ public final class MergeReducer {
     private static Comparator<RankedHit> hitComparator(List<SortBuilder<?>> sorts) {
         Comparator<RankedHit> tieBreak = Comparator.comparingInt(RankedHit::target).thenComparingLong(RankedHit::rowAddr);
         if (sorts == null || sorts.isEmpty()) {
-            return Comparator.<RankedHit>comparingDouble(r -> -scoreOf(r.hit())).thenComparing(tieBreak);
+            return Comparator.<RankedHit>comparingDouble(r -> -scoreOf(r)).thenComparing(tieBreak);
         }
         Comparator<RankedHit> comparator = null;
         for (int i = 0; i < sorts.size(); i++) {
@@ -492,7 +652,7 @@ public final class MergeReducer {
     private static Comparator<RankedHit> clauseComparator(SortBuilder<?> sort, int index) {
         boolean descending = sort.order() == SortOrder.DESC;
         if (sort instanceof ScoreSortBuilder) {
-            Comparator<RankedHit> byScore = (a, b) -> Float.compare(scoreAt(a.hit(), index), scoreAt(b.hit(), index));
+            Comparator<RankedHit> byScore = (a, b) -> Float.compare(scoreAt(a, index), scoreAt(b, index));
             return descending ? byScore.reversed() : byScore;
         }
         boolean nullsFirst = false;
@@ -505,8 +665,8 @@ public final class MergeReducer {
         }
         final boolean nullsFirstFinal = nullsFirst;
         return (a, b) -> {
-            Object left = rawSortValue(a.hit(), index);
-            Object right = rawSortValue(b.hit(), index);
+            Object left = rawSortValue(a, index);
+            Object right = rawSortValue(b, index);
             if (left == null || right == null) {
                 if (left == null && right == null) {
                     return 0;
@@ -522,8 +682,8 @@ public final class MergeReducer {
         };
     }
 
-    private static float scoreOf(SearchHit hit) {
-        float score = hit.getScore();
+    private static float scoreOf(RankedHit hit) {
+        float score = hit.score();
         // NaN would sort above every real score under Float.compare;
         // treat "no score" as the lowest score instead.
         return Float.isNaN(score) ? Float.NEGATIVE_INFINITY : score;
@@ -532,9 +692,9 @@ public final class MergeReducer {
     /**
      * Score for a {@code _score} sort clause: the raw sort value at
      * the clause position when the executor recorded one, else
-     * {@link SearchHit#getScore()}.
+     * the hit's score.
      */
-    private static float scoreAt(SearchHit hit, int index) {
+    private static float scoreAt(RankedHit hit, int index) {
         Object raw = rawSortValue(hit, index);
         if (raw instanceof Number number) {
             return number.floatValue();
@@ -542,8 +702,8 @@ public final class MergeReducer {
         return scoreOf(hit);
     }
 
-    private static Object rawSortValue(SearchHit hit, int index) {
-        Object[] raw = hit.getRawSortValues();
+    private static Object rawSortValue(RankedHit hit, int index) {
+        Object[] raw = hit.rawSortValues();
         if (raw == null || index >= raw.length) {
             return null;
         }

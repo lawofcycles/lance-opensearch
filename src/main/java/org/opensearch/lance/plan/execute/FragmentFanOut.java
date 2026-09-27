@@ -99,10 +99,10 @@ public final class FragmentFanOut {
 
     /**
      * What the merge receives: the responses that arrived, in slot
-     * order, and how many nodes did not answer (0 when every node
-     * did).
+     * order, the node each came from in the same order, and how many
+     * nodes did not answer (0 when every node did).
      */
-    public record Outcome(List<LanceFragmentQueryResponse> responses, int incompleteNodes) {
+    public record Outcome(List<LanceFragmentQueryResponse> responses, List<DiscoveryNode> nodes, int incompleteNodes) {
     }
 
     private final int size;
@@ -172,13 +172,15 @@ public final class FragmentFanOut {
             mergeExecutor.execute(ActionRunnable.run(once, () -> {
                 ensureNotCancelled();
                 List<LanceFragmentQueryResponse> ordered = new ArrayList<>(size);
+                List<DiscoveryNode> orderedNodes = new ArrayList<>(size);
                 for (int i = 0; i < size; i++) {
                     LanceFragmentQueryResponse response = slots.get(i);
                     if (response != null) {
                         ordered.add(response);
+                        orderedNodes.add(nodes.get(i));
                     }
                 }
-                merge.accept(new Outcome(ordered, incompleteNodes.get()));
+                merge.accept(new Outcome(ordered, orderedNodes, incompleteNodes.get()));
             }));
         }, once::onFailure), size);
     }

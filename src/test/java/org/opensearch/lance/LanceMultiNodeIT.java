@@ -903,6 +903,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             // the cluster log so the cost of the temporary IndexService
             // can be read from build/testclusters/*/logs.
             updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", "DEBUG");
+            updateClusterSetting("logger.org.opensearch.lance.dispatch.FragmentExecutorSupport", "DEBUG");
             Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
@@ -988,6 +989,9 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         } finally {
             try {
                 updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", null);
+            } catch (Exception ignored) {}
+            try {
+                updateClusterSetting("logger.org.opensearch.lance.dispatch.FragmentExecutorSupport", null);
             } catch (Exception ignored) {}
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
@@ -1638,6 +1642,125 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         int total = extractIntPath(response, "hits", "total", "value");
         assertEquals(shape + " answered " + hitIdsOf(response), Math.max(0, Math.min(size, total - from)), hitList(response).size());
         return response;
+    }
+
+    /**
+     * A page answered by three executors is rendered in a fetch round:
+     * every executor returns the row address, score and sort values of
+     * its top {@code from + size} rows, the coordinator merges them and
+     * asks the nodes holding the {@code size} rows it keeps to render
+     * those alone, so the takes over the cluster address {@code size}
+     * rows instead of {@code size} per executor. The hits are the ones
+     * the one round path renders ({@code plugins.lance.fragment_path.defer_fetch}
+     * false), for a score ordered page, a sorted page, a
+     * {@code search_after} continuation of a pushed sorted scan, a page
+     * with {@code from}, and a page with a {@code _source} filter and
+     * {@code fields}. The fetch cache is off for the test so every take
+     * is visible in the profile.
+     *
+     * <p>Fixture: {@link LanceTableFactory#writeInterleavedTable} with
+     * three fragments of 100 rows, one fragment per data node; row
+     * {@code i} sits in fragment {@code i % 3} and its {@code lance}
+     * score grows with {@code i}, so the top of every page is spread
+     * over the three nodes.
+     */
+    public void testBoundedPageOnThreeNodesTakesOnlyTheRowsOfThePageInAFetchRound() throws Exception {
+        String suffix = "mn-fetch-round-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int fragments = 3;
+        int rowsPerFragment = 100;
+        LanceTableFactory.writeInterleavedTable(scratchDir, tableName, fragments, rowsPerFragment);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String match = "{\"match\":{\"body\":\"lance\"}}";
+        // Body, rows the page holds, rows the one round path takes over
+        // the cluster (from + size on each of the three executors).
+        Object[][] shapes = {
+            { "{\"size\":10,\"profile\":true,\"query\":" + match + "}", 10, 30 },
+            { "{\"from\":7,\"size\":10,\"profile\":true,\"query\":" + match + "}", 10, 51 },
+            { "{\"size\":10,\"profile\":true,\"sort\":[{\"id\":\"desc\"}],\"query\":" + match + "}", 10, 30 },
+            { "{\"size\":10,\"profile\":true,\"sort\":[{\"id\":\"asc\"}],\"search_after\":[9],\"query\":{\"match_all\":{}}}", 10, 30 },
+            { "{\"size\":10,\"profile\":true,\"_source\":[\"id\"],\"fields\":[\"category\"],\"query\":" + match + "}", 10, 30 },
+            {
+                "{\"size\":4,\"profile\":true,\"sort\":[{\"_score\":\"desc\"},{\"id\":\"asc\"}],\"track_scores\":true,\"query\":"
+                    + match
+                    + "}",
+                4,
+                12 } };
+        try {
+            updateClusterSetting("plugins.lance.fetch_cache.enabled", "false");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
+            int dataNodes = dataNodeCount();
+            assertEquals("fixture assumes one fragment per data node", fragments, dataNodes);
+
+            for (Object[] shape : shapes) {
+                String body = (String) shape[0];
+                int pageRows = (Integer) shape[1];
+                int oneRoundRows = (Integer) shape[2];
+
+                updateClusterSetting("plugins.lance.fragment_path.defer_fetch", null);
+                Map<String, Object> twoRounds = parse(readAll(postJson("/" + indexName + "/_search", body)));
+                assertEquals(body, pageRows, hitList(twoRounds).size());
+                assertEquals("every data node executed " + body + ": " + twoRounds, dataNodes, profileNodes(twoRounds).size());
+                assertEquals(
+                    "the takes address the rows of the page alone " + body + ": " + twoRounds,
+                    pageRows,
+                    takeRowsOverNodes(twoRounds)
+                );
+                int roundTrips = fetchRoundTrips(twoRounds);
+                assertTrue("a fetch round ran " + body + ": " + twoRounds, roundTrips >= 1 && roundTrips <= dataNodes);
+
+                updateClusterSetting("plugins.lance.fragment_path.defer_fetch", "false");
+                Map<String, Object> oneRound = parse(readAll(postJson("/" + indexName + "/_search", body)));
+                assertEquals("no fetch round with the setting off " + body + ": " + oneRound, 0, fetchRoundTrips(oneRound));
+                assertEquals("every executor takes its own page " + body + ": " + oneRound, oneRoundRows, takeRowsOverNodes(oneRound));
+                assertEquals("the two paths render the same hits for " + body, hitList(oneRound), hitList(twoRounds));
+                assertEquals(extractIntPath(oneRound, "hits", "total", "value"), extractIntPath(twoRounds, "hits", "total", "value"));
+                assertEquals(((Map<?, ?>) oneRound.get("hits")).get("max_score"), ((Map<?, ?>) twoRounds.get("hits")).get("max_score"));
+            }
+            // The top ten scores are ids 299 down to 290, spread over the
+            // three fragments.
+            updateClusterSetting("plugins.lance.fragment_path.defer_fetch", null);
+            Map<String, Object> page = parse(readAll(postJson("/" + indexName + "/_search", (String) shapes[0][0])));
+            assertEquals(List.of(299, 298, 297, 296, 295, 294, 293, 292, 291, 290), sourceIds(page));
+            assertEquals("one request per node holding rows of the page", dataNodes, fetchRoundTrips(page));
+            Map<String, Object> continued = parse(readAll(postJson("/" + indexName + "/_search", (String) shapes[3][0])));
+            assertEquals(List.of(10, 11, 12, 13, 14, 15, 16, 17, 18, 19), sourceIds(continued));
+        } finally {
+            try {
+                updateClusterSetting("plugins.lance.fragment_path.defer_fetch", null);
+            } catch (Exception ignored) {}
+            try {
+                updateClusterSetting("plugins.lance.fetch_cache.enabled", null);
+            } catch (Exception ignored) {}
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /** The sum of {@code fetch.take_rows} over the nodes of a response's profile. */
+    private static long takeRowsOverNodes(Map<String, Object> response) {
+        long takeRows = 0L;
+        for (Map<String, Object> node : profileNodes(response).values()) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> fetch = (Map<String, Object>) node.get("fetch");
+            takeRows += ((Number) fetch.get("take_rows")).longValue();
+        }
+        return takeRows;
+    }
+
+    /** {@code profile.lance.coordinator.fetch_round_trips} of a response. */
+    @SuppressWarnings("unchecked")
+    private static int fetchRoundTrips(Map<String, Object> response) {
+        Map<String, Object> lance = (Map<String, Object>) ((Map<String, Object>) response.get("profile")).get("lance");
+        Map<String, Object> coordinator = (Map<String, Object>) lance.get("coordinator");
+        assertNotNull("the profile carries the coordinator block: " + response, coordinator);
+        return ((Number) coordinator.get("fetch_round_trips")).intValue();
     }
 
     /**

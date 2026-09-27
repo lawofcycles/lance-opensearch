@@ -33,10 +33,8 @@ import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.SortField;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.search.Weight;
-import org.apache.lucene.store.ByteBuffersDirectory;
 import org.lance.Dataset;
 import org.lance.Fragment;
-import org.opensearch.ResourceAlreadyExistsException;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -44,12 +42,10 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.CheckedFunction;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.inject.Inject;
-import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
 import org.opensearch.common.lucene.search.Queries;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.breaker.CircuitBreaker;
-import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.indices.breaker.CircuitBreakerService;
 import org.opensearch.index.IndexService;
@@ -74,8 +70,6 @@ import org.opensearch.lance.engine.FragmentGroupScan;
 import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
-import org.opensearch.lance.engine.LanceFragmentLeafReader;
-import org.opensearch.lance.engine.LanceFragmentSchema;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.lance.plan.execute.FragmentPlanRefiner;
@@ -101,7 +95,6 @@ import org.opensearch.search.aggregations.MultiBucketCollector;
 import org.opensearch.search.aggregations.MultiBucketConsumerService.MultiBucketConsumer;
 import org.opensearch.search.aggregations.SearchContextAggregations;
 import org.opensearch.search.collapse.CollapseContext;
-import org.opensearch.search.fetch.subphase.FetchDocValuesContext;
 import org.opensearch.search.fetch.subphase.FetchFieldsContext;
 import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.search.internal.SearchContext;
@@ -216,14 +209,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             );
         }
     }
-
-    /**
-     * How many times a request re-resolves its {@link IndexService}
-     * when the cluster state applier registers or removes the node's
-     * instance while the request is between the lookup and the
-     * temporary creation.
-     */
-    private static final int INDEX_SERVICE_RACE_RETRIES = 2;
 
     /**
      * Pool the intra request work (collection slices, column load
@@ -434,7 +419,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         if (indexMetadata == null) {
             throw new IllegalStateException("Fragment path cannot resolve OpenSearch index [" + request.indexName() + "] on this node");
         }
-        Index index = indexMetadata.getIndex();
         String pkField = LancePlugin.PRIMARY_KEY_FIELD_SETTING.get(indexMetadata.getSettings());
         // Parse the type setting through the same fromSetting helper the
         // engine uses so unknown values fall back to LONG. Empty pkField
@@ -501,79 +485,14 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             // The executor needs an IndexService for the mapping, the
             // QueryShardContext, the bitset cache and the reader
             // wrapper the security plugin installs; see
-            // executeWithLocalOrTempIndexService for where it comes from.
-            return executeWithLocalOrTempIndexService(
-                index,
+            // FragmentExecutorSupport.withIndexService for where it comes
+            // from.
+            return FragmentExecutorSupport.withIndexService(
+                indicesService,
                 indexMetadata,
-                snapshot,
-                multiFields,
-                request,
-                cancellation,
-                fragmentCount,
-                effectiveFragmentIds,
-                0
-            );
-        }
-    }
-
-    /**
-     * Resolve the {@link IndexService} to run against and hand off to
-     * {@link #executeWithIndexService}. A node that hosts the shard
-     * copy has a registered instance; every other node builds a
-     * temporary one from cluster state for the duration of the
-     * request through {@link IndicesService#withTempIndexService}.
-     * Both go through the plugins' {@code onIndexModule} hooks, so the
-     * security plugin's reader wrapper is present in either case.
-     *
-     * <p>The cluster state applier can register or remove the node's
-     * instance while this runs. {@code withTempIndexService} throws
-     * {@link ResourceAlreadyExistsException} when a registered
-     * instance appeared after the lookup, and that instance can be
-     * gone again by the time it is looked up. The method therefore
-     * re-enters itself once per such race, up to a small bound, and
-     * then gives up with an {@link IllegalStateException} that names
-     * the flapping applier; the index is present in cluster state, so
-     * an {@code IndexNotFoundException} would misreport it as missing.
-     */
-    private LanceFragmentQueryResponse executeWithLocalOrTempIndexService(
-        Index index,
-        IndexMetadata indexMetadata,
-        LanceWarmCache.Snapshot snapshot,
-        Map<String, LinkedHashMap<String, String>> multiFields,
-        LanceFragmentQueryRequest request,
-        LanceCancellation cancellation,
-        int fragmentCount,
-        List<Integer> effectiveFragmentIds,
-        int attempt
-    ) throws Exception {
-        IndexService localIndexService = indicesService.indexService(index);
-        if (localIndexService != null) {
-            return executeWithIndexService(
-                localIndexService,
-                indexMetadata,
-                snapshot,
-                multiFields,
-                request,
-                cancellation,
-                fragmentCount,
-                effectiveFragmentIds
-            );
-        }
-        long tempStart = System.nanoTime();
-        try {
-            return indicesService.withTempIndexService(indexMetadata, tempIndexService -> {
-                // withTempIndexService leaves the MapperService
-                // empty; apply the cluster state mapping the same
-                // way IndicesClusterStateService does for a fresh
-                // IndexService.
-                tempIndexService.updateMapping(null, indexMetadata);
-                LOGGER.debug(
-                    "lance.dispatch: temporary IndexService for [{}] ready in {} us",
-                    request.indexName(),
-                    (System.nanoTime() - tempStart) / 1_000L
-                );
-                return executeWithIndexService(
-                    tempIndexService,
+                "fragment query",
+                indexService -> executeWithIndexService(
+                    indexService,
                     indexMetadata,
                     snapshot,
                     multiFields,
@@ -581,34 +500,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     cancellation,
                     fragmentCount,
                     effectiveFragmentIds
-                );
-            });
-        } catch (ResourceAlreadyExistsException raced) {
-            if (attempt >= INDEX_SERVICE_RACE_RETRIES) {
-                throw new IllegalStateException(
-                    "the cluster state applier on this node kept registering and removing the IndexService for ["
-                        + index.getName()
-                        + "] while a fragment query tried to resolve it ("
-                        + (attempt + 1)
-                        + " attempts)",
-                    raced
-                );
-            }
-            // The cluster state applier registered a local
-            // IndexService between the lookup above and the temp
-            // creation. Look it up again; if it has been removed in
-            // the meantime the lookup misses and the temp path runs
-            // once more.
-            return executeWithLocalOrTempIndexService(
-                index,
-                indexMetadata,
-                snapshot,
-                multiFields,
-                request,
-                cancellation,
-                fragmentCount,
-                effectiveFragmentIds,
-                attempt + 1
+                )
             );
         }
     }
@@ -684,7 +576,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         // to fragment path hits the same way they apply to shard path
         // hits.
         try (
-            DirectoryReader dr = openWrappedReader(
+            DirectoryReader dr = FragmentExecutorSupport.openWrappedReader(
                 shardId,
                 snapshot,
                 snapshot.isCached() ? warmCache.columnStore() : null,
@@ -710,7 +602,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 // The row take behind the page reads only the columns
                 // the body renders: the _source filter's, the fields'
                 // and the primary key.
-                request.projection().takeProjection(snapshot.schema())
+                request.projection().takeProjection(snapshot.schema()),
+                circuitBreakerService.getBreaker(CircuitBreaker.REQUEST)
             )
         ) {
             MultiBucketConsumer bucketConsumer = new MultiBucketConsumer(
@@ -783,7 +676,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 searchContext.withProjection(
                     request.projection().fetchSource(),
                     request.projection().storedFields(),
-                    resolveDocValuesContext(request.projection(), indexService),
+                    FragmentExecutorSupport.resolveDocValuesContext(request.projection(), indexService),
                     request.projection().fetchFields().isEmpty() ? null : new FetchFieldsContext(request.projection().fetchFields()),
                     request.projection().explain()
                 );
@@ -1098,15 +991,31 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                         );
                     }
                 }
+                // The page is rendered here unless the coordinator asked
+                // for the hits deferred: then only the row address, the
+                // score and the sort values of every hit travel, and the
+                // coordinator's fetch round renders the rows the merged
+                // page keeps. Under a reader wrapper the page is rendered
+                // whatever the request says: the fetch round has no
+                // search context to run the wrapper's decision in.
+                boolean defer = request.deferFetch() && !hasSecurityWrapper;
                 long fetchStart = System.nanoTime();
-                FragmentHitsPages.HitsPage hits = FragmentHitsPages.materialise(
-                    searchContext,
-                    fetchPhase,
-                    searcher.getIndexReader(),
-                    page.scoreDocs(),
-                    sortAndFormats,
-                    groupScan
-                );
+                FragmentHitsPages.HitsPage hits;
+                LanceFragmentQueryResponse.DeferredHits deferred;
+                if (defer) {
+                    hits = FragmentHitsPages.HitsPage.EMPTY;
+                    deferred = FragmentHitsPages.defer(searcher.getIndexReader(), page.scoreDocs(), sortAndFormats);
+                } else {
+                    hits = FragmentHitsPages.materialise(
+                        searchContext,
+                        fetchPhase,
+                        searcher.getIndexReader(),
+                        page.scoreDocs(),
+                        sortAndFormats,
+                        groupScan
+                    );
+                    deferred = LanceFragmentQueryResponse.DeferredHits.NONE;
+                }
                 long fetchEnd = System.nanoTime();
                 LanceFragmentQueryResponse.Profile profile = new LanceFragmentQueryResponse.Profile(
                     (fetchStart - queryStart) / 1_000_000L,
@@ -1132,7 +1041,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 // A size 0 request (the only shape the pushdown takes)
                 // has an empty page, so its row address array is empty
                 // as well; every other shape ships the addresses of the
-                // hits above for the coordinator's tie break.
+                // hits above for the coordinator's tie break, or the
+                // deferred hits when the coordinator asked for them.
                 return new LanceFragmentQueryResponse(
                     matched.value(),
                     matched.lowerBound(),
@@ -1141,7 +1051,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     hits.rowAddrs(),
                     aggregations,
                     terminatedEarly,
-                    profile
+                    profile,
+                    deferred
                 );
             }
         }
@@ -1644,24 +1555,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
     }
 
     /**
-     * The request's {@code docvalue_fields} resolved against the mapping
-     * the way {@code SearchService.parseSource} resolves them: patterns
-     * expanded to field names and the total bounded by
-     * {@code index.max_docvalue_fields_search}. {@code null} when the
-     * request has none.
-     */
-    private static FetchDocValuesContext resolveDocValuesContext(HitProjection projection, IndexService indexService) {
-        if (projection.docValueFields().isEmpty()) {
-            return null;
-        }
-        return FetchDocValuesContext.create(
-            indexService.mapperService()::simpleMatchToFullName,
-            indexService.getIndexSettings().getMaxDocvalueFields(),
-            projection.docValueFields()
-        );
-    }
-
-    /**
      * Combine the top-level query with {@code post_filter} into the
      * Lucene query used for hits and matched counting. Returns the
      * unmodified {@code base} when no post_filter is set.
@@ -1831,7 +1724,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * wrapper). See {@link #INDEX_SERVICE_GET_READER_WRAPPER} for
      * why this goes through reflection.
      *
-     * <p>Split out from {@link #openWrappedReader} so the caller in
+     * <p>Split out from {@link FragmentExecutorSupport#openWrappedReader} so the caller in
      * {@link #execute} can inspect whether a wrapper is installed
      * without also opening the reader. This is what lets
      * {@link PlanExecutor#computeMatched} count from the wrapped reader's
@@ -1855,98 +1748,6 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 throw (RuntimeException) cause;
             }
             throw new IllegalStateException("failed to obtain IndexService reader wrapper", cause);
-        }
-    }
-
-    /**
-     * Open the Lance-backed {@link DirectoryReader} for the caller's
-     * fragment subset, wrap it as an
-     * {@link OpenSearchDirectoryReader} so downstream code that
-     * relies on {@code ShardUtils.extractShardId(reader)} (the
-     * security plugin's DLS/FLS wrapper, most importantly) can find
-     * the shard id, and apply the {@code readerWrapper} the caller
-     * fetched from {@link IndexService}.
-     *
-     * <p>Lance-backed indexes are single-shard fixed, so
-     * {@code shardId} is always shard number 0 of the index. This
-     * matches the shard path (see {@code
-     * LanceReadOnlyEngine.openLanceReader}) so wrapper behaviour is
-     * consistent across the two paths, and it needs no local shard
-     * copy.
-     *
-     * <p>{@code readerWrapper} is the value returned by
-     * {@link #resolveReaderWrapper}. Passing it in rather than
-     * resolving it here lets {@link #execute} record whether a
-     * wrapper is installed so {@link PlanExecutor#computeMatched} can route
-     * counts through the searcher whenever a wrapper may restrict
-     * the visible document set. A {@code null} wrapper means no
-     * wrapper is installed (empty cluster, no security plugin) and
-     * the {@link OpenSearchDirectoryReader} is returned as-is —
-     * wrapping is still needed for shard id extraction by other
-     * code paths (e.g. the search context).
-     *
-     * <p>The reader contract is that {@code close()} on the
-     * returned reader also closes any nested reader, so the caller
-     * only needs to close the return value of this method
-     * (typically via try-with-resources). Errors during construction
-     * clean up the partially-built chain here.
-     */
-    private DirectoryReader openWrappedReader(
-        ShardId shardId,
-        LanceWarmCache.Snapshot snapshot,
-        ColumnStore columnStore,
-        List<Integer> effectiveFragmentIds,
-        String filterSql,
-        CheckedFunction<DirectoryReader, DirectoryReader, IOException> readerWrapper,
-        FragmentGroupScan groupScan,
-        FetchTakeStats.Accumulator takes,
-        LanceFragmentSchema.TakeProjection takeProjection
-    ) throws IOException {
-        // Column loads of this reader (the store's and the heap
-        // fallback's) scan the node's fragments in the groups of
-        // groupScan, so a column is read into its arrays on several
-        // cores. The scan carries the request's cancellation so every
-        // group, on whichever thread it runs, stops at its next batch
-        // once the task is cancelled.
-        DirectoryReader lanceReader = LanceDirectoryReader.openForSnapshot(
-            new ByteBuffersDirectory(),
-            snapshot,
-            columnStore,
-            effectiveFragmentIds,
-            filterSql,
-            circuitBreakerService.getBreaker(CircuitBreaker.REQUEST),
-            groupScan
-        );
-        OpenSearchDirectoryReader wrapped = null;
-        try {
-            // The leaves are this request's own, so the take scans they
-            // issue are this request's takes, attached before any
-            // wrapper hides the Lance leaf; the same leaves take only
-            // the columns this request renders.
-            for (LeafReaderContext leaf : lanceReader.leaves()) {
-                LanceFragmentLeafReader lanceLeaf = LanceFragmentLeafReader.unwrap(leaf.reader());
-                if (lanceLeaf != null) {
-                    lanceLeaf.setTakeAccumulator(takes);
-                    lanceLeaf.setTakeProjection(takeProjection);
-                }
-            }
-            wrapped = OpenSearchDirectoryReader.wrap(lanceReader, shardId);
-            if (readerWrapper == null) {
-                return wrapped;
-            }
-            return readerWrapper.apply(wrapped);
-        } catch (Exception e) {
-            // Close the outermost reader we successfully built.
-            // OpenSearchDirectoryReader.close() closes the inner
-            // Lance reader; if wrap itself failed before returning,
-            // the inner reader is still ours to close directly.
-            DirectoryReader toClose = wrapped != null ? wrapped : lanceReader;
-            try {
-                toClose.close();
-            } catch (Exception suppressed) {
-                e.addSuppressed(suppressed);
-            }
-            throw e;
         }
     }
 }

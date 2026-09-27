@@ -440,7 +440,15 @@ public final class LanceRequestCache implements ClusterStateListener {
         return new Lookup(metadata.getIndexUUID(), nodeIds(dataNodes), canonical, startMillis);
     }
 
-    private boolean readerWrapperInstalled(IndexMetadata metadata, IndicesService indicesService) {
+    /**
+     * Whether a reader wrapper is installed on the index of
+     * {@code metadata}, read once per index on this node and remembered
+     * (see {@link ReaderWrapperProbe#installedOn}); {@code true} when the
+     * probe cannot tell, the side that never caches, and never defers,
+     * a wrapped answer. Shared with the coordinator's decision to defer
+     * the hits of a page to the fetch round.
+     */
+    boolean readerWrapperInstalled(IndexMetadata metadata, IndicesService indicesService) {
         if (indicesService == null) {
             // Without the node's index services the probe cannot run;
             // like a probe that fails, the answer is the side that never

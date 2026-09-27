@@ -116,10 +116,14 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 | | 2 | Base: index, route (`fragment` or `unsupported`), optional logical and physical text, optional fragment plan, optional unplanned message, refinements, optional traits |
 | | 3 | Block, optional: whether the result cache would serve the body and the reason when not (optional `cacheable`, `reason`; fallback absent) |
 | `LanceFragmentQueryRequest` | 1 | Base: table URI, index name, storage options, pinned version, the fragment plan, optional query and post filter, sorts, search after, size, aggregations, fragment ids, track scores, track total hits up to, min score, terminate after, hit projection, rescores, collapse |
+| | 2 | Block, optional: whether the executor defers its hits to the fetch round (one boolean; fallback false, the executor renders its hits and the coordinator merges them next to deferred ones) |
 | `LanceFragmentQueryResponse` | 1 | Base: matched, matched is lower bound, fragment count, hits, row addresses, aggregations, terminated early |
 | | 2 | Block, optional: the executor's profile (query and fetch phase milliseconds, take scans, rows addressed, take milliseconds; five counters, fallback zero) |
 | | 3 | Block, optional: the columns the executor's take scans projected, summed over the scans (one counter, fallback zero) |
 | | 4 | Block, optional: the Lance full text scans the request ran on the executor (one counter, fallback zero) |
+| | 5 | Block, optional: the deferred hits (row addresses, scores, raw sort values per hit, the sort's doc value formats; fallback none, which is also what an executor writes for a request that did not ask for them) |
+| `LanceFragmentFetchRequest` | 1 | Base: table URI, index name, storage options, the version the query round read, row addresses, hit projection |
+| `LanceFragmentFetchResponse` | 1 | Base: the rendered hits in request order, the fetch round profile (fetch milliseconds, take scans, rows addressed, take milliseconds, columns projected) |
 | `LanceNodeStats` | 1 | Base: every figure of the node stats but the pruned fragment counter and the admission source, then the freshness stats |
 | | 2 | Block, optional: pruned fragment counter (fallback zero) |
 | | 3 | Block, optional: source of the last admission decision (`request` or `warm_up`; fallback `none`) |
@@ -178,9 +182,11 @@ node:
 | 3, Substrait filter set | 1 or 2 | Refused: `FragmentPlan wire version [3] adds fields in version [3] that this node's [k] cannot ignore` |
 | 3 | 3 | Reads every field |
 
-`FragmentPlanMixedVersionTests`, `LanceStatsSerializationTests` and `LanceExplainResponseTests`
-pin these rows: they write the streams of the earlier versions by hand and read today's streams
-with `FragmentPlan.read` and `LanceNodeStats.read` dialled down to the earlier versions, and
+`FragmentPlanMixedVersionTests`, `LanceStatsSerializationTests`, `LanceExplainResponseTests` and
+`LanceFragmentQuerySerializationTests` pin these rows: they write the streams of the earlier
+versions by hand and read today's streams with `FragmentPlan.read`, `LanceNodeStats.read`,
+`LanceFragmentQueryRequest.read` and `LanceFragmentQueryResponse.read` dialled down to the
+earlier versions, and
 `WireVersionTests` pins the framing itself. No released plugin binary exists yet to run a two
 binary cluster against; when one does, a mixed version integration test replaces the hand written
 streams.

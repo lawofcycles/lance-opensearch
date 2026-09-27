@@ -9,11 +9,13 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.opensearch.common.lucene.Lucene;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.lance.WireVersion;
+import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.aggregations.InternalAggregations;
 
@@ -65,6 +67,12 @@ import org.opensearch.search.aggregations.InternalAggregations;
  *       issued ({@link Profile}). The coordinator renders them per
  *       node under {@code profile.lance} when the request carried
  *       {@code profile: true}.</li>
+ *   <li>{@link #deferredHits()} — the page of a request the
+ *       coordinator sent with {@link LanceFragmentQueryRequest#deferFetch()}:
+ *       the row address, score and sort values of every hit and no
+ *       rendered hit ({@link #hits()} is empty). The coordinator merges
+ *       the page across the executors and has the rows of the hits it
+ *       keeps rendered by {@link LanceFragmentFetchAction}.</li>
  * </ul>
  *
  * <p>{@link SearchHit} is already {@link org.opensearch.core.common.io.stream.Writeable
@@ -81,15 +89,103 @@ import org.opensearch.search.aggregations.InternalAggregations;
  * projected as a second optional block, read as zero by a coordinator
  * of version 2. Version 4 added the Lance full text scans the request
  * ran as a third optional block, read as zero by an older coordinator.
+ * Version 5 added the deferred hits of a request whose coordinator asked
+ * for them ({@link LanceFragmentQueryRequest#deferFetch()}) as a fourth
+ * optional block; an older coordinator never asks, so it never receives
+ * a non empty one.
  */
 public final class LanceFragmentQueryResponse extends ActionResponse {
 
     /**
      * The wire format's version, the first field the response writes; 2
      * added the profile block, 3 the take columns block, 4 the full text
-     * scans block.
+     * scans block, 5 the deferred hits block.
      */
-    public static final int WIRE_VERSION = 4;
+    public static final int WIRE_VERSION = 5;
+
+    /**
+     * The hits of a page the executor collected but did not render, in
+     * page order: the Lance row address of every hit, its score (the
+     * value a rendered hit's {@code _score} would carry, a {@code _score}
+     * sort clause's value included), and its raw sort values with the
+     * formats that render them, so the coordinator can merge the page
+     * and stamp the hits the fetch round renders. {@code formats} is null
+     * for a page without a sort, whose hits carry no sort values.
+     * {@link #NONE} stands for a response whose hits are rendered.
+     */
+    public record DeferredHits(long[] rowAddrs, float[] scores, Object[][] sortValues, DocValueFormat[] formats) implements Writeable {
+
+        /** No deferred hit: the executor rendered its page. */
+        public static final DeferredHits NONE = new DeferredHits(new long[0], new float[0], new Object[0][], null);
+
+        public DeferredHits {
+            if (scores.length != rowAddrs.length || sortValues.length != rowAddrs.length) {
+                throw new IllegalArgumentException(
+                    "deferred hits carry "
+                        + rowAddrs.length
+                        + " row addresses, "
+                        + scores.length
+                        + " scores and "
+                        + sortValues.length
+                        + " sort values"
+                );
+            }
+        }
+
+        public DeferredHits(StreamInput in) throws IOException {
+            this(in.readLongArray(), in.readFloatArray(), readSortValues(in), readFormats(in));
+        }
+
+        private static Object[][] readSortValues(StreamInput in) throws IOException {
+            int count = in.readVInt();
+            Object[][] values = new Object[count][];
+            for (int i = 0; i < count; i++) {
+                values[i] = in.readArray(Lucene::readSortValue, Object[]::new);
+            }
+            return values;
+        }
+
+        private static DocValueFormat[] readFormats(StreamInput in) throws IOException {
+            if (!in.readBoolean()) {
+                return null;
+            }
+            int count = in.readVInt();
+            DocValueFormat[] formats = new DocValueFormat[count];
+            for (int i = 0; i < count; i++) {
+                formats[i] = in.readNamedWriteable(DocValueFormat.class);
+            }
+            return formats;
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            out.writeLongArray(rowAddrs);
+            out.writeFloatArray(scores);
+            out.writeVInt(sortValues.length);
+            for (Object[] values : sortValues) {
+                out.writeArray(Lucene::writeSortValue, values);
+            }
+            if (formats == null) {
+                out.writeBoolean(false);
+            } else {
+                out.writeBoolean(true);
+                out.writeVInt(formats.length);
+                for (DocValueFormat format : formats) {
+                    out.writeNamedWriteable(format);
+                }
+            }
+        }
+
+        /** How many hits were deferred. */
+        public int size() {
+            return rowAddrs.length;
+        }
+
+        /** Whether any hit was deferred. */
+        public boolean isEmpty() {
+            return rowAddrs.length == 0;
+        }
+    }
 
     /**
      * What one executor spent on a request: the query phase (from the
@@ -168,6 +264,12 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
     private final Boolean terminatedEarly;
     /** The executor's timings and take counts; {@link Profile#NONE} from an executor that reports none. */
     private final Profile profile;
+    /**
+     * The hits the executor collected but left for the coordinator's
+     * fetch round; {@link DeferredHits#NONE} when it rendered them into
+     * {@link #hits()}. A response carries one or the other, never both.
+     */
+    private final DeferredHits deferredHits;
 
     /** A response of a request without {@code terminate_after}: {@link #terminatedEarly()} is {@code null}. */
     public LanceFragmentQueryResponse(
@@ -194,6 +296,7 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         this(matched, matchedIsLowerBound, fragmentCount, hits, rowAddrs, aggregations, terminatedEarly, Profile.NONE);
     }
 
+    /** A response whose hits are rendered: {@link #deferredHits()} is {@link DeferredHits#NONE}. */
     public LanceFragmentQueryResponse(
         long matched,
         boolean matchedIsLowerBound,
@@ -204,8 +307,25 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         Boolean terminatedEarly,
         Profile profile
     ) {
+        this(matched, matchedIsLowerBound, fragmentCount, hits, rowAddrs, aggregations, terminatedEarly, profile, DeferredHits.NONE);
+    }
+
+    public LanceFragmentQueryResponse(
+        long matched,
+        boolean matchedIsLowerBound,
+        int fragmentCount,
+        List<SearchHit> hits,
+        long[] rowAddrs,
+        InternalAggregations aggregations,
+        Boolean terminatedEarly,
+        Profile profile,
+        DeferredHits deferredHits
+    ) {
         if (rowAddrs.length != hits.size()) {
             throw new IllegalArgumentException("rowAddrs has " + rowAddrs.length + " entries for " + hits.size() + " hits");
+        }
+        if (!hits.isEmpty() && deferredHits != null && !deferredHits.isEmpty()) {
+            throw new IllegalArgumentException("a response carries rendered hits or deferred hits, not both");
         }
         this.matched = matched;
         this.matchedIsLowerBound = matchedIsLowerBound;
@@ -215,6 +335,7 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         this.aggregations = aggregations;
         this.terminatedEarly = terminatedEarly;
         this.profile = profile == null ? Profile.NONE : profile;
+        this.deferredHits = deferredHits == null ? DeferredHits.NONE : deferredHits;
     }
 
     public LanceFragmentQueryResponse(StreamInput in) throws IOException {
@@ -253,6 +374,7 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         Profile timings = reader.block(2, Profile::new, Profile.NONE);
         this.profile = timings.withTakeColumns(reader.block(3, StreamInput::readVLong, 0L))
             .withFtsScans(reader.block(4, StreamInput::readVLong, 0L));
+        this.deferredHits = reader.block(5, DeferredHits::new, DeferredHits.NONE);
         reader.finish();
     }
 
@@ -277,10 +399,13 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         // An older coordinator that steps over the timings still merges
         // the hits and aggregations correctly, so every block is
         // optional: the version 2 timings, then the version 3 columns,
-        // then the version 4 full text scans.
+        // then the version 4 full text scans, then the version 5
+        // deferred hits (empty unless the coordinator asked for them,
+        // which an older coordinator cannot).
         WireVersion.writeBlock(out, false, profile);
         WireVersion.writeBlock(out, false, columns -> columns.writeVLong(profile.takeColumns()));
         WireVersion.writeBlock(out, false, scans -> scans.writeVLong(profile.ftsScans()));
+        WireVersion.writeBlock(out, false, deferredHits);
     }
 
     public long matched() {
@@ -340,5 +465,14 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
      */
     public Profile profile() {
         return profile;
+    }
+
+    /**
+     * The hits the executor collected but did not render, for the
+     * coordinator's fetch round; {@link DeferredHits#NONE} when the
+     * page is rendered into {@link #hits()}.
+     */
+    public DeferredHits deferredHits() {
+        return deferredHits;
     }
 }

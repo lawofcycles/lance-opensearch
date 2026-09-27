@@ -8,6 +8,7 @@ package org.opensearch.lance.dispatch;
 import java.io.IOException;
 import java.util.Map;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.cluster.node.DiscoveryNode;
@@ -32,7 +33,8 @@ import org.opensearch.transport.TransportResponseHandler;
  *         "query": {"millis": 12, "fts_scans": 1},
  *         "fetch": {"millis": 3, "take_count": 4, "take_rows": 47, "take_columns": 8, "take_millis": 9}
  *       }
- *     }
+ *     },
+ *     "coordinator": {"fetch_round_trips": 2}
  *   }
  * }
  * </pre>
@@ -42,15 +44,21 @@ import org.opensearch.transport.TransportResponseHandler;
  * Lance full text scans the request ran on that node (the hits scans of
  * its full text Weights and the count-only scans behind
  * {@code hits.total}), {@code fetch.millis} its
- * fetch phase (the rows behind the hits materialised), and the
+ * fetch phase (the rows behind the hits materialised, on the query
+ * round or on the fetch round of a page answered by several executors),
+ * and the
  * {@code take_*} figures the {@code _rowaddr IN (...)} take scans the
  * request issued on that node, whichever phase issued them: how many,
  * the row addresses they carried, the columns they projected summed
  * over the scans, and their wall time
  * ({@link LanceFragmentQueryResponse.Profile}). A node that answered
  * several requests of the same search (several fragment groups, several
- * targets) reports the sum. A request answered from the result cache
- * ran on no executor and reports {@code "lance": {"cached": true}}.
+ * targets, a fetch round request) reports the sum.
+ * {@code coordinator.fetch_round_trips} is the number of fetch round
+ * requests the coordinator sent ({@link LanceFragmentFetchAction}), zero
+ * for a page the executors rendered on the query round. A request
+ * answered from the result cache ran on no executor and reports
+ * {@code "lance": {"cached": true}}.
  *
  * <p>The per node figures are gathered as the responses arrive, by
  * wrapping the transport handler of every per node request
@@ -64,10 +72,32 @@ final class LanceSearchProfile {
 
     /** Node id to the summed figures of that node, in node id order so the object renders the same on every request. */
     private final Map<String, LanceFragmentQueryResponse.Profile> nodes = new ConcurrentSkipListMap<>();
+    /**
+     * How many {@link LanceFragmentFetchAction} requests the coordinator
+     * sent for this search: one per data node holding rows of the merged
+     * page, per target, when the executors deferred their hits; zero for
+     * a page rendered on the query round.
+     */
+    private final AtomicInteger fetchRoundTrips = new AtomicInteger();
 
     /** Adds what {@code node} reported in {@code response} to its figures. */
     void record(DiscoveryNode node, LanceFragmentQueryResponse response) {
-        nodes.merge(node.getId(), response.profile(), LanceFragmentQueryResponse.Profile::plus);
+        record(node, response.profile());
+    }
+
+    /** Adds {@code profile} to the figures of {@code node}. */
+    void record(DiscoveryNode node, LanceFragmentQueryResponse.Profile profile) {
+        nodes.merge(node.getId(), profile, LanceFragmentQueryResponse.Profile::plus);
+    }
+
+    /** Counts one fetch round request sent. */
+    void fetchRoundTrip() {
+        fetchRoundTrips.incrementAndGet();
+    }
+
+    /** The fetch round requests sent so far. */
+    int fetchRoundTrips() {
+        return fetchRoundTrips.get();
     }
 
     /** The figures gathered so far, by node id. */
@@ -167,6 +197,9 @@ final class LanceSearchProfile {
                     builder.endObject();
                     builder.endObject();
                 }
+                builder.endObject();
+                builder.startObject("coordinator");
+                builder.field("fetch_round_trips", profile.fetchRoundTrips());
                 builder.endObject();
             }
             builder.endObject();

@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -248,42 +249,69 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     }
 
     /**
+     * How the fetch round requests of one coordinator request leave the
+     * node: as child requests of the policy's task with the policy's
+     * timeout, like the query round requests ({@link #sender}). The
+     * request's {@code timeout} bounds each round on its own; the
+     * profile records the fetch round responses inside
+     * {@link CoordinatorFetchPhase}.
+     */
+    private CoordinatorFetchPhase.Sender fetchSender(FanOutPolicy policy) {
+        CancellableTask task = policy.task();
+        TimeValue timeout = policy.timeout();
+        TransportRequestOptions options = timeout == null
+            ? TransportRequestOptions.EMPTY
+            : TransportRequestOptions.builder().withTimeout(timeout).build();
+        return (node, request, handler) -> {
+            if (task != null) {
+                transportService.sendChildRequest(node, LanceFragmentFetchAction.NAME, request, task, options, handler);
+            } else {
+                transportService.sendRequest(node, LanceFragmentFetchAction.NAME, request, options, handler);
+            }
+        };
+    }
+
+    /**
      * Cancel the executor task of a per-node request whose answer will
      * not come: the request timed out, so the transport layer has
      * dropped its handler and unregistered the node as a child of the
      * coordinator task, and a later cancellation of the coordinator task
-     * would not reach it. The cancel names the executor's action and the
+     * would not reach it. The cancel names the executor's action
+     * ({@code actionName}, the query or the fetch round's) and the
      * coordinator task as parent, so on that node it matches the one
      * task this request started there. It runs under a stashed thread
      * context so a caller without the tasks privilege can still stop
      * its own executor, and its outcome only goes to the log: the
      * request has already been answered or failed by then.
      */
-    private void cancelExecutorTask(CancellableTask task, DiscoveryNode node, LanceFragmentQueryRequest request) {
+    private void cancelExecutorTask(CancellableTask task, DiscoveryNode node, String actionName, String indexName) {
         if (task == null || node == null) {
             return;
         }
         CancelTasksRequest cancel = new CancelTasksRequest().setNodes(node.getId())
-            .setActions(LanceFragmentQueryAction.NAME)
+            .setActions(actionName)
             .setParentTaskId(new TaskId(clusterService.localNode().getId(), task.getId()))
             .setReason("lance fragment request timed out at the coordinator");
         try (ThreadContext.StoredContext ignored = threadPool.getThreadContext().stashContext()) {
             client.admin().cluster().cancelTasks(cancel, ActionListener.wrap(response -> {
                 if (response.getTasks().isEmpty()) {
                     LOGGER.debug(
-                        "lance.dispatch: no fragment query task left to cancel on node [{}] for index [{}]",
+                        "lance.dispatch: no [{}] task left to cancel on node [{}] for index [{}]",
+                        actionName,
                         node.getId(),
-                        request == null ? "?" : request.indexName()
+                        indexName
                     );
                 } else {
                     LOGGER.debug(
-                        "lance.dispatch: cancelled {} fragment query task(s) on node [{}] for index [{}]",
+                        "lance.dispatch: cancelled {} [{}] task(s) on node [{}] for index [{}]",
                         response.getTasks().size(),
+                        actionName,
                         node.getId(),
-                        request == null ? "?" : request.indexName()
+                        indexName
                     );
                 }
-            }, e -> LOGGER.warn("lance.dispatch: could not cancel the fragment query task on node [{}]: {}", node.getId(), e.toString())));
+            }, e -> LOGGER.warn("lance.dispatch: could not cancel the [{}] task on node [{}]: {}", actionName, node.getId(), e.toString()))
+            );
         }
     }
 
@@ -317,7 +345,13 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // profile gathers them from the responses as they arrive and is
         // rendered under profile.lance once the answer is complete.
         LanceSearchProfile profile = source != null && source.profile() ? new LanceSearchProfile() : null;
-        FanOutPolicy policy = new FanOutPolicy(task, resolveTimeout(source), resolveAllowPartialSearchResults(searchRequest), profile);
+        FanOutPolicy policy = new FanOutPolicy(
+            task,
+            resolveTimeout(source),
+            resolveAllowPartialSearchResults(searchRequest),
+            profile,
+            new ConcurrentHashMap<>()
+        );
 
         QueryBuilder query = rewriteAtCoordinator(source == null ? null : source.query(), start);
         QueryBuilder postFilter = source == null ? null : source.postFilter();
@@ -398,6 +432,15 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // Per-index fan-out results, collected sequentially. The plan
         // is derived per target inside runIndexLoop, against the
         // target's own schema; the spec built here carries no plan yet.
+        // Whether the executors defer their hits is decided per target
+        // once its executor count and reader wrapper are known; the
+        // body level conditions are settled here.
+        boolean deferFetchCandidate = deferFetchCandidate(
+            clusterService.getClusterSettings().get(LancePlugin.FRAGMENT_PATH_DEFER_FETCH_SETTING),
+            size,
+            collapse,
+            projection
+        );
         FragmentQuerySpec spec = new FragmentQuerySpec(
             null,
             query,
@@ -413,7 +456,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             terminateAfter,
             projection,
             rescores,
-            collapse
+            collapse,
+            deferFetchCandidate
         );
         boolean versionRequested = source != null && Boolean.TRUE.equals(source.version());
         boolean seqNoAndPrimaryTermRequested = source != null && Boolean.TRUE.equals(source.seqNoAndPrimaryTerm());
@@ -458,6 +502,33 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             rescores.add(rescore);
         }
         return rescores;
+    }
+
+    /**
+     * Whether the body allows the executors to defer their hits to a
+     * fetch round: the setting is on, the body asks for hits, and it
+     * carries neither {@code collapse} (the collapse value is a doc value
+     * field of the rendered hit, read by the merge and by the
+     * {@code inner_hits} expansion) nor {@code "explain": true} (the
+     * explanation needs the query round's Weight). The target level
+     * conditions follow in {@link #deferFetch}.
+     */
+    static boolean deferFetchCandidate(boolean settingEnabled, int size, CollapseBuilder collapse, HitProjection projection) {
+        return settingEnabled && size > 0 && collapse == null && !projection.explain();
+    }
+
+    /**
+     * Whether one target's executors defer their hits: the body allows
+     * it ({@link #deferFetchCandidate}), the target fans out to at least
+     * two executors (with one, every hit it returns is a hit of the
+     * page, and a second round would only add a round trip), and no
+     * reader wrapper is installed on the index (the fetch round has no
+     * search context to run the wrapper's decision in, so a wrapped
+     * index renders on the query round; the executor checks the same
+     * on its side).
+     */
+    static boolean deferFetch(boolean candidate, int executorCount, boolean readerWrapperInstalled) {
+        return candidate && executorCount >= 2 && !readerWrapperInstalled;
     }
 
     /**
@@ -599,18 +670,31 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         ActionListener<SearchResponse> listener
     ) {
         if (index >= targets.size()) {
-            // The cached answer when the lookup found one (the fan-out
-            // was skipped), else the merge, stored when it qualifies.
-            SearchResponse response;
-            if (cacheLookup != null) {
-                response = cacheLookup.complete(merged::buildResponse);
-            } else {
-                response = merged.buildResponse(startMillis);
-            }
-            if (policy.profile() != null) {
-                response = policy.profile().attachTo(response, cacheLookup != null && cacheLookup.isHit());
-            }
-            listener.onResponse(response);
+            // Every target's query round is absorbed: the fetch round
+            // renders the hits the executors deferred (nothing is sent
+            // when none did), then the response is built.
+            CoordinatorFetchPhase.run(
+                merged,
+                policy.fetchTargets()::get,
+                spec.projection(),
+                fetchSender(policy),
+                threadPool.executor(LancePlugin.LANCE_COORDINATOR_THREAD_POOL),
+                threadPool.generic(),
+                policy.task(),
+                policy.profile(),
+                (node, request, cause) -> {
+                    LOGGER.warn(
+                        "lance.dispatch: node [{}] did not answer the fetch round for index [{}] ({} rows) within [{}]; "
+                            + "cancelling its executor task",
+                        node.getId(),
+                        request.indexName(),
+                        request.rowAddrs().length,
+                        policy.timeout()
+                    );
+                    cancelExecutorTask(policy.task(), node, LanceFragmentFetchAction.NAME, request.indexName());
+                },
+                ActionListener.wrap(v -> completeResponse(merged, policy, startMillis, cacheLookup, listener), listener::onFailure)
+            );
             return;
         }
         IndexTarget target = targets.get(index);
@@ -630,6 +714,37 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         } catch (Exception e) {
             listener.onFailure(e);
         }
+    }
+
+    /**
+     * The response once every hit of the page is at hand: the cached
+     * answer when the lookup found one (the fan-out was skipped), else
+     * the merge, stored when it qualifies; with the profile attached
+     * under {@code profile: true}. A merge that fails to build reaches
+     * the listener as a failure, not as an exception on the pool.
+     */
+    private void completeResponse(
+        MergeReducer merged,
+        FanOutPolicy policy,
+        long startMillis,
+        LanceRequestCache.Lookup cacheLookup,
+        ActionListener<SearchResponse> listener
+    ) {
+        SearchResponse response;
+        try {
+            if (cacheLookup != null) {
+                response = cacheLookup.complete(merged::buildResponse);
+            } else {
+                response = merged.buildResponse(startMillis);
+            }
+            if (policy.profile() != null) {
+                response = policy.profile().attachTo(response, cacheLookup != null && cacheLookup.isHit());
+            }
+        } catch (Exception e) {
+            listener.onFailure(e);
+            return;
+        }
+        listener.onResponse(response);
     }
 
     /**
@@ -805,6 +920,23 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         long maxDocs = clusterService.getClusterSettings().get(LancePlugin.MAX_DOCS_PER_READER_SETTING);
         List<PlanExecutor.FragmentGroup> groups = PlanExecutor.splitByRows(perNode, allFragmentIds, allFragmentRows, maxDocs);
 
+        // Two or more executors answer this target's page: they defer
+        // their hits and the fetch round renders the rows of the merged
+        // page on the nodes that hold them, unless a reader wrapper is
+        // installed on the index. The fetch round needs the table and
+        // the version the query round read.
+        boolean readerWrapperInstalled = false;
+        if (spec.deferFetch() && groups.size() >= 2) {
+            IndexMetadata indexMetadata = indexMetadataOf(target);
+            readerWrapperInstalled = indexMetadata == null || requestCache.readerWrapperInstalled(indexMetadata, indicesService);
+        }
+        boolean deferFetch = deferFetch(spec.deferFetch(), groups.size(), readerWrapperInstalled);
+        if (deferFetch) {
+            policy.fetchTargets()
+                .put(target.indexName(), new CoordinatorFetchPhase.Target(target.tableUri(), target.storageOptions(), observedVersion));
+        }
+        FragmentQuerySpec sendSpec = spec.withDeferFetch(deferFetch);
+
         // Responses land in the slot of the request they answer, so the
         // merge sees them in fan-out (node id, then group) order rather
         // than arrival order. The merge itself orders equal hits by row
@@ -827,12 +959,17 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // dispatch is loopback aware, but any other node in the
         // cluster picks up its slice through the network.
         planExecutor.execute(
-            planned.coordinatorPlan(spec.executionShape(), groups.size()),
-            fanOutContext(groups, target, observedVersion, spec, policy),
+            planned.coordinatorPlan(sendSpec.executionShape(), groups.size()),
+            fanOutContext(groups, target, observedVersion, sendSpec, policy),
             merged,
             target.indexName(),
             done
         );
+    }
+
+    /** The cluster state metadata of a target's index; null when the index left the cluster state. */
+    private IndexMetadata indexMetadataOf(IndexTarget target) {
+        return clusterService.state().metadata().index(target.index());
     }
 
     /**
@@ -914,7 +1051,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             spec.terminateAfter(),
             spec.projection(),
             spec.rescores(),
-            spec.collapse()
+            spec.collapse(),
+            spec.deferFetch()
         );
     }
 
@@ -938,7 +1076,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                     fragments,
                     policy.timeout()
                 );
-                cancelExecutorTask(policy.task(), node, request);
+                cancelExecutorTask(policy.task(), node, LanceFragmentQueryAction.NAME, target.indexName());
             } else {
                 // The executor's task was cancelled on that node,
                 // through _tasks/_cancel or because this request's
@@ -1117,34 +1255,34 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     }
 
     /**
-     * How the per-node requests of one coordinator request are sent and
-     * how a node that does not answer is treated: the coordinator task
-     * they are children of (null when the request runs under none), the
-     * transport timeout of each (null for none), and whether a node that
-     * did not answer leaves the request with partial results or fails it.
-     */
-    /**
      * How one coordinator request fans out: its task, the transport
      * timeout of every per-node request, whether a node that did not
-     * answer leaves a partial answer or fails the request, and the
-     * profile gathering the executors' timings when the body carried
-     * {@code profile: true} (null otherwise).
+     * answer leaves a partial answer or fails the request, the profile
+     * gathering the executors' timings when the body carried
+     * {@code profile: true} (null otherwise), and, per index name, the
+     * fetch round target of every index whose executors defer their hits
+     * (filled by {@link #fanOutForTarget}, read by the fetch round).
      */
-    private record FanOutPolicy(CancellableTask task, TimeValue timeout, boolean allowPartialSearchResults, LanceSearchProfile profile) {
+    private record FanOutPolicy(CancellableTask task, TimeValue timeout, boolean allowPartialSearchResults, LanceSearchProfile profile, Map<
+        String,
+        CoordinatorFetchPhase.Target> fetchTargets) {
     }
 
     /**
      * Immutable bundle of the query-time settings the coordinator
      * resolves once and threads through the per-index fan-out, plus the
      * per node plan derived for the current target ({@code plan}, null
-     * until {@link #fanOutForTarget} planned it). Keeps the recursive
+     * until {@link #fanOutForTarget} planned it) and whether the
+     * target's executors defer their hits ({@code deferFetch}: the body
+     * level candidate until {@link #fanOutForTarget} settles it per
+     * target). Keeps the recursive
      * {@link #runIndexLoop} / {@link #fanOutForTarget} signatures short
      * even as new wire-format fields are added.
      */
     private record FragmentQuerySpec(FragmentPlan plan, QueryBuilder query, QueryBuilder postFilter, List<SortBuilder<?>> sorts,
         Object[] searchAfter, int from, int effectiveSize, AggregatorFactories.Builder aggregations, boolean trackScores,
         int trackTotalHitsUpTo, Float minScore, int terminateAfter, HitProjection projection, List<RescorerBuilder<?>> rescores,
-        CollapseBuilder collapse) {
+        CollapseBuilder collapse, boolean deferFetch) {
 
         /** The same spec carrying the plan derived for one target. */
         FragmentQuerySpec withPlan(FragmentPlan targetPlan) {
@@ -1163,7 +1301,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 terminateAfter,
                 projection,
                 rescores,
-                collapse
+                collapse,
+                deferFetch
             );
         }
 
@@ -1187,7 +1326,33 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 terminateAfter,
                 projection,
                 rescores,
-                collapse
+                collapse,
+                deferFetch
+            );
+        }
+
+        /** The same spec with the defer fetch decision of one target. */
+        FragmentQuerySpec withDeferFetch(boolean targetDeferFetch) {
+            if (targetDeferFetch == deferFetch) {
+                return this;
+            }
+            return new FragmentQuerySpec(
+                plan,
+                query,
+                postFilter,
+                sorts,
+                searchAfter,
+                from,
+                effectiveSize,
+                aggregations,
+                trackScores,
+                trackTotalHitsUpTo,
+                minScore,
+                terminateAfter,
+                projection,
+                rescores,
+                collapse,
+                targetDeferFetch
             );
         }
 
