@@ -316,10 +316,6 @@ Shipping one of the two would take the following changes. The alternative that a
   - Once the retries are exhausted the restore itself is marked failed, so `POST /_cluster/reroute?retry_failed=true` does not help even after the table is back: OpenSearch refuses to allocate a primary whose restore has failed. Delete the index and restore it again.
 - The same engine failure outside a restore (for example `POST /{index}/_open` while the table is unreachable) behaves differently after the table is back: `POST /_cluster/reroute?retry_failed=true` starts the shard, because each failed attempt releases the shard's store and shard lock before the next one.
 
-## Deprecated setting names
-
-- The node settings are `plugins.lance.*` and the index settings `index.plugins.lance.*`. Release 0.1.0 also accepts the names of the earlier previews, `lance.*` and `index.lance.*`, as deprecated: a value under an old key is read when the new key is absent, and every read of an old key logs a deprecation warning (a `Warning` header on the request that read it). An index created under the old keys keeps opening; attach and the namespace poll write the new keys only. The old names are removed in the next minor release.
-
 ## Not yet implemented (RFC future work)
 
 Items on the roadmap that no version of the plugin ships today.
