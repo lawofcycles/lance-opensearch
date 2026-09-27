@@ -295,7 +295,7 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
      */
     private static String overridesSetting(String settingsBody, String index) {
         Object value = parseJson(settingsBody).get(index);
-        for (String step : new String[] { "settings", "index", "lance", "overrides" }) {
+        for (String step : new String[] { "settings", "index", "plugins", "lance", "overrides" }) {
             if (!(value instanceof Map<?, ?> map)) {
                 return null;
             }

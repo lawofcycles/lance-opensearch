@@ -87,7 +87,7 @@ public class LanceSnapshotIT extends LanceRestTestCase {
                 assertEquals(
                     "restored index must point at the same table: " + settings,
                     f.tableUri(),
-                    extractPath(settings, indexName, "settings", "index", "lance", "table")
+                    extractPath(settings, indexName, "settings", "index", "plugins", "lance", "table")
                 );
                 String uuid = (String) extractPath(settings, indexName, "settings", "index", "uuid");
 
@@ -195,7 +195,7 @@ public class LanceSnapshotIT extends LanceRestTestCase {
             ensureGreen(indexName);
 
             String settings = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_settings")));
-            assertEquals(tableUri, extractPath(settings, indexName, "settings", "index", "lance", "table"));
+            assertEquals(tableUri, extractPath(settings, indexName, "settings", "index", "plugins", "lance", "table"));
             String uuid = (String) extractPath(settings, indexName, "settings", "index", "uuid");
             assertEquals(6, extractIntPath(readAll(client().performRequest(new Request("GET", "/" + indexName + "/_count"))), "count"));
             assertEquals(6, engineDocCount(indexName));
@@ -273,9 +273,12 @@ public class LanceSnapshotIT extends LanceRestTestCase {
             ensureGreen(indexName);
 
             String settings = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_settings")));
-            assertEquals(tableUri, extractPath(settings, indexName, "settings", "index", "lance", "table"));
-            assertEquals("1", extractPath(settings, indexName, "settings", "index", "lance", "version"));
-            assertEquals("us-east-1", extractPath(settings, indexName, "settings", "index", "lance", "storage_options", "aws_region"));
+            assertEquals(tableUri, extractPath(settings, indexName, "settings", "index", "plugins", "lance", "table"));
+            assertEquals("1", extractPath(settings, indexName, "settings", "index", "plugins", "lance", "version"));
+            assertEquals(
+                "us-east-1",
+                extractPath(settings, indexName, "settings", "index", "plugins", "lance", "storage_options", "aws_region")
+            );
             // The restored index carries the credential in its metadata
             // like the original did; the settings API withholds it.
             assertFalse("restored settings must withhold the secret: " + settings, settings.contains("aws_secret_access_key"));
@@ -372,7 +375,7 @@ public class LanceSnapshotIT extends LanceRestTestCase {
             // both run on the fragment path, which opens the table
             // itself and fails on the missing dataset with the same 400.
             String settings = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_settings")));
-            assertEquals(tablePath.toString(), extractPath(settings, indexName, "settings", "index", "lance", "table"));
+            assertEquals(tablePath.toString(), extractPath(settings, indexName, "settings", "index", "plugins", "lance", "table"));
             ResponseException count = expectThrows(
                 ResponseException.class,
                 () -> client().performRequest(new Request("GET", "/" + indexName + "/_count"))
