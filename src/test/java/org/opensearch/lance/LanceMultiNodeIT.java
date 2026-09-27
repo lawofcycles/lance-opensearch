@@ -903,6 +903,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             // the cluster log so the cost of the temporary IndexService
             // can be read from build/testclusters/*/logs.
             updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", "DEBUG");
+            updateClusterSetting("logger.org.opensearch.lance.dispatch.FragmentExecutorSupport", "DEBUG");
             Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
@@ -988,6 +989,9 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         } finally {
             try {
                 updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", null);
+            } catch (Exception ignored) {}
+            try {
+                updateClusterSetting("logger.org.opensearch.lance.dispatch.FragmentExecutorSupport", null);
             } catch (Exception ignored) {}
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
