@@ -15,7 +15,7 @@ import org.opensearch.rest.action.RestToXContentListener;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
- * GET /_lance/refs/{index}
+ * GET /_plugins/_lance/refs/{index}
  *
  * Lists the tags and branches of the Lance table behind a Lance-backed
  * index. The handler only builds a {@link LanceRefsRequest} and hands it
@@ -31,8 +31,8 @@ public class RestRefsAction extends BaseRestHandler {
     }
 
     @Override
-    public List<Route> routes() {
-        return List.of(new Route(RestRequest.Method.GET, "/_lance/refs/{index}"));
+    public List<ReplacedRoute> replacedRoutes() {
+        return List.of(new ReplacedRoute(RestRequest.Method.GET, "/_plugins/_lance/refs/{index}", "/_lance/refs/{index}"));
     }
 
     @Override

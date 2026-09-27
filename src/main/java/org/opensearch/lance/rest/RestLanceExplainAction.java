@@ -18,7 +18,7 @@ import java.io.IOException;
 import java.util.List;
 
 /**
- * GET /{index}/_lance/explain
+ * GET /_plugins/_lance/explain/{index}
  *
  * Explains the plan the fragment coordinator would execute for a search
  * body against a Lance-backed index without executing anything: the
@@ -30,6 +30,12 @@ import java.util.List;
  * transport action so a security plugin evaluates the caller's
  * index-level privilege first and no native I/O runs on the REST
  * thread.
+ *
+ * <p>The index comes after the verb, as in {@code build_indexes/{index}}
+ * and {@code refs/{index}}, because {@code /_plugins/_lance/{index}/_explain}
+ * would put an {@code {index}} wildcard on the same path segment as the
+ * {@code {node_id}} of {@code /_plugins/_lance/{node_id}/stats}, which
+ * the REST path trie rejects at registration.
  */
 public class RestLanceExplainAction extends BaseRestHandler {
 
@@ -39,8 +45,8 @@ public class RestLanceExplainAction extends BaseRestHandler {
     }
 
     @Override
-    public List<Route> routes() {
-        return List.of(new Route(RestRequest.Method.GET, "/{index}/_lance/explain"));
+    public List<ReplacedRoute> replacedRoutes() {
+        return List.of(new ReplacedRoute(RestRequest.Method.GET, "/_plugins/_lance/explain/{index}", "/{index}/_lance/explain"));
     }
 
     @Override

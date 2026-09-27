@@ -34,7 +34,7 @@ import org.opensearch.rest.action.RestToXContentListener;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
- * POST /_lance/attach {"table": "/path/to/table.lance"}
+ * POST /_plugins/_lance/attach {"table": "/path/to/table.lance"}
  *
  * The RFC's attach operation. Derives everything from the table and creates
  * a real engine backed index. The mapping follows the derivation defaults
@@ -69,8 +69,8 @@ public class RestAttachAction extends BaseRestHandler {
     }
 
     @Override
-    public List<Route> routes() {
-        return List.of(new Route(RestRequest.Method.POST, "/_lance/attach"));
+    public List<ReplacedRoute> replacedRoutes() {
+        return List.of(new ReplacedRoute(RestRequest.Method.POST, "/_plugins/_lance/attach", "/_lance/attach"));
     }
 
     @Override
@@ -102,7 +102,7 @@ public class RestAttachAction extends BaseRestHandler {
                 return channel -> channel.sendResponse(
                     new BytesRestResponse(
                         RestStatus.BAD_REQUEST,
-                        "[number_of_shards] is no longer accepted by /_lance/attach; the fragment path fans out at the fragment "
+                        "[number_of_shards] is no longer accepted by /_plugins/_lance/attach; the fragment path fans out at the fragment "
                             + "level regardless of shard count, and Lance-backed indices are always single-shard"
                     )
                 );
