@@ -679,7 +679,7 @@ public final class LanceIndexBuilder {
         try {
             rows = dataset.countRows();
         } catch (Exception e) {
-            LOG.warn("countRows failed for {} build over {}", kind, targetColumns, e);
+            LOG.warn("countRows failed for {} build over {}", kind, targetColumns, StorageOptions.redactCredentials(e));
             for (String column : targetColumns) {
                 result.addFailed(column, e);
             }
@@ -775,7 +775,7 @@ public final class LanceIndexBuilder {
                     indexesByColumn.put(column, names);
                 }
             } catch (Exception e) {
-                LOG.warn("describeIndices failed for column {}", column, e);
+                LOG.warn("describeIndices failed for column {}", column, StorageOptions.redactCredentials(e));
                 result.addFailed(column, e);
             }
         }
@@ -797,7 +797,7 @@ public final class LanceIndexBuilder {
                 }
             }
         } catch (Exception e) {
-            LOG.warn("optimize failed for {} indexes {}", kind, indexNames, e);
+            LOG.warn("optimize failed for {} indexes {}", kind, indexNames, StorageOptions.redactCredentials(e));
             // Same cause for every column in the batch, with the column's
             // index names in the reason and Lance's classification kept,
             // so an invalid-input rejection still answers as one.

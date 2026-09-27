@@ -5,7 +5,11 @@
 
 package org.opensearch.lance.engine;
 
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -15,11 +19,16 @@ import java.util.Set;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.LogEvent;
 import org.lance.Dataset;
 import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
+import org.opensearch.ExceptionsHelper;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceTableFactory;
+import org.opensearch.test.MockLogAppender;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -27,7 +36,8 @@ import org.opensearch.test.OpenSearchTestCase;
  * preference from the {@code indexes} clause picks the scalar or vector
  * type (and its params) instead of the fixed BTree / IVF_PQ, {@code none}
  * skips the column, an absent preference keeps the defaults, and the
- * per-type training minimums gate the vector build.
+ * per-type training minimums gate the vector build. Also what the
+ * builder logs and records when the table's row count cannot be read.
  */
 @ThreadLeakScope(ThreadLeakScope.Scope.NONE)
 public class LanceIndexBuilderTests extends OpenSearchTestCase {
@@ -229,6 +239,56 @@ public class LanceIndexBuilderTests extends OpenSearchTestCase {
         assertEquals(1L, LanceIndexBuilder.vectorTrainingMinimum("ivf_hnsw_sq", Map.of()));
         assertEquals(1L, LanceIndexBuilder.vectorTrainingMinimum("ivf_sq", Map.of()));
         assertEquals(1L, LanceIndexBuilder.vectorTrainingMinimum("ivf_rq", Map.of()));
+    }
+
+    /**
+     * A {@code countRows} that fails with S3's {@code InvalidAccessKeyId}
+     * body, which echoes the access key id, is warned once and recorded
+     * as a failure of every target column. Neither the WARN (its line
+     * and the exception chain it carries) nor the recorded reason holds
+     * the key id; the S3 error code stays in both.
+     */
+    public void testCountRowsFailureIsWarnedAndRecordedWithoutTheAccessKeyId() throws Exception {
+        String keyId = "AKIA" + randomAlphaOfLength(16).toUpperCase(Locale.ROOT);
+        String message = "LanceError(IO): Generic S3 error: Client error with status 403 Forbidden: "
+            + "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>InvalidAccessKeyId</Code>"
+            + "<Message>The AWS Access Key Id you provided does not exist in our records.</Message>"
+            + "<AWSAccessKeyId>"
+            + keyId
+            + "</AWSAccessKeyId><RequestId>7A9E3F0C2B1D4E5F</RequestId><HostId>host</HostId></Error>";
+        Dataset dataset = mock(Dataset.class);
+        when(dataset.countRows()).thenThrow(new RuntimeException(message));
+        List<LogEvent> warnings = new ArrayList<>();
+        LanceIndexBuilder.BuildResult result;
+        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(LanceIndexBuilder.class))) {
+            appender.addExpectation(new MockLogAppender.LoggingExpectation() {
+                @Override
+                public void match(LogEvent event) {
+                    if (event.getLevel() == Level.WARN) {
+                        warnings.add(event.toImmutable());
+                    }
+                }
+
+                @Override
+                public void assertMatched() {
+                    assertEquals("one WARN for the countRows failure: " + warnings, 1, warnings.size());
+                }
+            });
+            result = LanceIndexBuilder.ensureVectorIndexes(dataset, Set.of("embedding"), Long.MAX_VALUE, Optional.empty(), Map.of());
+            appender.assertAllExpectationsMatched();
+        }
+        assertEquals("failures: " + result.failed(), 1, result.failed().size());
+        String reason = result.failed().get(0).reason();
+        assertTrue("the reason names the S3 error: " + reason, reason.contains("InvalidAccessKeyId"));
+        assertFalse("the reason must not carry the key id: " + reason, reason.contains(keyId));
+
+        LogEvent warning = warnings.get(0);
+        String line = warning.getMessage().getFormattedMessage();
+        assertNotNull("the WARN carries the exception", warning.getThrown());
+        String trace = ExceptionsHelper.stackTrace(warning.getThrown());
+        assertFalse("the WARN line must not carry the key id: " + line, line.contains(keyId));
+        assertFalse("the WARN's exception chain must not carry the key id: " + trace, trace.contains(keyId));
+        assertTrue("the logged exception names the S3 error: " + trace, trace.contains("InvalidAccessKeyId"));
     }
 
     private static Dataset open(RootAllocator allocator, String uri) {
