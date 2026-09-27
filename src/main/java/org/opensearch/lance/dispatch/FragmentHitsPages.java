@@ -12,6 +12,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -58,6 +59,7 @@ import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.lance.engine.FragmentGroupScan;
 import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
+import org.opensearch.lance.engine.LanceMultiLeafTake;
 import org.opensearch.lance.query.ScanAdmission;
 import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.lance.query.LanceFtsQuery;
@@ -527,8 +529,14 @@ final class FragmentHitsPages {
      * The fetch round of a page: render the rows at {@code rowAddrs} of
      * {@code reader}, which the caller opened over the fragments those
      * addresses name, through {@link FragmentFetchPhase} with one take
-     * per leaf ({@link #prefetchHitRows}), the leaves side by side
-     * through {@code groupScan}. The hits come back in the order of the
+     * for the rows of every leaf together ({@link LanceMultiLeafTake}):
+     * the rows a node renders on the fetch round are its share of one
+     * page, and Lance's take by address reads the rows of several
+     * fragments in one scan, so the node pays one round trip to the
+     * store whatever the number of fragments the page touches. Before
+     * the take every leaf is told whether its rows may go through the
+     * node's fetch cache, as {@link #prefetchHitRows} tells the leaves
+     * of a query round page. The hits come back in the order of the
      * addresses and carry neither score nor sort values; the coordinator
      * stamps those from the query round. An address whose fragment is
      * not a leaf of the reader, or whose offset is past the fragment's
@@ -539,8 +547,7 @@ final class FragmentHitsPages {
         LanceFragmentSearchContext searchContext,
         FragmentFetchPhase fetchPhase,
         IndexReader reader,
-        long[] rowAddrs,
-        FragmentGroupScan groupScan
+        long[] rowAddrs
     ) throws IOException {
         if (rowAddrs.length == 0) {
             return Collections.emptyList();
@@ -552,7 +559,8 @@ final class FragmentHitsPages {
                 leafByFragment.put(lance.fragmentId(), ctx);
             }
         }
-        ScoreDoc[] scoreDocs = new ScoreDoc[rowAddrs.length];
+        int[] docIds = new int[rowAddrs.length];
+        Map<LanceFragmentLeafReader, List<Integer>> docsByLeaf = new LinkedHashMap<>();
         for (int i = 0; i < rowAddrs.length; i++) {
             int fragmentId = (int) (rowAddrs[i] >>> 32);
             int offset = (int) (rowAddrs[i] & 0xFFFFFFFFL);
@@ -563,13 +571,24 @@ final class FragmentHitsPages {
                 );
             }
             LanceFragmentLeafReader lance = LanceFragmentLeafReader.unwrap(ctx.reader());
-            scoreDocs[i] = new ScoreDoc(ctx.docBase + lance.docOfRow(offset), Float.NaN);
+            int leafDoc = lance.docOfRow(offset);
+            docIds[i] = ctx.docBase + leafDoc;
+            if (!docsByLeaf.containsKey(lance)) {
+                lance.setFetchCacheEligible(LanceFragmentLeafReader.wrappedOnlyByOwnReaders(ctx.reader()));
+                docsByLeaf.put(lance, new ArrayList<>());
+            }
+            docsByLeaf.get(lance).add(leafDoc);
         }
-        prefetchHitRows(reader, scoreDocs, groupScan);
-        int[] docIds = new int[scoreDocs.length];
-        for (int i = 0; i < scoreDocs.length; i++) {
-            docIds[i] = scoreDocs[i].doc;
+        Map<LanceFragmentLeafReader, int[]> docIdsByLeaf = new LinkedHashMap<>();
+        for (Map.Entry<LanceFragmentLeafReader, List<Integer>> entry : docsByLeaf.entrySet()) {
+            List<Integer> docs = entry.getValue();
+            int[] leafDocs = new int[docs.size()];
+            for (int i = 0; i < leafDocs.length; i++) {
+                leafDocs[i] = docs.get(i);
+            }
+            docIdsByLeaf.put(entry.getKey(), leafDocs);
         }
+        LanceMultiLeafTake.prefetchRows(docIdsByLeaf);
         return Arrays.asList(fetchPhase.fetch(searchContext, docIds));
     }
 

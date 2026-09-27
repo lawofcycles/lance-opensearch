@@ -65,6 +65,7 @@ import org.opensearch.lance.plan.translate.QueryToRex;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
 import org.opensearch.lance.plan.translate.SearchRequestToRel.ExecutionShape;
 import org.opensearch.lance.plan.translate.StockTextQueryRewriter;
+import org.opensearch.lance.query.LanceKnnQueryBuilder;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
@@ -78,6 +79,7 @@ import org.opensearch.search.fetch.subphase.FetchSourceContext;
 import org.opensearch.search.fetch.subphase.FieldAndFormat;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.rescore.RescorerBuilder;
+import org.opensearch.search.sort.ScoreSortBuilder;
 import org.opensearch.search.sort.SortBuilder;
 import org.opensearch.tasks.CancellableTask;
 import org.opensearch.tasks.Task;
@@ -437,7 +439,10 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // body level conditions are settled here.
         boolean deferFetchCandidate = deferFetchCandidate(
             clusterService.getClusterSettings().get(LancePlugin.FRAGMENT_PATH_DEFER_FETCH_SETTING),
+            query,
+            from,
             size,
+            sorts,
             collapse,
             projection
         );
@@ -506,15 +511,56 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
 
     /**
      * Whether the body allows the executors to defer their hits to a
-     * fetch round: the setting is on, the body asks for hits, and it
+     * fetch round: the setting is on, the body asks for hits, it
      * carries neither {@code collapse} (the collapse value is a doc value
      * field of the rendered hit, read by the merge and by the
      * {@code inner_hits} expansion) nor {@code "explain": true} (the
-     * explanation needs the query round's Weight). The target level
+     * explanation needs the query round's Weight), and its executors do
+     * not already return only the rows the coordinator keeps
+     * ({@link #executorsReturnOnlyKeptRows}). The target level
      * conditions follow in {@link #deferFetch}.
      */
-    static boolean deferFetchCandidate(boolean settingEnabled, int size, CollapseBuilder collapse, HitProjection projection) {
-        return settingEnabled && size > 0 && collapse == null && !projection.explain();
+    static boolean deferFetchCandidate(
+        boolean settingEnabled,
+        QueryBuilder query,
+        int from,
+        int size,
+        List<SortBuilder<?>> sorts,
+        CollapseBuilder collapse,
+        HitProjection projection
+    ) {
+        return settingEnabled
+            && size > 0
+            && collapse == null
+            && !projection.explain()
+            && !executorsReturnOnlyKeptRows(query, from, size, sorts);
+    }
+
+    /**
+     * Whether every hit the executors return is a hit of the page, so a
+     * fetch round would render the same rows one round trip later and
+     * save no take: the body's query is one {@code lance_knn} clause
+     * (not inside a {@code bool}) whose {@code k} is at most
+     * {@code from + size}, and the page is in score order (no sort, or
+     * {@code _score} clauses alone). A {@code lance_knn} runs the table
+     * wide nearest scan on every executor and each hands back the rows
+     * of the global top {@code k} that sit in its own fragments, so the
+     * executors together return at most {@code k} rows and the
+     * coordinator keeps them all. Inside a {@code bool} the knn is one
+     * clause of a larger match and the executors return their own top
+     * {@code from + size}; under a field sort the page is cut on the
+     * sort values, which is the case the round is for.
+     */
+    static boolean executorsReturnOnlyKeptRows(QueryBuilder query, int from, int size, List<SortBuilder<?>> sorts) {
+        if (!(query instanceof LanceKnnQueryBuilder knn) || knn.k() > (long) from + size) {
+            return false;
+        }
+        for (SortBuilder<?> sort : sorts) {
+            if (!(sort instanceof ScoreSortBuilder)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**

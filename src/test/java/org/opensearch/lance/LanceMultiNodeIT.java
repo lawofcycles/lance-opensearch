@@ -1764,6 +1764,182 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     /**
+     * A node renders its share of a fetch round page in one take
+     * whatever the number of fragments the rows sit in: Lance's take by
+     * address reads the rows of several fragments in one scan, so a
+     * sorted or scored page spread over many fragments costs one round
+     * trip to the store per node, not one per fragment. The one round
+     * path keeps its take per leaf, since every leaf's rows are a page
+     * of their own there.
+     *
+     * <p>Fixture: {@link LanceTableFactory#writeInterleavedTable} with
+     * six fragments of 20 rows on three data nodes, so each node holds
+     * two fragments; row {@code i} sits in fragment {@code i % 6} and its
+     * {@code lance} score grows with {@code i}, so the top ten rows
+     * (ids 119 down to 110) touch every fragment and each node holds
+     * rows of the page in both of its fragments. The table has no key,
+     * so the {@code _id} of a hit is {@code <fragment>-<offset>} and the
+     * hits themselves show which fragments the page touched. The fetch
+     * cache is off for the test so every take is visible in the profile.
+     */
+    public void testFetchRoundTakesOncePerNodeWhenThePageSpansSeveralFragmentsOfANode() throws Exception {
+        String suffix = "mn-node-take-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int fragments = 6;
+        int rowsPerFragment = 20;
+        LanceTableFactory.writeInterleavedTable(scratchDir, tableName, fragments, rowsPerFragment);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        String indexName = tableName;
+        String body = "{\"size\":10,\"profile\":true,\"query\":{\"match\":{\"body\":\"lance\"}}}";
+        String sorted = "{\"size\":10,\"profile\":true,\"sort\":[{\"id\":\"desc\"}],\"query\":{\"match_all\":{}}}";
+        try {
+            updateClusterSetting("plugins.lance.fetch_cache.enabled", "false");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
+            client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
+            int dataNodes = dataNodeCount();
+            assertEquals("fixture assumes two fragments per data node", fragments, 2 * dataNodes);
+
+            for (String shape : List.of(body, sorted)) {
+                Map<String, Object> page = parse(readAll(postJson("/" + indexName + "/_search", shape)));
+                assertEquals(shape, List.of(119, 118, 117, 116, 115, 114, 113, 112, 111, 110), sourceIds(page));
+                Set<String> fragmentsOfPage = new HashSet<>();
+                for (String id : hitIdsOf(page)) {
+                    fragmentsOfPage.add(id.substring(0, id.indexOf('-')));
+                }
+                assertEquals("the page touches every fragment " + shape + ": " + page, fragments, fragmentsOfPage.size());
+                assertEquals("every node holds rows of the page " + shape + ": " + page, dataNodes, fetchRoundTrips(page));
+                assertEquals("the takes address the rows of the page alone " + shape + ": " + page, 10, takeRowsOverNodes(page));
+                for (Map.Entry<String, Map<String, Object>> node : profileNodes(page).entrySet()) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> fetch = (Map<String, Object>) node.getValue().get("fetch");
+                    assertTrue(
+                        "node " + node.getKey() + " rendered rows of two fragments " + shape + ": " + page,
+                        ((Number) fetch.get("take_rows")).longValue() >= 2L
+                    );
+                    assertEquals(
+                        "node " + node.getKey() + " took its share of the page once " + shape + ": " + page,
+                        1L,
+                        ((Number) fetch.get("take_count")).longValue()
+                    );
+                }
+            }
+
+            // Without the round every executor takes its own page, one
+            // take per leaf with a hit: two per node.
+            updateClusterSetting("plugins.lance.fragment_path.defer_fetch", "false");
+            Map<String, Object> oneRound = parse(readAll(postJson("/" + indexName + "/_search", body)));
+            assertEquals(0, fetchRoundTrips(oneRound));
+            for (Map.Entry<String, Map<String, Object>> node : profileNodes(oneRound).entrySet()) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> fetch = (Map<String, Object>) node.getValue().get("fetch");
+                assertEquals(
+                    "node " + node.getKey() + " takes once per leaf on the query round: " + oneRound,
+                    2L,
+                    ((Number) fetch.get("take_count")).longValue()
+                );
+            }
+        } finally {
+            try {
+                updateClusterSetting("plugins.lance.fragment_path.defer_fetch", null);
+            } catch (Exception ignored) {}
+            try {
+                updateClusterSetting("plugins.lance.fetch_cache.enabled", null);
+            } catch (Exception ignored) {}
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * A page whose body is one {@code lance_knn} clause with {@code k}
+     * at most {@code from + size}, in score order, is rendered on the
+     * query round: every executor runs the table wide nearest scan and
+     * hands back the rows of the global top {@code k} that sit in its own
+     * fragments, so the executors together take the {@code k} rows of
+     * the page and a fetch round would render the same rows one round
+     * trip later. The same knn inside a {@code bool} or under a field
+     * sort goes through the round.
+     *
+     * <p>Fixture: {@link LanceTableFactory#writeMultiFragmentTable} with
+     * 24 rows in 12 fragments over three nodes; row {@code i} has
+     * {@code embedding[0] = i}, so the ten nearest rows of a query on
+     * the first axis at 23.5 are ids 23 down to 14, spread over the
+     * nodes. The fetch cache is off so every take is visible.
+     */
+    public void testPlainKnnPageOnThreeNodesRendersOnTheQueryRound() throws Exception {
+        String suffix = "mn-knn-round-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int rows = 24;
+        String tableUri = LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, rows, 2);
+        String indexName = tableName;
+        String knn = "{\"lance_knn\":{\"field\":\"embedding\",\"vector\":[23.5,0,0,0,0,0,0,0],\"k\":10}}";
+        List<Integer> nearest = List.of(23, 22, 21, 20, 19, 18, 17, 16, 15, 14);
+        try {
+            updateClusterSetting("plugins.lance.fetch_cache.enabled", "false");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals("fixture assumes several fragments per data node", 3, dataNodeCount());
+
+            Map<String, Object> plain = parse(
+                readAll(postJson("/" + indexName + "/_search", "{\"size\":10,\"profile\":true,\"query\":" + knn + "}"))
+            );
+            assertEquals(nearest, sourceIds(plain));
+            assertEquals("every data node executed: " + plain, 3, profileNodes(plain).size());
+            assertEquals("a plain knn page runs no fetch round: " + plain, 0, fetchRoundTrips(plain));
+            assertEquals("the executors together take the k rows of the page: " + plain, 10, takeRowsOverNodes(plain));
+
+            Map<String, Object> scoreSorted = parse(
+                readAll(
+                    postJson(
+                        "/" + indexName + "/_search",
+                        "{\"size\":10,\"profile\":true,\"sort\":[{\"_score\":\"desc\"}],\"query\":" + knn + "}"
+                    )
+                )
+            );
+            assertEquals(nearest, sourceIds(scoreSorted));
+            assertEquals("a _score sort is score order: " + scoreSorted, 0, fetchRoundTrips(scoreSorted));
+
+            Map<String, Object> inBool = parse(
+                readAll(
+                    postJson("/" + indexName + "/_search", "{\"size\":10,\"profile\":true,\"query\":{\"bool\":{\"must\":[" + knn + "]}}}")
+                )
+            );
+            assertEquals(nearest, sourceIds(inBool));
+            assertTrue("a knn inside a bool goes through the round: " + inBool, fetchRoundTrips(inBool) >= 1);
+
+            Map<String, Object> fieldSorted = parse(
+                readAll(
+                    postJson(
+                        "/" + indexName + "/_search",
+                        "{\"size\":10,\"profile\":true,\"sort\":[{\"id\":\"asc\"}],\"query\":" + knn + "}"
+                    )
+                )
+            );
+            assertEquals(List.of(14, 15, 16, 17, 18, 19, 20, 21, 22, 23), sourceIds(fieldSorted));
+            assertTrue("a knn under a field sort goes through the round: " + fieldSorted, fetchRoundTrips(fieldSorted) >= 1);
+
+            Map<String, Object> wideK = parse(
+                readAll(postJson("/" + indexName + "/_search", "{\"size\":5,\"profile\":true,\"query\":" + knn + "}"))
+            );
+            assertEquals(nearest.subList(0, 5), sourceIds(wideK));
+            assertTrue("k above from + size goes through the round: " + wideK, fetchRoundTrips(wideK) >= 1);
+            assertEquals("the round takes the rows of the page alone: " + wideK, 5, takeRowsOverNodes(wideK));
+        } finally {
+            try {
+                updateClusterSetting("plugins.lance.fetch_cache.enabled", null);
+            } catch (Exception ignored) {}
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
      * Wildcard, regexp and prefix on the {@code lance_text} column and
      * on the keyword column, fanned out over three executors that each
      * hold two of the six fragments. The coordinator's SQL drives both
@@ -2843,13 +3019,18 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     /**
-     * The rows behind a page are taken once per leaf that holds a hit,
-     * the leaves of one executor side by side, and the take projects the
-     * columns the body renders. Twelve fragments of two rows over three
-     * data nodes, so every executor holds several leaves; a sorted page
-     * of every row touches every leaf, and {@code profile.lance} reports
-     * one take per fragment summed over the nodes, whatever the fan out
-     * assigned to each node. Without a {@code _source} element the take
+     * The rows behind a page rendered on the query round are taken once
+     * per leaf that holds a hit, the leaves of one executor side by side,
+     * and the take projects the columns the body renders. Twelve
+     * fragments of two rows over three data nodes, so every executor
+     * holds several leaves; a sorted page of every row touches every
+     * leaf, and {@code profile.lance} reports one take per fragment
+     * summed over the nodes, whatever the fan out assigned to each node.
+     * The fetch round is turned off for the test
+     * ({@code plugins.lance.fragment_path.defer_fetch: false}), since a
+     * page rendered in a fetch round takes once per node instead
+     * ({@link #testFetchRoundTakesOncePerNodeWhenThePageSpansSeveralFragmentsOfANode}).
+     * Without a {@code _source} element the take
      * projects the three surfaced columns ({@code id}, {@code body},
      * {@code title}; the vector column is not surfaced and the table
      * declares no primary key); with {@code _source: false} it projects
@@ -2876,6 +3057,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         try {
             updateClusterSetting("logger.org.opensearch.lance.engine.LanceStoredFields", "DEBUG");
             updateClusterSetting("plugins.lance.fragment_path.parallelism", "4");
+            updateClusterSetting("plugins.lance.fragment_path.defer_fetch", "false");
             Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
@@ -2964,6 +3146,9 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 updateClusterSetting("plugins.lance.fragment_path.parallelism", null);
             } catch (Exception ignored) {}
             try {
+                updateClusterSetting("plugins.lance.fragment_path.defer_fetch", null);
+            } catch (Exception ignored) {}
+            try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
         }
@@ -3007,7 +3192,9 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 Map<String, Object> fetch = (Map<String, Object>) node.get("fetch");
                 firstTakes += ((Number) fetch.get("take_count")).longValue();
             }
-            assertEquals("one take per leaf on the first page", fragments, firstTakes);
+            // The page is rendered in a fetch round, one take per node
+            // over the rows of the node's fragments.
+            assertEquals("one take per node on the first page", 3L, firstTakes);
             Map<String, Map<String, Object>> afterFirst = fetchCacheByNode();
             long entries = 0L;
             for (Map.Entry<String, Map<String, Object>> node : afterFirst.entrySet()) {

@@ -28,6 +28,7 @@ import org.lance.Fragment;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.lance.schema.LanceField;
+import org.opensearch.ExceptionsHelper;
 import org.opensearch.OpenSearchStatusException;
 import org.opensearch.ResourceAlreadyExistsException;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
@@ -192,8 +193,35 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
             // error code says the store refused the credentials the
             // request carried is reported as a 400 instead, since the
             // caller's input is what failed.
-            throw LanceInvalidInput.openFailure(e, request.table());
+            throw reportFailure(e, request.table(), request.indexName());
         }
+    }
+
+    /**
+     * The exception {@code failure} of an attach of {@code table} is
+     * reported as ({@link LanceInvalidInput#openFailure}: the redacted
+     * copy, or the 400 for credentials the store refused), after one
+     * line is written to this node's log for a failure the client
+     * answers a 4xx for. The REST layer logs a 5xx at WARN with the
+     * message, but nothing for a 4xx, and an operator who is shown the
+     * client's 400 later has nothing on the node to trace it to
+     * otherwise; the line is INFO because the failure is the caller's,
+     * not the node's. {@code indexName} is the request's, or null when
+     * the index takes the table's name.
+     */
+    static Exception reportFailure(Exception failure, String table, String indexName) {
+        Exception reported = LanceInvalidInput.openFailure(failure, table);
+        RestStatus status = ExceptionsHelper.status(reported);
+        if (status.getStatus() >= 400 && status.getStatus() < 500) {
+            LOG.info(
+                "lance.attach: attach of table [{}] as index [{}] was refused with {}: {}",
+                table,
+                indexName != null ? indexName : tableName(table),
+                status.getStatus(),
+                reported.getMessage()
+            );
+        }
+        return reported;
     }
 
     private void attach(LanceAttachRequest request, BooleanSupplier cancelled, ActionListener<LanceAttachResponse> listener)

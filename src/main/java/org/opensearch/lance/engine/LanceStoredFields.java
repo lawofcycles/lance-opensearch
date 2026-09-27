@@ -60,7 +60,10 @@ import org.opensearch.lance.query.ScanAdmission;
  *
  * <p>Rows are fetched per hit through {@link #prefetchRows} (one
  * {@code _rowaddr IN (...)} take scan per {@link #TAKE_CHUNK} doc ids,
- * which Lance executes as a take by address) and rendered by
+ * which Lance executes as a take by address), or on a fetch round
+ * through {@link LanceMultiLeafTake} (one take over the rows of every
+ * leaf of the node, handed out to the leaves' instances of this class),
+ * and rendered by
  * {@link #materialiseStoredFields}: {@code _id} from the declared
  * primary key column or a synthesised {@code "<fragment>-<offset>"},
  * {@code _source} as JSON in schema order through
@@ -447,6 +450,87 @@ final class LanceStoredFields extends StoredFields {
     }
 
     /**
+     * The first step of a take that spans several leaves
+     * ({@link LanceMultiLeafTake}): the row addresses behind
+     * {@code docIds} that the take has to read, after the rows this leaf
+     * already holds and, when the leaf is eligible for the node's fetch
+     * cache, the rows the cache serves are set aside. The same steps as
+     * the opening of {@link #prefetchRows}: a doc id already in
+     * {@link #takenRows} or repeated in {@code docIds} is skipped, a row
+     * the cache holds whole is stored under its doc id, and the rows of
+     * an ineligible leaf are counted as skipped by the cache. Every doc
+     * id considered is added to {@code requested}, for
+     * {@link #recordMissingRows} once the take has run. The caller takes
+     * the returned addresses with the columns of
+     * {@link #takeProjection()}, which every leaf of one fetch round
+     * shares.
+     */
+    List<Long> addressesToTake(int[] docIds, Set<Integer> requested) {
+        List<String> takeColumns = this.projection.columns();
+        LanceFetchCache.Table cache = this.fetchTable;
+        Boolean eligible = this.fetchCacheEligible;
+        boolean useCache = cache != null && Boolean.TRUE.equals(eligible) && !takeColumns.isEmpty();
+        List<Long> addresses = new ArrayList<>(docIds.length);
+        int fresh = 0;
+        for (int docId : docIds) {
+            if (takenRows.containsKey(docId) || !requested.add(docId)) {
+                continue;
+            }
+            fresh++;
+            long address = ((long) fragmentId << 32) | (leaf.rowOf(docId) & 0xFFFFFFFFL);
+            if (useCache) {
+                Object[] cached = cache.lookup(address, takeColumns);
+                if (cached != null) {
+                    takenRows.put(docId, cached);
+                    continue;
+                }
+            }
+            addresses.add(address);
+        }
+        if (cache != null && Boolean.FALSE.equals(eligible) && fresh > 0) {
+            cache.skipped(fresh);
+        }
+        return addresses;
+    }
+
+    /**
+     * Store one row a take that spans several leaves returned for this
+     * leaf: {@code address} is the row's address (its fragment is this
+     * leaf's), {@code row} its decoded cells in the order of
+     * {@link #takeProjection()}'s columns. The row is written to the
+     * node's fetch cache when this leaf is eligible for it, as
+     * {@link #prefetchRows} writes the rows of its own take.
+     */
+    void recordTakenRow(long address, Object[] row) {
+        List<String> takeColumns = this.projection.columns();
+        int offset = (int) (address & 0xFFFFFFFFL);
+        takenRows.put(leaf.docOfRow(offset), row);
+        LanceFetchCache.Table cache = this.fetchTable;
+        if (cache != null && Boolean.TRUE.equals(this.fetchCacheEligible) && !takeColumns.isEmpty()) {
+            cache.put(address, takeColumns, row);
+        }
+    }
+
+    /**
+     * The last step of a take that spans several leaves: every doc id of
+     * {@code requested} (the set {@link #addressesToTake} filled) the
+     * take did not return is marked {@link #MISSING_ROW}, and written to
+     * the node's fetch cache as a negative entry when this leaf is
+     * eligible for it, as the closing loop of {@link #prefetchRows} does
+     * for its own take.
+     */
+    void recordMissingRows(Set<Integer> requested) {
+        List<String> takeColumns = this.projection.columns();
+        LanceFetchCache.Table cache = this.fetchTable;
+        boolean useCache = cache != null && Boolean.TRUE.equals(this.fetchCacheEligible) && !takeColumns.isEmpty();
+        for (int docId : requested) {
+            if (takenRows.putIfAbsent(docId, MISSING_ROW) == null && useCache) {
+                cache.putMissing(((long) fragmentId << 32) | (leaf.rowOf(docId) & 0xFFFFFFFFL), takeColumns);
+            }
+        }
+    }
+
+    /**
      * Decode one cell of a take-scan batch into the representation
      * {@link #materialiseStoredFields} renders from. Numeric columns
      * go through {@link LanceColumnLoader#readAsLong} so the value carries the same
@@ -458,9 +542,11 @@ final class LanceStoredFields extends StoredFields {
      * {@link #columnKind} (only the appended PK can be) is decoded by
      * vector type: Utf8 as a string, anything {@link LanceColumnLoader#readAsLong}
      * understands as a long, otherwise {@code null}. Arrow nulls
-     * return {@code null}.
+     * return {@code null}. Package private for the take that spans
+     * several leaves, which decodes each row through the leaf that owns
+     * its fragment.
      */
-    private Object decodeTakeValue(String name, FieldVector vector, int i) {
+    Object decodeTakeValue(String name, FieldVector vector, int i) {
         if (vector == null || vector.isNull(i)) {
             return null;
         }
