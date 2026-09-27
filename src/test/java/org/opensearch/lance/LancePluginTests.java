@@ -118,17 +118,19 @@ public class LancePluginTests extends OpenSearchTestCase {
 
     public void testEverySettingHasACurrentAndADeprecatedKey() {
         // Every current key is plugins.lance.* (node scope) or
-        // index.plugins.lance.* (index scope), and each has a deprecated
-        // twin under lance.* or index.lance.* with the same scope, the
-        // same dynamic flag and the same default, so a cluster configured
-        // with the old keys behaves as before and reading an old key logs
-        // a deprecation.
+        // index.plugins.lance.* (index scope), and each key that existed
+        // under the old prefix has a deprecated twin under lance.* or
+        // index.lance.* with the same scope, the same dynamic flag and the
+        // same default, so a cluster configured with the old keys behaves
+        // as before and reading an old key logs a deprecation. A setting
+        // introduced after the rename has no old key and no twin.
+        Set<String> introducedAfterRename = Set.of(LancePlugin.FRAGMENT_PATH_DEFER_FETCH_SETTING.getKey());
         List<Setting<?>> settings = plugin.getSettings();
         List<Setting<?>> current = settings.stream().filter(s -> s.isDeprecated() == false).collect(java.util.stream.Collectors.toList());
         List<Setting<?>> deprecated = settings.stream().filter(Setting::isDeprecated).collect(java.util.stream.Collectors.toList());
-        // 38 node settings and 10 index settings.
-        assertEquals(48, current.size());
-        assertEquals(current.size(), deprecated.size());
+        // 39 node settings and 10 index settings.
+        assertEquals(49, current.size());
+        assertEquals(current.size() - introducedAfterRename.size(), deprecated.size());
         java.util.Map<String, Setting<?>> deprecatedByKey = deprecated.stream()
             .collect(java.util.stream.Collectors.toMap(Setting::getKey, s -> s));
         for (Setting<?> setting : current) {
@@ -143,6 +145,10 @@ public class LancePluginTests extends OpenSearchTestCase {
                 oldKey = "lance." + key.substring("plugins.lance.".length());
             }
             Setting<?> old = deprecatedByKey.get(oldKey);
+            if (introducedAfterRename.contains(key)) {
+                assertNull("no deprecated twin for a setting introduced after the rename: " + key, old);
+                continue;
+            }
             assertNotNull("deprecated twin of " + key, old);
             assertEquals(key, setting.hasNodeScope(), old.hasNodeScope());
             assertEquals(key, setting.hasIndexScope(), old.hasIndexScope());
