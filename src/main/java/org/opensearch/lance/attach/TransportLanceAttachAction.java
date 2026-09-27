@@ -33,6 +33,7 @@ import org.opensearch.ResourceAlreadyExistsException;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.create.CreateIndexResponse;
 import org.opensearch.action.support.ActionFilters;
+import org.opensearch.action.support.ContextPreservingActionListener;
 import org.opensearch.action.support.clustermanager.TransportClusterManagerNodeAction;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.block.ClusterBlockException;
@@ -579,7 +580,18 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         // drops the caller's identity for this one call, which is
         // intended: the caller was authorised against the attach
         // action, not against creating an index of this name.
+        //
+        // The create's callbacks run under the context the create was
+        // submitted with, which is the stashed one. The REST layer
+        // reads the response headers from the thread context when it
+        // writes the response, so a response sent straight from the
+        // callback would lose the headers on the caller's context, such
+        // as the Warning a request on a deprecated path carries. The
+        // listener therefore restores the caller's context (with its
+        // response headers) before it answers, the way cluster state
+        // updates in core preserve the submitter's context.
         ThreadContext threadContext = client.threadPool().getThreadContext();
+        ActionListener<LanceAttachResponse> responding = ContextPreservingActionListener.wrapPreservingContext(listener, threadContext);
         try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
             threadContext.putHeader(LanceInternalHeaders.LANCE_INTERNAL_CREATE_INDEX, "true");
             client.admin().indices().create(create, new ActionListener<CreateIndexResponse>() {
@@ -589,20 +601,20 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
                     // index's shard picks it up for freshness checks from
                     // its settings (table, tag, storage options), and a
                     // pinned index is left alone there by design.
-                    listener.onResponse(response(indexName, table, derivation, false, luceneBoundExceeded, backfill));
+                    responding.onResponse(response(indexName, table, derivation, false, luceneBoundExceeded, backfill));
                 }
 
                 @Override
                 public void onFailure(Exception e) {
                     if (!isAlreadyExists(e)) {
-                        listener.onFailure(e);
+                        responding.onFailure(e);
                         return;
                     }
                     // The index already exists. Verify it is a Lance index
                     // for the same table before claiming success; otherwise
                     // attach would silently take credit for an unrelated
                     // index.
-                    verifyExistingLanceIndex(indexName, table, derivation, storageOptions, luceneBoundExceeded, backfill, listener);
+                    verifyExistingLanceIndex(indexName, table, derivation, storageOptions, luceneBoundExceeded, backfill, responding);
                 }
             });
         }

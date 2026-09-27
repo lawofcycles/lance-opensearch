@@ -25,6 +25,7 @@ import org.opensearch.action.admin.indices.delete.DeleteIndexRequest;
 import org.opensearch.action.admin.indices.refresh.RefreshRequest;
 import org.opensearch.action.admin.indices.refresh.RefreshResponse;
 import org.opensearch.action.support.ActionFilters;
+import org.opensearch.action.support.ContextPreservingActionListener;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
@@ -249,11 +250,22 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
         LanceBuildIndexesResponse response,
         ActionListener<LanceBuildIndexesResponse> listener
     ) {
+        // The mapping update below runs under a stashed context, and
+        // the refresh that answers is issued from its callback, so the
+        // response would otherwise leave under the stashed context and
+        // without the response headers on the caller's context (the
+        // Warning of a deprecated path among them). Restoring the
+        // caller's context around the answer keeps them.
+        ThreadContext threadContext = client.threadPool().getThreadContext();
+        ActionListener<LanceBuildIndexesResponse> responding = ContextPreservingActionListener.wrapPreservingContext(
+            listener,
+            threadContext
+        );
         Runnable refreshAndRespond = () -> client.admin()
             .indices()
             .refresh(
                 new RefreshRequest(indexName),
-                ActionListener.wrap((RefreshResponse r) -> listener.onResponse(response), listener::onFailure)
+                ActionListener.wrap((RefreshResponse r) -> responding.onResponse(response), responding::onFailure)
             );
         if (mappingJson == null) {
             refreshAndRespond.run();
@@ -267,7 +279,6 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
         // indices:admin/lance/build_indexes and indices:admin/refresh
         // must not need mapping or delete privileges for the first FTS
         // build that flips a keyword column.
-        ThreadContext threadContext = client.threadPool().getThreadContext();
         try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
             threadContext.putHeader(LanceInternalHeaders.LANCE_INTERNAL_CREATE_INDEX, "true");
             client.admin()
@@ -276,7 +287,7 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
                 .setSource(mappingJson, MediaTypeRegistry.JSON)
                 .execute(ActionListener.wrap(ack -> refreshAndRespond.run(), e -> {
                     if (isTypeChangeRefusal(e)) {
-                        rebuildIndexWithMapping(indexName, mappingJson, refreshAndRespond, listener);
+                        rebuildIndexWithMapping(indexName, mappingJson, refreshAndRespond, responding);
                     } else {
                         LOGGER.warn("mapping re-derivation after node_local build failed for {}: {}", indexName, e.getMessage());
                         refreshAndRespond.run();
