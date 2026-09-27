@@ -44,8 +44,10 @@ import org.opensearch.lance.dispatch.LanceGetIndexActionFilter;
 import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
 import org.opensearch.lance.dispatch.LanceRequestCache;
 import org.opensearch.lance.dispatch.LanceRequestCacheClearAction;
+import org.opensearch.lance.dispatch.LanceFragmentFetchAction;
 import org.opensearch.lance.dispatch.LanceStatisticsPrefetchAction;
 import org.opensearch.lance.dispatch.TransportLanceRequestCacheClearAction;
+import org.opensearch.lance.dispatch.TransportLanceFragmentFetchAction;
 import org.opensearch.lance.dispatch.TransportLanceStatisticsPrefetchAction;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceIndexWarmer;
@@ -1180,6 +1182,28 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     );
 
     /**
+     * Whether a page answered by two or more executors is rendered in a
+     * fetch round: the executors return the row address, score and sort
+     * values of their top hits, the coordinator merges them and asks the
+     * executors holding the {@code size} rows it keeps to render those
+     * alone. Without it every executor renders its own top
+     * {@code from + size} rows and the coordinator discards all but the
+     * page, so a page takes {@code size} rows per executor from the
+     * object store. {@code false} renders on the query round on every
+     * request. A page served by one executor, a {@code collapse} or
+     * {@code "explain": true} body and an index with a reader wrapper
+     * (the security plugin's document and field level security) render
+     * on the query round whatever the setting says. Dynamic; the
+     * coordinator reads it per request.
+     */
+    public static final Setting<Boolean> FRAGMENT_PATH_DEFER_FETCH_SETTING = Setting.boolSetting(
+        "plugins.lance.fragment_path.defer_fetch",
+        true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
      * What {@link LanceIndexWarmer} reads of a table's indexes into this
      * node's Lance Session cache when a Lance-backed index appears
      * (attach, namespace poll, node restart): {@code none} nothing,
@@ -1323,6 +1347,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING,
             FRAGMENT_PATH_PARALLELISM_SETTING,
             FRAGMENT_PATH_SLICES_SETTING,
+            FRAGMENT_PATH_DEFER_FETCH_SETTING,
             ATTACH_WARM_INDEXES_SETTING,
             ATTACH_BACKFILL_THREADS_SETTING,
             MAX_DOCS_PER_READER_SETTING
@@ -2022,6 +2047,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
                 org.opensearch.lance.dispatch.LanceFragmentQueryAction.INSTANCE,
                 org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction.class
             ),
+            new ActionHandler<>(LanceFragmentFetchAction.INSTANCE, TransportLanceFragmentFetchAction.class),
             new org.opensearch.plugins.ActionPlugin.ActionHandler<>(
                 org.opensearch.lance.dispatch.LanceCoordinatorAction.INSTANCE,
                 org.opensearch.lance.dispatch.TransportLanceCoordinatorAction.class

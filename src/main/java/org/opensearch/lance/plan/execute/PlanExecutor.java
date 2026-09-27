@@ -144,7 +144,7 @@ public final class PlanExecutor {
 
     /** The reduce of one target's gathered responses into the accumulated state. */
     private static void executeMerge(MergeExec merge, MergeReducer reducer, String indexName, FragmentFanOut.Outcome outcome) {
-        reducer.absorbTarget(indexName, outcome.responses(), outcome.incompleteNodes() > 0);
+        reducer.absorbTarget(indexName, outcome.responses(), outcome.nodes(), outcome.incompleteNodes() > 0);
     }
 
     /**
