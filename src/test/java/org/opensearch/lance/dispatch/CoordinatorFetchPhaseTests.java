@@ -24,14 +24,19 @@ import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.index.query.BoolQueryBuilder;
+import org.opensearch.index.query.MatchAllQueryBuilder;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.dispatch.LanceFragmentQueryResponse.DeferredHits;
 import org.opensearch.lance.plan.execute.MergeReducer;
+import org.opensearch.lance.query.LanceKnnQueryBuilder;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.collapse.CollapseBuilder;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.sort.FieldSortBuilder;
+import org.opensearch.search.sort.ScoreSortBuilder;
 import org.opensearch.search.sort.SortBuilder;
 import org.opensearch.search.sort.SortOrder;
 import org.opensearch.test.ClusterServiceUtils;
@@ -371,20 +376,77 @@ public class CoordinatorFetchPhaseTests extends OpenSearchTestCase {
 
     public void testDeferFetchDecision() {
         HitProjection explain = new HitProjection(null, null, List.of(), List.of(), true);
-        assertTrue(TransportLanceCoordinatorAction.deferFetchCandidate(true, 10, null, HitProjection.NONE));
-        assertFalse("setting off", TransportLanceCoordinatorAction.deferFetchCandidate(false, 10, null, HitProjection.NONE));
-        assertFalse("size 0", TransportLanceCoordinatorAction.deferFetchCandidate(true, 0, null, HitProjection.NONE));
+        QueryBuilder match = new MatchAllQueryBuilder();
+        List<SortBuilder<?>> noSort = List.of();
+        assertTrue(TransportLanceCoordinatorAction.deferFetchCandidate(true, match, 0, 10, noSort, null, HitProjection.NONE));
+        assertFalse(
+            "setting off",
+            TransportLanceCoordinatorAction.deferFetchCandidate(false, match, 0, 10, noSort, null, HitProjection.NONE)
+        );
+        assertFalse("size 0", TransportLanceCoordinatorAction.deferFetchCandidate(true, match, 0, 0, noSort, null, HitProjection.NONE));
         assertFalse(
             "collapse",
-            TransportLanceCoordinatorAction.deferFetchCandidate(true, 10, new CollapseBuilder("f"), HitProjection.NONE)
+            TransportLanceCoordinatorAction.deferFetchCandidate(true, match, 0, 10, noSort, new CollapseBuilder("f"), HitProjection.NONE)
         );
-        assertFalse("explain", TransportLanceCoordinatorAction.deferFetchCandidate(true, 10, null, explain));
+        assertFalse("explain", TransportLanceCoordinatorAction.deferFetchCandidate(true, match, 0, 10, noSort, null, explain));
 
         assertTrue(TransportLanceCoordinatorAction.deferFetch(true, 2, false));
         assertTrue(TransportLanceCoordinatorAction.deferFetch(true, 3, false));
         assertFalse("one executor", TransportLanceCoordinatorAction.deferFetch(true, 1, false));
         assertFalse("reader wrapper", TransportLanceCoordinatorAction.deferFetch(true, 3, true));
         assertFalse("body refused", TransportLanceCoordinatorAction.deferFetch(false, 3, false));
+    }
+
+    /**
+     * A body whose executors already return only the rows of the page is
+     * rendered on the query round: a lone {@code lance_knn} with
+     * {@code k} at most {@code from + size} in score order. Every
+     * executor hands back the rows of the global top {@code k} in its own
+     * fragments, so the round would render the same rows one round trip
+     * later. The same knn inside a {@code bool}, under a field sort, or
+     * with {@code k} above {@code from + size} defers.
+     */
+    public void testPlainKnnPageStaysOnTheQueryRound() {
+        LanceKnnQueryBuilder knn = new LanceKnnQueryBuilder("embedding", new float[] { 1f, 0f }, 10);
+        List<SortBuilder<?>> noSort = List.of();
+        List<SortBuilder<?>> scoreSort = List.of(new ScoreSortBuilder());
+        List<SortBuilder<?>> priceSort = List.of(new FieldSortBuilder("price").order(SortOrder.DESC));
+        List<SortBuilder<?>> scoreThenPrice = List.of(new ScoreSortBuilder(), new FieldSortBuilder("price"));
+
+        assertTrue(TransportLanceCoordinatorAction.executorsReturnOnlyKeptRows(knn, 0, 10, noSort));
+        assertTrue("k below the page", TransportLanceCoordinatorAction.executorsReturnOnlyKeptRows(knn, 0, 20, noSort));
+        assertTrue("from counts toward the page", TransportLanceCoordinatorAction.executorsReturnOnlyKeptRows(knn, 5, 5, noSort));
+        assertTrue("_score sort is score order", TransportLanceCoordinatorAction.executorsReturnOnlyKeptRows(knn, 0, 10, scoreSort));
+        assertFalse("k above the page", TransportLanceCoordinatorAction.executorsReturnOnlyKeptRows(knn, 0, 9, noSort));
+        assertFalse("field sort", TransportLanceCoordinatorAction.executorsReturnOnlyKeptRows(knn, 0, 10, priceSort));
+        assertFalse("field sort after _score", TransportLanceCoordinatorAction.executorsReturnOnlyKeptRows(knn, 0, 10, scoreThenPrice));
+        assertFalse(
+            "knn inside a bool",
+            TransportLanceCoordinatorAction.executorsReturnOnlyKeptRows(new BoolQueryBuilder().must(knn), 0, 10, noSort)
+        );
+        assertFalse("not a knn", TransportLanceCoordinatorAction.executorsReturnOnlyKeptRows(new MatchAllQueryBuilder(), 0, 10, noSort));
+        assertFalse("no query", TransportLanceCoordinatorAction.executorsReturnOnlyKeptRows(null, 0, 10, noSort));
+
+        assertFalse(
+            "plain knn page renders on the query round",
+            TransportLanceCoordinatorAction.deferFetchCandidate(true, knn, 0, 10, noSort, null, HitProjection.NONE)
+        );
+        assertTrue(
+            "knn inside a bool defers",
+            TransportLanceCoordinatorAction.deferFetchCandidate(
+                true,
+                new BoolQueryBuilder().must(knn),
+                0,
+                10,
+                noSort,
+                null,
+                HitProjection.NONE
+            )
+        );
+        assertTrue(
+            "knn under a field sort defers",
+            TransportLanceCoordinatorAction.deferFetchCandidate(true, knn, 0, 10, priceSort, null, HitProjection.NONE)
+        );
     }
 
     public void testProfileRendersTheCoordinatorBlock() throws Exception {

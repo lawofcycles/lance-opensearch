@@ -1855,6 +1855,91 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     }
 
     /**
+     * A page whose body is one {@code lance_knn} clause with {@code k}
+     * at most {@code from + size}, in score order, is rendered on the
+     * query round: every executor runs the table wide nearest scan and
+     * hands back the rows of the global top {@code k} that sit in its own
+     * fragments, so the executors together take the {@code k} rows of
+     * the page and a fetch round would render the same rows one round
+     * trip later. The same knn inside a {@code bool} or under a field
+     * sort goes through the round.
+     *
+     * <p>Fixture: {@link LanceTableFactory#writeMultiFragmentTable} with
+     * 24 rows in 12 fragments over three nodes; row {@code i} has
+     * {@code embedding[0] = i}, so the ten nearest rows of a query on
+     * the first axis at 23.5 are ids 23 down to 14, spread over the
+     * nodes. The fetch cache is off so every take is visible.
+     */
+    public void testPlainKnnPageOnThreeNodesRendersOnTheQueryRound() throws Exception {
+        String suffix = "mn-knn-round-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        int rows = 24;
+        String tableUri = LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, rows, 2);
+        String indexName = tableName;
+        String knn = "{\"lance_knn\":{\"field\":\"embedding\",\"vector\":[23.5,0,0,0,0,0,0,0],\"k\":10}}";
+        List<Integer> nearest = List.of(23, 22, 21, 20, 19, 18, 17, 16, 15, 14);
+        try {
+            updateClusterSetting("plugins.lance.fetch_cache.enabled", "false");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            assertEquals("fixture assumes several fragments per data node", 3, dataNodeCount());
+
+            Map<String, Object> plain = parse(
+                readAll(postJson("/" + indexName + "/_search", "{\"size\":10,\"profile\":true,\"query\":" + knn + "}"))
+            );
+            assertEquals(nearest, sourceIds(plain));
+            assertEquals("every data node executed: " + plain, 3, profileNodes(plain).size());
+            assertEquals("a plain knn page runs no fetch round: " + plain, 0, fetchRoundTrips(plain));
+            assertEquals("the executors together take the k rows of the page: " + plain, 10, takeRowsOverNodes(plain));
+
+            Map<String, Object> scoreSorted = parse(
+                readAll(
+                    postJson(
+                        "/" + indexName + "/_search",
+                        "{\"size\":10,\"profile\":true,\"sort\":[{\"_score\":\"desc\"}],\"query\":" + knn + "}"
+                    )
+                )
+            );
+            assertEquals(nearest, sourceIds(scoreSorted));
+            assertEquals("a _score sort is score order: " + scoreSorted, 0, fetchRoundTrips(scoreSorted));
+
+            Map<String, Object> inBool = parse(
+                readAll(
+                    postJson("/" + indexName + "/_search", "{\"size\":10,\"profile\":true,\"query\":{\"bool\":{\"must\":[" + knn + "]}}}")
+                )
+            );
+            assertEquals(nearest, sourceIds(inBool));
+            assertTrue("a knn inside a bool goes through the round: " + inBool, fetchRoundTrips(inBool) >= 1);
+
+            Map<String, Object> fieldSorted = parse(
+                readAll(
+                    postJson(
+                        "/" + indexName + "/_search",
+                        "{\"size\":10,\"profile\":true,\"sort\":[{\"id\":\"asc\"}],\"query\":" + knn + "}"
+                    )
+                )
+            );
+            assertEquals(List.of(14, 15, 16, 17, 18, 19, 20, 21, 22, 23), sourceIds(fieldSorted));
+            assertTrue("a knn under a field sort goes through the round: " + fieldSorted, fetchRoundTrips(fieldSorted) >= 1);
+
+            Map<String, Object> wideK = parse(
+                readAll(postJson("/" + indexName + "/_search", "{\"size\":5,\"profile\":true,\"query\":" + knn + "}"))
+            );
+            assertEquals(nearest.subList(0, 5), sourceIds(wideK));
+            assertTrue("k above from + size goes through the round: " + wideK, fetchRoundTrips(wideK) >= 1);
+            assertEquals("the round takes the rows of the page alone: " + wideK, 5, takeRowsOverNodes(wideK));
+        } finally {
+            try {
+                updateClusterSetting("plugins.lance.fetch_cache.enabled", null);
+            } catch (Exception ignored) {}
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
      * Wildcard, regexp and prefix on the {@code lance_text} column and
      * on the keyword column, fanned out over three executors that each
      * hold two of the six fragments. The coordinator's SQL drives both
