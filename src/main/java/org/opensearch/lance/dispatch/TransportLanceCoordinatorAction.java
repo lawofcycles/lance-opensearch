@@ -163,7 +163,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     /**
      * This node's snapshot cache, opened through for the table a
      * fan-out enumerates fragments from so the open is counted in
-     * {@code snapshots.dataset_open_count} of {@code GET /_lance/stats}
+     * {@code snapshots.dataset_open_count} of {@code GET /_plugins/_lance/stats}
      * next to the executors' snapshot builds.
      */
     private final LanceWarmCache warmCache;

@@ -9,7 +9,7 @@ import org.opensearch.action.ActionType;
 
 /**
  * Runs the freshness check of one Lance backed index now, on the node
- * that holds its shard, behind {@code POST /{index}/_lance/sync}. The
+ * that holds its shard, behind {@code POST /_plugins/_lance/sync/{index}}. The
  * check is the one {@link LanceIndexFreshnessService} runs at
  * {@code lance.namespace.poll_cadence}: compare the table's latest
  * manifest (or the followed tag) with the version the shard serves, and

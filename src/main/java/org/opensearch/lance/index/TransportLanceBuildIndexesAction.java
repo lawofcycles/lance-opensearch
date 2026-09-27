@@ -227,7 +227,7 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
                     + disagreeing
                     + " disagree with node ["
                     + referenceNode
-                    + "]; no mapping was applied. Re-run POST /_lance/build_indexes once the nodes serve the same clone version"
+                    + "]; no mapping was applied. Re-run POST /_plugins/_lance/build_indexes once the nodes serve the same clone version"
             );
         }
         return new MappingConsensus(referenceJson, null);

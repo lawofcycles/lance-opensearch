@@ -54,7 +54,7 @@ import java.util.Objects;
  * Lucene, predicted from the mapping and the plan, in
  * {@link FragmentPlanRefiner.Reason} order; it is a prediction, the
  * data node decides, and the counts it decided with are under
- * {@code plan.refinements} in {@code GET /_lance/stats}. When no plan
+ * {@code plan.refinements} in {@code GET /_plugins/_lance/stats}. When no plan
  * of the request declares the traits it demands ({@link #planFailed}),
  * the route is still {@code fragment} but nothing ships:
  * {@code fragment_plan} is absent, {@code unplanned} carries the

@@ -25,7 +25,7 @@ import org.opensearch.core.xcontent.XContentBuilder;
  * scalar / vector), which Lance indexes were built or optimised, which
  * columns were skipped and why, and which columns failed with Lance's
  * message. Echoes the column and fragment filters the caller supplied.
- * {@link #toXContent} produces the {@code POST /_lance/build_indexes/{index}}
+ * {@link #toXContent} produces the {@code POST /_plugins/_lance/build_indexes/{index}}
  * body:
  *
  * <pre>

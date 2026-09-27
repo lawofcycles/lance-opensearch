@@ -20,7 +20,7 @@ public final class LanceInternalHeaders {
      * lets the request through only when this header is present;
      * user {@code PUT /{index}} requests that try to set {@code
      * index.lance.table} directly are rejected with 400 because
-     * they skip the {@code POST /_lance/attach} derive step and
+     * they skip the {@code POST /_plugins/_lance/attach} derive step and
      * produce a half-broken index (empty mapping, sort queries
      * failing with "No mapping found").
      */

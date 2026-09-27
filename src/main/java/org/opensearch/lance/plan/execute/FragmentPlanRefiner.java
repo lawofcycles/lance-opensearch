@@ -66,7 +66,7 @@ import java.util.function.Predicate;
  * nothing here warms the store.
  *
  * <p>Every downgrade is counted per reason in {@link #refinementCounts}
- * for {@code GET /_lance/stats}, and the caller logs the planned and
+ * for {@code GET /_plugins/_lance/stats}, and the caller logs the planned and
  * the executed plan. The caller also reports which branch ran the
  * refined plan through {@link #recordExecuted}: the Lance scan
  * (an ordered, limited scan or a Substrait aggregate scan) or Lucene's

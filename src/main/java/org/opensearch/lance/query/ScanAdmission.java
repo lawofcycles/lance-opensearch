@@ -231,7 +231,7 @@ public final class ScanAdmission {
 
         /**
          * {@code kind:table:columns}, the columns sorted and comma
-         * separated, as {@code GET /_lance/stats} reports the pool's
+         * separated, as {@code GET /_plugins/_lance/stats} reports the pool's
          * identity under {@code admission.retained_scope}.
          */
         public String key() {
@@ -775,7 +775,7 @@ public final class ScanAdmission {
     /**
      * Cumulative rejections per kind in declaration order, every kind
      * present even at zero, keyed by {@link Kind#key()}, for
-     * {@code GET /_lance/stats}.
+     * {@code GET /_plugins/_lance/stats}.
      */
     public static Map<String, Long> rejectionsByKind() {
         Map<String, Long> counts = new LinkedHashMap<>();
@@ -785,12 +785,12 @@ public final class ScanAdmission {
         return counts;
     }
 
-    /** Estimate of the last decision on this node, for {@code GET /_lance/stats}. */
+    /** Estimate of the last decision on this node, for {@code GET /_plugins/_lance/stats}. */
     public static long lastEstimateBytes() {
         return LAST_ESTIMATE_BYTES.get();
     }
 
-    /** Kind key of the last decision on this node, {@code "none"} before the first, for {@code GET /_lance/stats}. */
+    /** Kind key of the last decision on this node, {@code "none"} before the first, for {@code GET /_plugins/_lance/stats}. */
     public static String lastKind() {
         Kind kind = LAST_KIND.get();
         return kind == null ? "none" : kind.key();
@@ -799,7 +799,7 @@ public final class ScanAdmission {
     /**
      * Source key of the last decision on this node ({@code request} or
      * {@code warm_up}), {@code "none"} before the first, for
-     * {@code GET /_lance/stats}.
+     * {@code GET /_plugins/_lance/stats}.
      */
     public static String lastSource() {
         Source source = LAST_SOURCE.get();
@@ -811,7 +811,7 @@ public final class ScanAdmission {
      * against: the kernel's {@code MemAvailable} where
      * {@code /proc/meminfo} reports it, else {@link OsProbe}'s free
      * physical memory. Also reported as {@code admission.available_bytes}
-     * in {@code GET /_lance/stats}.
+     * in {@code GET /_plugins/_lance/stats}.
      */
     public static long availablePhysicalMemoryBytes() {
         return readAvailableMemoryNow();
@@ -824,7 +824,7 @@ public final class ScanAdmission {
      * gated scan runs, zero when the resident set guard blocks it, else
      * the pool's credit. A decision on a scan of another identity is
      * credited nothing whatever this reads. Also reported as
-     * {@code admission.retained_bytes} in {@code GET /_lance/stats}.
+     * {@code admission.retained_bytes} in {@code GET /_plugins/_lance/stats}.
      */
     public static long retainedCreditBytes() {
         return retainedCreditBytes(readAvailableMemoryNow());
@@ -865,7 +865,7 @@ public final class ScanAdmission {
      * The identity of the scans that filled the retained pool, as
      * {@link Scope#key()} spells it ({@code kind:table:columns}), or
      * {@code "none"} before the first admission. Reported as
-     * {@code admission.retained_scope} in {@code GET /_lance/stats}, so
+     * {@code admission.retained_scope} in {@code GET /_plugins/_lance/stats}, so
      * an operator can tell which scan the {@code retained_bytes} figure
      * would be credited to.
      */

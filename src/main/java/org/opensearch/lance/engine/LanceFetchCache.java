@@ -567,7 +567,7 @@ public final class LanceFetchCache implements ClusterStateListener {
     }
 
     /**
-     * The cache's figures for {@code GET /_lance/stats}: the setting in
+     * The cache's figures for {@code GET /_plugins/_lance/stats}: the setting in
      * force, the bytes held against the limit, the entries, and since
      * the node started the cells served ({@code hits}), the cells looked
      * up and not held ({@code misses}), the entries dropped for room or

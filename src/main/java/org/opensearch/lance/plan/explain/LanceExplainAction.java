@@ -9,7 +9,7 @@ import org.opensearch.action.ActionType;
 import org.opensearch.action.IndicesRequest;
 
 /**
- * Action behind {@code GET /<index>/_lance/explain}. Explaining a
+ * Action behind {@code GET /_plugins/_lance/explain/<index>}. Explaining a
  * request only reads the index's schema and row count, so the name sits
  * under {@code indices:monitor/} and the request implements
  * {@link IndicesRequest}: a security plugin evaluates the privilege per

@@ -705,7 +705,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
      * happens). The type strings are what Lance reports
      * ({@code BTree}, {@code Bitmap}, {@code ZoneMap}, {@code Inverted},
      * {@code IVF_FLAT}, ...). Columns without an index are absent.
-     * {@code GET /_lance/stats} reports the result per index so an
+     * {@code GET /_plugins/_lance/stats} reports the result per index so an
      * operator can see whether an {@code indexes} preference took
      * effect.
      */

@@ -16,7 +16,7 @@ import org.opensearch.core.common.io.stream.StreamOutput;
 
 /**
  * Request for {@link LanceRefsAction}: the index named in
- * {@code GET /_lance/refs/{index}}.
+ * {@code GET /_plugins/_lance/refs/{index}}.
  *
  * <p>Implements {@link IndicesRequest} so a security plugin can apply
  * index-level permissions to the one index named in the path.

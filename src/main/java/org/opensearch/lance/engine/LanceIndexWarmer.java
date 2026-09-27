@@ -63,7 +63,7 @@ import org.opensearch.lance.query.ScanAdmission;
  * pays for the load in latency bound page reads while the second takes
  * seconds. This class issues, for every index the table carries, the
  * smallest scan that makes Lance load the part named by the
- * {@link Mode}, and records what it did for {@code GET /_lance/stats}.
+ * {@link Mode}, and records what it did for {@code GET /_plugins/_lance/stats}.
  *
  * <p>Trigger: the class listens to cluster state and starts one
  * warm-up per Lance-backed index that appears in the metadata (attach,

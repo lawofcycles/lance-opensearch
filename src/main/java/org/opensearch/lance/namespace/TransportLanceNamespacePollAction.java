@@ -23,7 +23,7 @@ import org.opensearch.transport.TransportService;
 /**
  * Serves {@link LanceNamespacePollAction}. Cluster manager scoped, like
  * the register call: whichever node receives
- * {@code POST /_lance/namespace/_poll} forwards it to the elected
+ * {@code POST /_plugins/_lance/namespace/_poll} forwards it to the elected
  * cluster manager, where the scheduled poll runs and where the
  * {@link LanceNamespaceService} holds the catalog handles. The cycle
  * lists catalogs and opens the tables it surfaces, so it runs on the

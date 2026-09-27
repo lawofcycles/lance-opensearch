@@ -261,7 +261,7 @@ final class LanceSchemaDriftDetector {
                 LOG.warn(
                     "Lance table for {} renamed field id {} from '{}' to '{}'. "
                         + "The mapping keeps the old name marked lance_dropped (PutMapping cannot remove properties): queries "
-                        + "against '{}' return no hits, and GET /_lance/stats lists the rename under renamed_fields. "
+                        + "against '{}' return no hits, and GET /_plugins/_lance/stats lists the rename under renamed_fields. "
                         + "Mapping overrides keyed by the old name follow the column to '{}'.",
                     indexName,
                     field.getId(),

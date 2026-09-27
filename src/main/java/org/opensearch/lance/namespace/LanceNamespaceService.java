@@ -797,7 +797,7 @@ public final class LanceNamespaceService implements Closeable {
             // Derive first so the CreateIndex settings and mapping reflect
             // the current Lance schema. Automatic index creation is off by
             // default; operators build indexes explicitly through
-            // POST /_lance/build_indexes.
+            // POST /_plugins/_lance/build_indexes.
             derivation = RestAttachAction.derive(dataset, overrides, true);
         }
         if (!derivation.notes().isEmpty() && LOG.isDebugEnabled()) {

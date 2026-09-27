@@ -13,7 +13,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * the request circuit breaker for columns it materialised in heap
  * because the off-heap {@link ColumnStore} had no room (or the reader
  * has no store), and the number of loads the breaker refused. Read by
- * {@code GET /_lance/stats} as {@code column_store.heap_fallback_bytes}
+ * {@code GET /_plugins/_lance/stats} as {@code column_store.heap_fallback_bytes}
  * and {@code column_store.heap_fallback_rejections}.
  *
  * <p>Static because the readers that charge the breaker are opened from

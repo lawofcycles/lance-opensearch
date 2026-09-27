@@ -104,7 +104,7 @@ public final class LanceRequestCache implements ClusterStateListener {
 
     private static final Logger LOGGER = LogManager.getLogger(LanceRequestCache.class);
 
-    /** Why a request was not served from or stored in the cache, as {@code GET /<index>/_lance/explain} names it. */
+    /** Why a request was not served from or stored in the cache, as {@code GET /_plugins/_lance/explain/<index>} names it. */
     public enum Skip {
         /** {@code lance.request_cache.enabled} is false on this node. */
         DISABLED("disabled"),
@@ -642,7 +642,7 @@ public final class LanceRequestCache implements ClusterStateListener {
     }
 
     /**
-     * The cache's figures for {@code GET /_lance/stats}: the setting in
+     * The cache's figures for {@code GET /_plugins/_lance/stats}: the setting in
      * force, the bytes held against the limit, the entries, and the
      * cumulative hits, misses, evictions (least recently used and
      * expired), invalidations (index deletions and clears) and skipped

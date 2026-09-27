@@ -15,7 +15,7 @@ import org.opensearch.lance.WireVersion;
 
 /**
  * Request for {@link LanceIndexSyncAction}: the index named in
- * {@code POST /{index}/_lance/sync}. A {@link SingleShardRequest}, so the
+ * {@code POST /_plugins/_lance/sync/{index}}. A {@link SingleShardRequest}, so the
  * transport action routes it to the node holding the index's one shard,
  * and a security plugin applies index level permissions to the name.
  * Carries nothing of its own but {@link #WIRE_VERSION} (see

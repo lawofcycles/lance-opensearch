@@ -26,7 +26,7 @@ import org.opensearch.core.common.io.stream.StreamOutput;
  * {@link ReadOptions.Builder#setStorageOptions(Map)}. The plugin surface
  * uses the Lance-native key names (e.g. {@code aws_access_key_id},
  * {@code aws_region}, {@code aws_endpoint}, {@code allow_http}) so what
- * the caller writes on {@code POST /_lance/attach} is what Lance's
+ * the caller writes on {@code POST /_plugins/_lance/attach} is what Lance's
  * object store sees; there is no OpenSearch-side translation.
  *
  * <p>The value type carries only {@link String} keys and values. Nested

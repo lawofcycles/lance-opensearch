@@ -74,7 +74,7 @@ import org.opensearch.transport.client.Client;
  * the table.
  *
  * <p>Routing: the action is cluster-manager scoped. Whichever node
- * receives {@code POST /_lance/attach} forwards the request to the
+ * receives {@code POST /_plugins/_lance/attach} forwards the request to the
  * elected cluster manager, and {@link #clusterManagerOperation} runs
  * there. Attach reads and writes cluster state (index existence check,
  * create index), so the manager is where that work belongs. It is also what keeps the internal create-index header

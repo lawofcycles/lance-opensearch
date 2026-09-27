@@ -18,7 +18,7 @@ import org.opensearch.core.xcontent.XContentBuilder;
 /**
  * Response for {@link LanceRefsAction}: the tags (name and the manifest
  * version each points at) and branches (name) of the Lance table behind an
- * index. {@link #toXContent} produces the {@code GET /_lance/refs/{index}}
+ * index. {@link #toXContent} produces the {@code GET /_plugins/_lance/refs/{index}}
  * body.
  */
 public final class LanceRefsResponse extends ActionResponse implements ToXContentObject {
