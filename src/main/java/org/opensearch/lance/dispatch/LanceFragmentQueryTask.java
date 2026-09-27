@@ -11,7 +11,8 @@ import org.opensearch.core.tasks.TaskId;
 import org.opensearch.tasks.CancellableTask;
 
 /**
- * Task of one per-node {@link LanceFragmentQueryAction} request.
+ * Task of one per-node {@link LanceFragmentQueryAction} or
+ * {@link LanceFragmentFetchAction} request.
  *
  * <p>Cancellable so the coordinator can stop an executor whose request
  * has timed out and so a cancelled coordinator task (through

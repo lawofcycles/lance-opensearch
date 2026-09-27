@@ -77,12 +77,16 @@ import org.opensearch.tasks.Task;
  * plugin and opens with {@link #WIRE_VERSION} (see {@link WireVersion}),
  * whose block framing lets an executor of the previous plugin version
  * read the request during a rolling upgrade; the plan inside carries a
- * marker of its own.
+ * marker of its own. Version 1 laid out every field but
+ * {@link #deferFetch()}, which version 2 added as an optional block: an
+ * executor of version 1 steps over it and renders its hits as before,
+ * which the coordinator accepts next to the deferred hits of the other
+ * executors.
  */
 public final class LanceFragmentQueryRequest extends ActionRequest {
 
-    /** The wire format's version, the first field the request writes after its base class. */
-    public static final int WIRE_VERSION = 1;
+    /** The wire format's version, the first field the request writes after its base class; 2 added the defer fetch block. */
+    public static final int WIRE_VERSION = 2;
 
     private final String tableUri;
     private final String indexName;
@@ -165,6 +169,20 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
      * per value across the executors and to expand {@code inner_hits}.
      */
     private final CollapseBuilder collapse;
+    /**
+     * Whether the executor collects the page but leaves its hits
+     * unrendered: the response then carries the row address, the score
+     * and the sort values of every hit
+     * ({@link LanceFragmentQueryResponse#deferredHits()}) and no
+     * {@code _source}, and the coordinator asks the executors that hold
+     * the rows of the merged page to render them in a second round
+     * ({@link LanceFragmentFetchAction}). The coordinator sets it when
+     * several executors answer a page, so only the rows of the page are
+     * taken instead of {@code size} rows on every executor. An executor
+     * that finds a reader wrapper on the index renders its hits anyway,
+     * because the fetch round cannot reproduce the wrapper's decision.
+     */
+    private final boolean deferFetch;
 
     /**
      * A request without collector knobs, per hit projections, rescorers
@@ -254,6 +272,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         );
     }
 
+    /** A request whose executors render their hits ({@link #deferFetch()} false). */
     public LanceFragmentQueryRequest(
         String tableUri,
         String indexName,
@@ -275,6 +294,52 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         List<RescorerBuilder<?>> rescores,
         CollapseBuilder collapse
     ) {
+        this(
+            tableUri,
+            indexName,
+            storageOptions,
+            pinnedVersion,
+            plan,
+            query,
+            postFilter,
+            sorts,
+            searchAfter,
+            size,
+            aggregations,
+            fragmentIds,
+            trackScores,
+            trackTotalHitsUpTo,
+            minScore,
+            terminateAfter,
+            projection,
+            rescores,
+            collapse,
+            false
+        );
+    }
+
+    public LanceFragmentQueryRequest(
+        String tableUri,
+        String indexName,
+        StorageOptions storageOptions,
+        long pinnedVersion,
+        FragmentPlan plan,
+        QueryBuilder query,
+        QueryBuilder postFilter,
+        List<SortBuilder<?>> sorts,
+        Object[] searchAfter,
+        int size,
+        AggregatorFactories.Builder aggregations,
+        List<Integer> fragmentIds,
+        boolean trackScores,
+        int trackTotalHitsUpTo,
+        Float minScore,
+        int terminateAfter,
+        HitProjection projection,
+        List<RescorerBuilder<?>> rescores,
+        CollapseBuilder collapse,
+        boolean deferFetch
+    ) {
         this.tableUri = tableUri;
         this.indexName = indexName;
         this.storageOptions = storageOptions;
@@ -294,11 +359,27 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
         this.projection = projection == null ? HitProjection.NONE : projection;
         this.rescores = rescores == null ? Collections.emptyList() : List.copyOf(rescores);
         this.collapse = collapse;
+        this.deferFetch = deferFetch;
     }
 
     public LanceFragmentQueryRequest(StreamInput in) throws IOException {
+        this(in, WIRE_VERSION);
+    }
+
+    /**
+     * Reads the request as an executor whose plugin is at wire version
+     * {@code asVersion} would: the blocks of later versions are stepped
+     * over as {@link WireVersion.Reader} describes. The transport reads
+     * with {@link #WIRE_VERSION}; the mixed version tests read with the
+     * versions before it.
+     */
+    static LanceFragmentQueryRequest read(StreamInput in, int asVersion) throws IOException {
+        return new LanceFragmentQueryRequest(in, asVersion);
+    }
+
+    private LanceFragmentQueryRequest(StreamInput in, int asVersion) throws IOException {
         super(in);
-        WireVersion.Reader reader = WireVersion.read(in, "LanceFragmentQueryRequest", WIRE_VERSION);
+        WireVersion.Reader reader = WireVersion.read(in, "LanceFragmentQueryRequest", asVersion);
         this.tableUri = in.readString();
         this.indexName = in.readString();
         this.storageOptions = StorageOptions.readFromStream(in);
@@ -345,6 +426,9 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
             this.rescores = List.copyOf(readRescores);
         }
         this.collapse = in.readOptionalWriteable(CollapseBuilder::new);
+        // An executor of version 1 never sees the flag and renders its
+        // hits, which the coordinator accepts; so the block is optional.
+        this.deferFetch = reader.block(2, StreamInput::readBoolean, Boolean.FALSE);
         reader.finish();
     }
 
@@ -393,6 +477,10 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
             out.writeNamedWriteable(rescore);
         }
         out.writeOptionalWriteable(collapse);
+        // Optional: an executor of version 1 that steps over the flag
+        // renders its hits, and the coordinator merges rendered and
+        // deferred hits alike.
+        WireVersion.writeBlock(out, false, block -> block.writeBoolean(deferFetch));
     }
 
     @Override
@@ -594,6 +682,43 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     /** The request's {@code collapse}, or {@code null} when it has none. */
     public CollapseBuilder collapse() {
         return collapse;
+    }
+
+    /**
+     * Whether the executor leaves its hits unrendered for the
+     * coordinator's fetch round; see the field comment.
+     */
+    public boolean deferFetch() {
+        return deferFetch;
+    }
+
+    /** This request with {@link #deferFetch()} set to {@code deferFetch}. */
+    public LanceFragmentQueryRequest withDeferFetch(boolean deferFetch) {
+        if (deferFetch == this.deferFetch) {
+            return this;
+        }
+        return new LanceFragmentQueryRequest(
+            tableUri,
+            indexName,
+            storageOptions,
+            pinnedVersion,
+            plan,
+            query,
+            postFilter,
+            sorts,
+            searchAfter,
+            size,
+            aggregations,
+            fragmentIds,
+            trackScores,
+            trackTotalHitsUpTo,
+            minScore,
+            terminateAfter,
+            projection,
+            rescores,
+            collapse,
+            deferFetch
+        );
     }
 
     /**
