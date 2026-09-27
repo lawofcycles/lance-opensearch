@@ -252,6 +252,31 @@ public class LanceAttachIT extends LanceRestTestCase {
         }
     }
 
+    public void testAttachAgainstAStoreThatRefusesTheAccessKeyIdDoesNotEchoIt() throws Exception {
+        // S3 answers a request signed with an unknown access key id
+        // with InvalidAccessKeyId and echoes the key id in the body,
+        // which Lance quotes in its message. The attach fails as a
+        // server error whose message keeps the S3 error code but not
+        // the key id. An HTTP listener in the test JVM stands in for
+        // the endpoint; the cluster runs on the same host.
+        String keyId = "AKIA" + randomAlphaOfLength(16).toUpperCase(Locale.ROOT);
+        try (InvalidAccessKeyIdS3Fixture s3 = new InvalidAccessKeyIdS3Fixture(keyId)) {
+            String table = "s3://redaction-bucket/attach-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT) + ".lance";
+            ResponseException failure = expectThrows(
+                ResponseException.class,
+                () -> postJson(
+                    "/_plugins/_lance/attach",
+                    "{\"table\":\"" + table + "\",\"storage_options\":" + s3.storageOptionsJson() + "}"
+                )
+            );
+            int status = failure.getResponse().getStatusLine().getStatusCode();
+            String body = readAll(failure.getResponse());
+            assertEquals("expected 500 for a store that refuses the key id, saw " + status + ": " + body, 500, status);
+            assertTrue("the response names the S3 error: " + body, body.contains("InvalidAccessKeyId"));
+            assertFalse("the response must not carry the key id: " + body, body.contains(keyId));
+        }
+    }
+
     public void testAttachOmittingStorageOptionsPersistsNothing() throws Exception {
         // Absent storage_options must not seed any
         // index.plugins.lance.storage_options.* setting; callers use the absence
