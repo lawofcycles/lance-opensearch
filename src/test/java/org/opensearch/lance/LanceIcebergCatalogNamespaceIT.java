@@ -54,7 +54,7 @@ public class LanceIcebergCatalogNamespaceIT extends LanceRestTestCase {
         String namespaceName = "ice-" + suffix;
         try {
             Response register = postJson(
-                "/_lance/namespace",
+                "/_plugins/_lance/namespace",
                 "{\"type\":\"iceberg\",\"name\":\""
                     + namespaceName
                     + "\",\"config\":{\"endpoint\":\"http://127.0.0.1:"
@@ -71,7 +71,7 @@ public class LanceIcebergCatalogNamespaceIT extends LanceRestTestCase {
                 assertTrue("expected 4 hits from the iceberg-surfaced index: " + body, body.contains("\"value\":4"));
             });
 
-            Response listing = client().performRequest(new Request("GET", "/_lance/namespace"));
+            Response listing = client().performRequest(new Request("GET", "/_plugins/_lance/namespace"));
             String listingBody = readAll(listing);
             assertTrue(
                 "expected the iceberg namespace in the listing: " + listingBody,
@@ -81,7 +81,7 @@ public class LanceIcebergCatalogNamespaceIT extends LanceRestTestCase {
             assertTrue("expected available status: " + listingBody, listingBody.contains("\"status\":\"available\""));
             assertFalse("bearer token must not appear in the listing: " + listingBody, listingBody.contains("test-token"));
 
-            Response tables = postJson("/_lance/namespace/tables", "{\"name\":\"" + namespaceName + "\"}");
+            Response tables = postJson("/_plugins/_lance/namespace/tables", "{\"name\":\"" + namespaceName + "\"}");
             String tablesBody = readAll(tables);
             assertTrue("expected the fixture table in the preview: " + tablesBody, tablesBody.contains("\"" + tableName + "\""));
         } finally {
@@ -90,7 +90,7 @@ public class LanceIcebergCatalogNamespaceIT extends LanceRestTestCase {
                 client().performRequest(new Request("DELETE", "/" + tableName));
             } catch (Exception ignored) {}
             try {
-                deleteJson("/_lance/namespace", "{\"name\":\"" + namespaceName + "\"}");
+                deleteJson("/_plugins/_lance/namespace", "{\"name\":\"" + namespaceName + "\"}");
             } catch (Exception ignored) {}
         }
     }

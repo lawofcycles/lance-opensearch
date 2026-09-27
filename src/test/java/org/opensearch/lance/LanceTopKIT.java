@@ -28,7 +28,7 @@ import org.opensearch.core.rest.RestStatus;
 public class LanceTopKIT extends LanceRestTestCase {
 
     private static String explainBody(String indexName, String body) throws IOException {
-        Request request = new Request("GET", "/" + indexName + "/_lance/explain");
+        Request request = new Request("GET", "/_plugins/_lance/explain/" + indexName);
         request.setJsonEntity(body);
         return readAll(client().performRequest(request));
     }
@@ -41,7 +41,7 @@ public class LanceTopKIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             // An explicit _score sort answers exactly what the bare page
@@ -102,7 +102,7 @@ public class LanceTopKIT extends LanceRestTestCase {
         String indexName = tableName;
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\""
                     + tableUri
                     + "\",\"overrides\":{\"label\":{\"type\":\"keyword\",\"fields\":{\"raw\":{\"type\":\"keyword\"}}}}}"
@@ -161,7 +161,7 @@ public class LanceTopKIT extends LanceRestTestCase {
         String tableUri = LanceTableFactory.writeGeoStructTable(scratchDir, indexName);
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"overrides\":{\"location\":{\"type\":\"geo_point\"}}}"
             );
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());

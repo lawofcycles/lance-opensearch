@@ -45,7 +45,7 @@ public class LanceNestedIT extends LanceRestTestCase {
         LanceTableFactory.deleteRows(tableUri, "id = 5");
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(
                 "attach on nested table failed: " + readAll(attach),
                 RestStatus.OK.getStatus(),
@@ -227,7 +227,7 @@ public class LanceNestedIT extends LanceRestTestCase {
             String docStats = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_stats/docs")));
             int numDocs = extractIntPath(docStats, "indices", indexName, "primaries", "docs", "count");
             assertEquals("docs.count counts parents plus child docs: " + docStats, 12, numDocs);
-            String lanceStats = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+            String lanceStats = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
             Map<String, Object> nodes = castMap(parseJson(lanceStats).get("nodes"));
             Map<String, Object> indices = castMap(castMap(nodes.values().iterator().next()).get("indices"));
             Map<String, Object> indexStats = castMap(indices.get(indexName));

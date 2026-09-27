@@ -21,7 +21,7 @@ import org.opensearch.rest.action.RestStatusToXContentListener;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
- * POST /_lance/build_indexes/{index} [{"columns": [...], "fts_columns": [...], "fragment_ids": [...], "optimize": bool, "retrain": bool, "tokenizer": "...", "with_position": bool, "indexes": {...}}]
+ * POST /_plugins/_lance/build_indexes/{index} [{"columns": [...], "fts_columns": [...], "fragment_ids": [...], "optimize": bool, "retrain": bool, "tokenizer": "...", "with_position": bool, "indexes": {...}}]
  *
  * Manual index build endpoint. The handler parses the body and hands a
  * {@link LanceBuildIndexesRequest} to {@link LanceBuildIndexesAction};
@@ -47,8 +47,10 @@ public class RestBuildIndexesAction extends BaseRestHandler {
     }
 
     @Override
-    public List<Route> routes() {
-        return List.of(new Route(RestRequest.Method.POST, "/_lance/build_indexes/{index}"));
+    public List<ReplacedRoute> replacedRoutes() {
+        return List.of(
+            new ReplacedRoute(RestRequest.Method.POST, "/_plugins/_lance/build_indexes/{index}", "/_lance/build_indexes/{index}")
+        );
     }
 
     @Override

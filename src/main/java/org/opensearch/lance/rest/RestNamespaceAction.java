@@ -35,7 +35,7 @@ import org.opensearch.transport.client.node.NodeClient;
  * REST surface for namespace registration and listing.
  *
  * <ul>
- *   <li>{@code POST /_lance/namespace} registers a catalog through
+ *   <li>{@code POST /_plugins/_lance/namespace} registers a catalog through
  *       {@link LanceNamespaceUpdateAction}. The body takes {@code type}
  *       ({@code directory} when absent; any value of
  *       {@link LanceNamespaceMetadata.Entry#ACCEPTED_TYPES}), a
@@ -43,13 +43,13 @@ import org.opensearch.transport.client.node.NodeClient;
  *       {@code directory}, where it defaults to the path),
  *       {@code path} (directory only), and a {@code config} object of
  *       string values passed to the implementation's initialize.</li>
- *   <li>{@code DELETE /_lance/namespace} unregisters by {@code name}
+ *   <li>{@code DELETE /_plugins/_lance/namespace} unregisters by {@code name}
  *       (or {@code path} for directory registrations) through the same
  *       action.</li>
- *   <li>{@code GET /_lance/namespace} lists the registrations and
- *       {@code POST /_lance/namespace/tables} lists the tables of one
+ *   <li>{@code GET /_plugins/_lance/namespace} lists the registrations and
+ *       {@code POST /_plugins/_lance/namespace/tables} lists the tables of one
  *       registration, both through {@link LanceNamespaceListAction}.</li>
- *   <li>{@code POST /_lance/namespace/_poll} runs one catalog listing
+ *   <li>{@code POST /_plugins/_lance/namespace/_poll} runs one catalog listing
  *       cycle now on the cluster manager through
  *       {@link LanceNamespacePollAction}; {@code ?name=} (a registration
  *       name, or a directory registration's path) limits it to one
@@ -70,13 +70,13 @@ public class RestNamespaceAction extends BaseRestHandler {
     }
 
     @Override
-    public List<Route> routes() {
+    public List<ReplacedRoute> replacedRoutes() {
         return List.of(
-            new Route(RestRequest.Method.POST, "/_lance/namespace"),
-            new Route(RestRequest.Method.GET, "/_lance/namespace"),
-            new Route(RestRequest.Method.DELETE, "/_lance/namespace"),
-            new Route(RestRequest.Method.POST, "/_lance/namespace/tables"),
-            new Route(RestRequest.Method.POST, "/_lance/namespace/_poll")
+            new ReplacedRoute(RestRequest.Method.POST, "/_plugins/_lance/namespace", "/_lance/namespace"),
+            new ReplacedRoute(RestRequest.Method.GET, "/_plugins/_lance/namespace", "/_lance/namespace"),
+            new ReplacedRoute(RestRequest.Method.DELETE, "/_plugins/_lance/namespace", "/_lance/namespace"),
+            new ReplacedRoute(RestRequest.Method.POST, "/_plugins/_lance/namespace/tables", "/_lance/namespace/tables"),
+            new ReplacedRoute(RestRequest.Method.POST, "/_plugins/_lance/namespace/_poll", "/_lance/namespace/_poll")
         );
     }
 
@@ -109,7 +109,7 @@ public class RestNamespaceAction extends BaseRestHandler {
         } catch (IllegalArgumentException e) {
             return badRequest(e.getMessage());
         }
-        // POST /_lance/namespace/tables is a read-only listing endpoint.
+        // POST /_plugins/_lance/namespace/tables is a read-only listing endpoint.
         // POST is used (rather than GET with a query parameter) because
         // registered paths can contain slashes, scheme prefixes
         // (s3://bucket/root), and other characters that make URL-encoded

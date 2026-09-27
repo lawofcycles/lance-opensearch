@@ -97,7 +97,7 @@ lists the catalog and surfaces new tables as indexes. Keeping an index fresh is 
 node that holds its shard: a freshness service there checks each held index at the same cadence,
 advances the reader when the manifest (or the followed tag) moved, re-derives the mapping and
 sends a mapping update only when it changed, and classifies schema drift (rename, reset, drop)
-between checks. `POST /_lance/namespace/_poll` and `POST /{index}/_lance/sync` run the two
+between checks. `POST /_plugins/_lance/namespace/_poll` and `POST /_plugins/_lance/sync/{index}` run the two
 jobs on demand. [docs/design/namespace-freshness.md](design/namespace-freshness.md) records why
 the split is drawn there.
 
@@ -153,11 +153,11 @@ src/main/java/org/opensearch/lance/
 │   ├── lancesql/    #   predicate -> Lance (DataFusion) SQL printer
 │   ├── substrait/   #   aggregate -> Substrait bytes
 │   ├── execute/     #   coordinator planning, the shipped per node plan, its refinement, fan-out, merge
-│   └── explain/     #   the _lance/explain endpoint
+│   └── explain/     #   the _plugins/_lance/explain endpoint
 ├── query/           # the lance_* query builders and their Lucene query forms
-├── refs/            # the _lance/refs endpoint (tags and branches)
+├── refs/            # the _plugins/_lance/refs endpoint (tags and branches)
 ├── rest/            # all REST handlers
-└── stats/           # the _lance/stats endpoint
+└── stats/           # the _plugins/_lance/stats endpoint
 ```
 
 The top-level classes are what every path shares: `LancePlugin` (settings, services, thread
@@ -195,7 +195,7 @@ sequenceDiagram
     participant A as Attach action (cluster manager)
     participant L as Lance table
     participant CS as Cluster state
-    C->>R: POST /_lance/attach {table, overrides, storage_options, version | tag}
+    C->>R: POST /_plugins/_lance/attach {table, overrides, storage_options, version | tag}
     R->>A: forwarded to the elected cluster manager
     A->>L: open the table
     A->>A: derive mapping from the Arrow schema + overrides
@@ -381,7 +381,7 @@ Translators turn the search body into a logical tree; pushdown rules fold what L
 into the scan; converter rules produce the Lucene alternative for the same tree; and the Volcano
 planner picks by cost. A
 tree the planner cannot handle at all falls back to Lucene execution — a planner failure never
-surfaces as a request error. `GET /{index}/_lance/explain` runs exactly the coordinator's
+surfaces as a request error. `GET /_plugins/_lance/explain/{index}` runs exactly the coordinator's
 planning entry without executing anything and prints the route, both plans (every physical
 operator with the traits it declares and the cost the planner charged it), the per node
 `FragmentPlan` it would ship, the refinements a data node could still apply and the trait
@@ -511,7 +511,7 @@ collection of that version and broadcasts a prefetch of it to every data node
 (`LanceStatisticsPrefetchAction`), since the served version is not in the cluster state and no
 other node observes the move; a node also collects a version when it builds its snapshot.
 Statistics are not shipped between
-nodes. The cache is per node and `GET /_lance/stats` reports it under `plan.statistics`: `tables`
+nodes. The cache is per node and `GET /_plugins/_lance/stats` reports it under `plan.statistics`: `tables`
 (entries held), `collect_millis_total` (time spent collecting), `pending` (collections started and
 not finished; zero also on a node that has started none) and `planned_without` (plans made without
 statistics since the node started). The Calcite
@@ -543,7 +543,7 @@ column store), and below the fitted model's range the shipped costs are zero. Do
 from the Lance scan to
 Lucene; nothing is pushed on the data node that the coordinator did not push, so the plan the
 explain endpoint prints is the plan the coordinator ships (the endpoint calls the same
-`RequestPlanner` entry with the same cost inputs and renders its result), and `GET /_lance/stats` counts every
+`RequestPlanner` entry with the same cost inputs and renders its result), and `GET /_plugins/_lance/stats` counts every
 downgrade under `plan.refinements` by reason and, under `plan.executed`, how many requests each
 node answered through the Lance scan and through Lucene. Before the plan ships, the coordinator
 also checks the query predicate against the zone maps of the columns it names (`plan/prune/ZoneMapPruner`,

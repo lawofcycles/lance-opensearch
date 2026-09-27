@@ -33,7 +33,7 @@ If you've upgraded to the latest version and you can't find it in our open issue
 
 ```sh
 # attach the Lance table
-curl -X POST localhost:9200/_lance/attach -H 'Content-Type: application/json' -d '{
+curl -X POST localhost:9200/_plugins/_lance/attach -H 'Content-Type: application/json' -d '{
  "table": "/tables/demo.lance"
 }'
 

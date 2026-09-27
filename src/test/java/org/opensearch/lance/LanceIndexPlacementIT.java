@@ -41,13 +41,13 @@ public class LanceIndexPlacementIT extends LanceRestTestCase {
         makeReadOnly(tableDir);
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"name\":\"" + indexName + "\",\"index_placement\":\"node_local\"}"
             );
             assertEquals(200, attach.getStatusLine().getStatusCode());
             ensureGreen(indexName);
 
-            String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"]}"));
+            String build = readAll(postJson("/_plugins/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"]}"));
             assertTrue(
                 "expected label in the merged fts built list: " + build,
                 build.contains("\"fts\":[{\"column\":\"label\",\"type\":\"INVERTED\"}]")
@@ -76,14 +76,14 @@ public class LanceIndexPlacementIT extends LanceRestTestCase {
 
             // The clone shows up in the stats with its size and the
             // source version it was cloned at.
-            String stats = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+            String stats = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
             assertTrue("stats must report the clone under local_clones: " + stats, stats.contains("\"" + indexName + "\""));
             assertTrue("stats must report local_clone_bytes: " + stats, stats.contains("\"local_clone_bytes\""));
 
             // Deleting the index removes the clone directory.
             client().performRequest(new Request("DELETE", "/" + indexName));
             assertBusy(() -> {
-                String after = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+                String after = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
                 int idx = after.indexOf("\"local_clones\"");
                 assertTrue("local_clones block expected: " + after, idx >= 0);
                 assertFalse(
@@ -107,13 +107,13 @@ public class LanceIndexPlacementIT extends LanceRestTestCase {
         Path tableDir = Path.of(tableUri);
         makeReadOnly(tableDir);
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"name\":\"" + indexName + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\",\"name\":\"" + indexName + "\"}");
             assertEquals(200, attach.getStatusLine().getStatusCode());
             ensureGreen(indexName);
 
             ResponseException failure = expectThrows(
                 ResponseException.class,
-                () -> postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"]}")
+                () -> postJson("/_plugins/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"]}")
             );
             String body = readAll(failure.getResponse());
             assertEquals(
@@ -137,7 +137,7 @@ public class LanceIndexPlacementIT extends LanceRestTestCase {
         String tableUri = LanceTableFactory.writeMultiFragmentTable(scratch, indexName, 8, 4);
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"name\":\"" + indexName + "\",\"index_placement\":\"node_local\"}"
             );
             assertEquals(200, attach.getStatusLine().getStatusCode());
@@ -187,7 +187,7 @@ public class LanceIndexPlacementIT extends LanceRestTestCase {
     }
 
     private long statsCloneVersion(String indexName) throws IOException {
-        String stats = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+        String stats = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
         // The stats body nests local_clones per node; find the entry for
         // this index and read its source_version.
         int idx = stats.indexOf("\"" + indexName + "\":{\"local_clone_bytes\"");

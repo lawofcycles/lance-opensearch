@@ -201,7 +201,7 @@ public class LanceFetchCacheIT extends LanceRestTestCase {
 
     @SuppressWarnings("unchecked")
     private static Map<String, Object> statsBlock(String name) throws IOException {
-        Map<String, Object> parsed = parseJson(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> parsed = parseJson(readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats"))));
         Map<String, Object> nodes = (Map<String, Object>) parsed.get("nodes");
         assertEquals("single node cluster", 1, nodes.size());
         Map<String, Object> node = (Map<String, Object>) nodes.values().iterator().next();

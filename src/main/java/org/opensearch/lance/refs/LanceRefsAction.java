@@ -9,7 +9,7 @@ import org.opensearch.action.ActionType;
 import org.opensearch.action.IndicesRequest;
 
 /**
- * Action behind {@code GET /_lance/refs/{index}}. Listing tags and
+ * Action behind {@code GET /_plugins/_lance/refs/{index}}. Listing tags and
  * branches only reads the table's refs, so the name sits under
  * {@code indices:monitor/} and the request implements
  * {@link IndicesRequest}: a security plugin evaluates the privilege per

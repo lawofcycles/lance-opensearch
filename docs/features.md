@@ -13,28 +13,28 @@ Distribution over the cluster is automatic: fragments are spread over every data
 
 ## Attach and namespace surface
 
-- `POST /_lance/namespace` registers a Lance namespace catalog. The plugin polls it for tables and surfaces each as an OpenSearch index; mapping is derived from the Lance Arrow schema on every surface. The body takes a `type` (`directory` when absent, `rest`, `glue`, `iceberg`, `polaris`, or `unity`), a registration `name` that identifies the entry everywhere, and a `config` object of string values handed to the implementation's `initialize`.
+- `POST /_plugins/_lance/namespace` registers a Lance namespace catalog. The plugin polls it for tables and surfaces each as an OpenSearch index; mapping is derived from the Lance Arrow schema on every surface. The body takes a `type` (`directory` when absent, `rest`, `glue`, `iceberg`, `polaris`, or `unity`), a registration `name` that identifies the entry everywhere, and a `config` object of string values handed to the implementation's `initialize`.
   - `name` is required for every type except `directory`, where it defaults to the path.
   - Unknown `type` returns 400 naming the accepted values; unknown `config` keys pass through to the implementation unvalidated.
 
   A directory namespace registers a filesystem or object-store prefix; `path` is required and is the catalog root:
 
   ```json
-  POST /_lance/namespace
+  POST /_plugins/_lance/namespace
   {"path": "/data/lance"}
   ```
 
   A REST namespace registers a Lance Namespace REST catalog through the `RestNamespace` client. The root and everything else the client reads come from `config`: `uri` (required), optional `delimiter`, and `header.*` entries for HTTP headers such as a bearer credential:
 
   ```json
-  POST /_lance/namespace
+  POST /_plugins/_lance/namespace
   {"type": "rest", "name": "catalog-a", "config": {"uri": "https://catalog.example.com", "header.Authorization": "Bearer ..."}}
   ```
 
   A Glue namespace registers an AWS Glue Data Catalog. `config` carries the property names the Glue implementation reads: `region`, optional `endpoint`, `catalog_id`, `root`, and the static credential keys `access_key_id` / `secret_access_key` / `session_token`. Tables inside every Glue database whose `table_type` is `lance` surface under their table name:
 
   ```json
-  POST /_lance/namespace
+  POST /_plugins/_lance/namespace
   {"type": "glue", "name": "glue-tokyo", "config": {"region": "ap-northeast-1", "catalog_id": "123456789012", "root": "s3://bucket/prefix"}}
   ```
 
@@ -55,14 +55,14 @@ Distribution over the cluster is automatic: fragments are spread over every data
   - `max_namespace_depth`: how many namespace levels below the warehouse the poll descends, default 2.
 
   ```json
-  POST /_lance/namespace
+  POST /_plugins/_lance/namespace
   {"type": "iceberg", "name": "ice-a", "config": {"endpoint": "https://catalog.example.com", "warehouse": "wh", "auth_token": "..."}}
   ```
 
   A Polaris namespace registers an Apache Polaris server's generic-table catalog, which speaks the Iceberg REST namespace protocol with Polaris's generic-tables endpoints. `config` carries `endpoint` (required; the server root, the client appends `/api/catalog`), `auth_token`, `connect_timeout` / `read_timeout` / `max_retries`, and the plugin's `warehouse` (required; the Polaris catalog name) and `max_namespace_depth`:
 
   ```json
-  POST /_lance/namespace
+  POST /_plugins/_lance/namespace
   {"type": "polaris", "name": "pol-a", "config": {"endpoint": "https://polaris.example.com", "warehouse": "mycatalog", "auth_token": "..."}}
   ```
 
@@ -76,32 +76,32 @@ Distribution over the cluster is automatic: fragments are spread over every data
   - `storage.*`: entries forwarded as storage properties.
 
   ```json
-  POST /_lance/namespace
+  POST /_plugins/_lance/namespace
   {"type": "unity", "name": "uni-a", "config": {"endpoint": "https://unity.example.com", "catalog": "main", "auth_token": "..."}}
   ```
 
 - For the catalog types whose tables live inside nested namespaces, the poll walks the namespace tree depth-first from the registration's root (the `warehouse` for `iceberg` and `polaris`, the catalog root otherwise), collecting the tables of every namespace that answers a table listing, down to `config.max_namespace_depth` levels.
   - The default of 2 is enough for Glue databases, one namespace level under an Iceberg warehouse, and Unity's `catalog.schema`. Deeper trees need a higher `max_namespace_depth`.
   - Tables with the same name in different namespaces collide on the index name; the first one surfaced wins and the poll logs the skip.
-- Config values whose key contains `secret`, `password`, `token`, `key`, `authorization`, or `credential` (case-insensitive) are accepted and handed to the implementation intact, but never leave the node readable: `GET /_lance/namespace`, the cluster state API, and every log line show them as `***`.
-  - The namespace's `storage_options` follow the same rule in the cluster state API (`GET _cluster/state/metadata`, custom `lance.namespaces`) and in log lines; `GET /_lance/namespace` does not list storage options at all.
+- Config values whose key contains `secret`, `password`, `token`, `key`, `authorization`, or `credential` (case-insensitive) are accepted and handed to the implementation intact, but never leave the node readable: `GET /_plugins/_lance/namespace`, the cluster state API, and every log line show them as `***`.
+  - The namespace's `storage_options` follow the same rule in the cluster state API (`GET _cluster/state/metadata`, custom `lance.namespaces`) and in log lines; `GET /_plugins/_lance/namespace` does not list storage options at all.
   - Only the gateway-persisted cluster state keeps the raw values, so the catalogs re-initialise and their tables reopen after a full cluster restart.
-- A catalog whose `initialize` or listing fails (bad credentials, unreachable endpoint) is kept as a registration, warned about once, and retried on every poll; `GET /_lance/namespace` shows it as `"status": "unavailable"` with the error message until a poll succeeds.
+- A catalog whose `initialize` or listing fails (bad credentials, unreachable endpoint) is kept as a registration, warned about once, and retried on every poll; `GET /_plugins/_lance/namespace` shows it as `"status": "unavailable"` with the error message until a poll succeeds.
 - For every type except `directory`, each table's location comes from the catalog's `describeTable` and is checked against `lance.allowed_table_roots` before the table surfaces (the register call names no path the allowlist could gate up front); a directory registration checks its root at register time.
-- `POST /_lance/attach` attaches a single Lance table URI directly. The request can be sent to any node: it is forwarded to the elected cluster manager, which opens the table and creates the index; the node that starts the index's shard keeps it in step with the table from then on (see [Follow-forward and version pinning](#follow-forward-and-version-pinning)).
+- `POST /_plugins/_lance/attach` attaches a single Lance table URI directly. The request can be sent to any node: it is forwarded to the elected cluster manager, which opens the table and creates the index; the node that starts the index's shard keeps it in step with the table from then on (see [Follow-forward and version pinning](#follow-forward-and-version-pinning)).
   - Idempotent: a repeated call for the same URI returns `already_attached: true`; a name clash with a non-Lance index or a Lance index for a different table returns 409.
   - The body takes either `"version": N` (fixed pin) or `"tag": "name"` (follow a Lance tag); both together return 400, and an unknown tag returns 400 with Lance's message.
 - A table with more physical rows than one Lucene reader may hold (`IndexWriter.MAX_DOCS`, 2,147,483,519) attaches too; the response then carries `lucene_bound_exceeded: true` and the manager logs one WARN naming the rows the shard reader holds and the fragment groups the fan-out cuts. Searches, `_count` and GET read every row (see [Tables above the Lucene document bound](#tables-above-the-lucene-document-bound)); only a table whose single fragment is above the bound is refused with 400, because no reader can hold that fragment.
-- `GET /_lance/refs/{index}` lists the tags (`name`, `version`) and branches (`name`) of the Lance table behind an index: `{"index": ..., "table": ..., "tags": [...], "branches": [...]}`. Unknown index returns 404, a non-Lance index 400.
-- `GET /_lance/namespace` lists the registrations: one object per entry with `name`, `type`, `path` (directory only), the redacted `config`, and `status` (`available`; `unavailable` with `error` when the catalog failed to initialise or list; `partial` with `error` when the last poll listed the catalog but a subnamespace refused its listing, so the tables below it are not surfaced).
-- `POST /_lance/namespace/tables {"name": "..."}` returns the table names the poll would surface from a registered namespace (`path` still works as the identifier for directory registrations). Read-only preview, useful for spotting a table the poll skipped due to a name clash. Unknown identifiers return 404.
-- `POST /_lance/namespace/_poll` runs one catalog listing cycle now on the elected cluster manager instead of waiting for the cadence; `?name=<registration>` (a name, or a directory registration's path) limits it to one registration. Idempotent: a table whose index exists is neither surfaced nor skipped. The answer names what the cycle did:
+- `GET /_plugins/_lance/refs/{index}` lists the tags (`name`, `version`) and branches (`name`) of the Lance table behind an index: `{"index": ..., "table": ..., "tags": [...], "branches": [...]}`. Unknown index returns 404, a non-Lance index 400.
+- `GET /_plugins/_lance/namespace` lists the registrations: one object per entry with `name`, `type`, `path` (directory only), the redacted `config`, and `status` (`available`; `unavailable` with `error` when the catalog failed to initialise or list; `partial` with `error` when the last poll listed the catalog but a subnamespace refused its listing, so the tables below it are not surfaced).
+- `POST /_plugins/_lance/namespace/tables {"name": "..."}` returns the table names the poll would surface from a registered namespace (`path` still works as the identifier for directory registrations). Read-only preview, useful for spotting a table the poll skipped due to a name clash. Unknown identifiers return 404.
+- `POST /_plugins/_lance/namespace/_poll` runs one catalog listing cycle now on the elected cluster manager instead of waiting for the cadence; `?name=<registration>` (a name, or a directory registration's path) limits it to one registration. Idempotent: a table whose index exists is neither surfaced nor skipped. The answer names what the cycle did:
   - `surfaced`: the indexes whose CreateIndex was acknowledged.
   - `skipped`: one entry per table left alone, with `namespace`, `table`, `index` and the `reason`: a name collision with an index the table does not back, a location outside `lance.allowed_table_roots`, a name deleted within the resurface grace, a failed create.
   - `unavailable`: registrations whose listing failed, with the error.
   - `partial`: registrations whose listing succeeded but could not descend into one of their subnamespaces (credentials that do not cover a Glue database or an Iceberg namespace), with the first such failure. The tables below that subnamespace are not surfaced; the manager logs the refusal at WARN on every poll.
-- `DELETE /_lance/namespace {"name": "..."}` stops polling that namespace (`path` also identifies a directory registration). Already-surfaced indexes stay in place; delete them separately if the tables should disappear.
-- `POST /_lance/build_indexes/{index}` triggers Lance-side FTS / scalar / vector index builds from OpenSearch. Automatic builds happen for tables at or under `lance.builder.max_rows` (default 1,000,000 rows); larger tables use this explicit endpoint.
+- `DELETE /_plugins/_lance/namespace {"name": "..."}` stops polling that namespace (`path` also identifies a directory registration). Already-surfaced indexes stay in place; delete them separately if the tables should disappear.
+- `POST /_plugins/_lance/build_indexes/{index}` triggers Lance-side FTS / scalar / vector index builds from OpenSearch. Automatic builds happen for tables at or under `lance.builder.max_rows` (default 1,000,000 rows); larger tables use this explicit endpoint.
   - `fts_columns`, `tokenizer` and `with_position` create inverted indexes on Utf8 columns that have none yet (see [Full-text search](#full-text-search)).
   - Without a preference a scalar column gets a BTree index and a vector column an IVF_PQ index; an `indexes` object on the attach body or on this endpoint's body selects other types per column (see [Index type selection](#index-type-selection)).
   - The response reports every target column under one of three keys, each split by index kind (`fts`, `scalar`, `vector`).
@@ -114,8 +114,8 @@ Distribution over the cluster is automatic: fragments are spread over every data
   - `node_local` keeps the source read-only: every data node shallow-clones the table into `<data path>/lance-local/<index name>/` (`Dataset.shallowClone`, metadata only, the data files stay in the source), builds the indexes into its clone, and serves all of its reads (search, GET, aggregations) from the clone.
   - The build fans out to every data node; the response carries the merged `built` / `skipped` / `failed` lists plus a `nodes` object with each node's own outcome under its node id (`{"error": "..."}` when a node's leg failed outright). The security action name of the fan-out leg is `indices:admin/lance/build_indexes[nodes]`; grant `indices:admin/lance/build_indexes*` to cover both.
   - A first FTS build on a `keyword` column flips it to `lance_text`. PutMapping refuses that type change, so the build action rebuilds the OpenSearch index (delete, then re-create with the same settings and the new mapping), the same way the freshness check handles the flip. The clone directories are keyed by index name and survive the rebuild.
-  - When the source advances a version, each node re-creates its clone at the new version on the next refresh; the clone inherits whatever indexes the source itself carries, and indexes that only existed in the previous clone need another `POST /_lance/build_indexes` run.
-  - `GET /_lance/stats` reports every clone under `local_clones` per node: `{"resolution_failures": F, "<index>": {"local_clone_bytes": N, "source_version": V, "resolution_failures": F}}`. `resolution_failures` counts the reads whose clone could not be resolved since the node started, over every index and per index; each such read failed its request with a 500 rather than reading the source. Deleting the index removes the clone directories on every node.
+  - When the source advances a version, each node re-creates its clone at the new version on the next refresh; the clone inherits whatever indexes the source itself carries, and indexes that only existed in the previous clone need another `POST /_plugins/_lance/build_indexes` run.
+  - `GET /_plugins/_lance/stats` reports every clone under `local_clones` per node: `{"resolution_failures": F, "<index>": {"local_clone_bytes": N, "source_version": V, "resolution_failures": F}}`. `resolution_failures` counts the reads whose clone could not be resolved since the node started, over every index and per index; each such read failed its request with a 500 rather than reading the source. Deleting the index removes the clone directories on every node.
   - Cross-node build coordination is out of scope: a node that has not built yet answers an FTS query with the same 400 the plugin gives for a column without an inverted index.
 - `lance.namespace.poll_cadence` (node setting, default 10s) is the cadence of both background jobs: the catalog listing cycle on the elected cluster manager, and the freshness check of every Lance-backed index on the node that holds its shard. The manager lists catalogs and creates indexes; it opens no table it is not about to surface.
 - Freshness runs on the node holding the shard. Every started Lance-backed shard registers with that node's freshness service (a Lance-backed index has one shard and no replica, so exactly one node checks each index) and is checked at the cadence.
@@ -125,27 +125,27 @@ Distribution over the cluster is automatic: fragments are spread over every data
   - The first check after a shard starts derives the mapping even when the version did not move, so a table that changed while no node held the shard (a node restart, a relocation) is caught up; the comparison keeps that check from sending an update the index does not need.
   - A pinned index (`index.lance.version`) is never checked. A `node_local` index only has its reader advanced; the build action maintains its mapping from the clones.
   - The table path, `index.lance.tag` and `index.lance.storage_options.*` come from the index settings, so nothing needs to be re-registered or re-attached after a restart or a failover.
-- `POST /{index}/_lance/sync` runs the freshness check of one index now, on the node holding its shard (the request is routed like a single shard read and can be sent to any node). Idempotent and safe to call repeatedly: a check that finds the shard at the table's version does nothing.
+- `POST /_plugins/_lance/sync/{index}` runs the freshness check of one index now, on the node holding its shard (the request is routed like a single shard read and can be sent to any node). Idempotent and safe to call repeatedly: a check that finds the shard at the table's version does nothing.
   - The answer carries `checked` (false with a `reason` for a pinned index), `moved`, `served_version`, `target_version`, `mapping_changed` and `rebuilt` (a keyword to `lance_text` flip recreated the index).
   - Only when the check sent a mapping update the cluster manager refused, it also carries `mapping_error` with the refusal's message; `mapping_changed` is then false, the mapping stayed as it was.
-- `GET /_lance/stats` reports the checks per node under `freshness`: `tracked` (indexes this node checks), `checks`, `moves` (checks that found another version), `mapping_updates`, `mapping_unchanged` (derivations whose mapping equalled the current one), `rebuilds`, `failures` (checks that threw, mapping updates the cluster manager refused, and schema drift steps that could not read or update the mapping, each also logged at WARN), `last_check_millis` and `mapping_errors`. A node that holds no Lance-backed shard, the cluster manager in a cluster with dedicated managers for instance, reports zero checks.
+- `GET /_plugins/_lance/stats` reports the checks per node under `freshness`: `tracked` (indexes this node checks), `checks`, `moves` (checks that found another version), `mapping_updates`, `mapping_unchanged` (derivations whose mapping equalled the current one), `rebuilds`, `failures` (checks that threw, mapping updates the cluster manager refused, and schema drift steps that could not read or update the mapping, each also logged at WARN), `last_check_millis` and `mapping_errors`. A node that holds no Lance-backed shard, the cluster manager in a cluster with dedicated managers for instance, reports zero checks.
   - `mapping_errors` is per index, the message of the last mapping update the cluster manager refused. The entry goes away when a mapping update for that index is acknowledged or the index is rebuilt, when a check at another version than the refused one finds its derived mapping already in place, or when the shard leaves the node; a check that finds nothing to derive because the version stood still leaves it in place.
 - Resurface guard: when an operator runs `DELETE /{index}` on a Lance-backed index, the poll cycle honours that deletion for `lance.namespace.resurface_guard_grace` (default 1 hour, node-scoped dynamic). Once the grace expires the poll recreates the index if the underlying Lance table is still there. Set to `0` to disable the guard entirely.
 
 ### Authorization
 
-Every `/_lance/*` endpoint runs through a transport action, so a security plugin evaluates the caller before the plugin opens a table, probes a path, or lists anything. Grant these action names to roles:
+Every `/_plugins/_lance/*` endpoint runs through a transport action, so a security plugin evaluates the caller before the plugin opens a table, probes a path, or lists anything. Grant these action names to roles:
 
-- `cluster:admin/lance/attach` for `POST /_lance/attach` (operator roles that may create Lance-backed indexes). The internal create-index call runs under a stashed thread context with the plugin's internal header, so the role is expected not to need `indices:admin/create` in addition; this is still to be confirmed with the security plugin installed.
-- `cluster:admin/lance/namespace/update` for `POST` / `DELETE /_lance/namespace` (the same operator roles).
-- `indices:admin/lance/build_indexes` as an index-level permission for `POST /_lance/build_indexes/{index}` (roles that own the Lance table behind that index; the build writes into the table). The refresh that follows the build runs as the caller, so the role also needs `indices:admin/refresh` on the index. The mapping update a `node_local` build applies, and the index rebuild the keyword to lance_text flip triggers, run under the plugin's internal context, so the caller needs no mapping, delete or create privileges for them.
-- `indices:monitor/lance/refs` as an index-level permission for `GET /_lance/refs/{index}` (read-only roles; it reveals tag and branch names).
-- `indices:monitor/lance/explain` as an index-level permission for `GET /{index}/_lance/explain`. Grant it like `indices:admin/mappings/get`: like `GET _mapping`, the endpoint resolves field names against the index's full schema and does not apply field level security.
+- `cluster:admin/lance/attach` for `POST /_plugins/_lance/attach` (operator roles that may create Lance-backed indexes). The internal create-index call runs under a stashed thread context with the plugin's internal header, so the role is expected not to need `indices:admin/create` in addition; this is still to be confirmed with the security plugin installed.
+- `cluster:admin/lance/namespace/update` for `POST` / `DELETE /_plugins/_lance/namespace` (the same operator roles).
+- `indices:admin/lance/build_indexes` as an index-level permission for `POST /_plugins/_lance/build_indexes/{index}` (roles that own the Lance table behind that index; the build writes into the table). The refresh that follows the build runs as the caller, so the role also needs `indices:admin/refresh` on the index. The mapping update a `node_local` build applies, and the index rebuild the keyword to lance_text flip triggers, run under the plugin's internal context, so the caller needs no mapping, delete or create privileges for them.
+- `indices:monitor/lance/refs` as an index-level permission for `GET /_plugins/_lance/refs/{index}` (read-only roles; it reveals tag and branch names).
+- `indices:monitor/lance/explain` as an index-level permission for `GET /_plugins/_lance/explain/{index}`. Grant it like `indices:admin/mappings/get`: like `GET _mapping`, the endpoint resolves field names against the index's full schema and does not apply field level security.
   - The response carries the index name, the route, the logical and physical plan strings, the per node plan the coordinator would ship and the refinements a data node could apply; the strings include the column names referenced by the search body, the Lance SQL of its filters and the aggregate specs pushed into the Lance scan. The response shape is described under [Query plan (preview)](#query-plan-preview).
-- `cluster:admin/lance/namespace/poll` for `POST /_lance/namespace/_poll` (the same operator roles as the register call; the cycle creates indexes).
-- `indices:admin/lance/sync` as an index-level permission for `POST /{index}/_lance/sync` (roles that administer the index; the check may update its mapping and settings, both under the plugin's internal context).
-- `cluster:monitor/lance/namespace` for `GET /_lance/namespace` and `POST /_lance/namespace/tables` (read-only roles; it reveals registered paths and table names).
-- `cluster:monitor/lance/stats` for `GET /_lance/stats` (read-only roles; it reveals cache counters and byte totals, no table content).
+- `cluster:admin/lance/namespace/poll` for `POST /_plugins/_lance/namespace/_poll` (the same operator roles as the register call; the cycle creates indexes).
+- `indices:admin/lance/sync` as an index-level permission for `POST /_plugins/_lance/sync/{index}` (roles that administer the index; the check may update its mapping and settings, both under the plugin's internal context).
+- `cluster:monitor/lance/namespace` for `GET /_plugins/_lance/namespace` and `POST /_plugins/_lance/namespace/tables` (read-only roles; it reveals registered paths and table names).
+- `cluster:monitor/lance/stats` for `GET /_plugins/_lance/stats` (read-only roles; it reveals cache counters and byte totals, no table content).
 - `cluster:admin/lance/statistics/prefetch` is sent by the freshness check of the node holding a shard to every data node when the table moved to a new version, under the plugin's internal context. No REST endpoint issues it and no role needs it.
 
 ## Query shapes
@@ -154,7 +154,7 @@ Full-text, vector, filter, and hit-shape queries all run on the fragment executo
 
 ### Query DSL matrix
 
-Every stock query type runs on the fragment path; what differs is how the executors evaluate it. The coordinator translates the `query` clause once ([query-plan.md](query-plan.md)) and `GET /<index>/_lance/explain` names the outcome. `LanceQueryDSLIT` runs every row of the table below on both paths and compares the answers.
+Every stock query type runs on the fragment path; what differs is how the executors evaluate it. The coordinator translates the `query` clause once ([query-plan.md](query-plan.md)) and `GET /_plugins/_lance/explain/<index>` names the outcome. `LanceQueryDSLIT` runs every row of the table below on both paths and compares the answers.
 
 - A query the translator spells as a predicate travels as Lance SQL (and Substrait bytes where the planner chose them) under `fragment_plan.filter_sql`. The Lance scan evaluates it, counts it in a scan that returns no rows, orders and cuts a sorted page or feeds a pushed aggregate from it.
 - A full text clause travels under `fragment_plan.lance_clause` and the Lance inverted index answers it.
@@ -196,7 +196,7 @@ Notes per row:
 ### Full-text search
 
 - Stock OpenSearch syntax on a `lance_text` field is BM25 scored by Lance's inverted index: `match` (with `operator`, `fuzziness`, `prefix_length`, `max_expansions`, `boost`, `_name`), `match_phrase` (with `slop`), `multi_match` of type `best_fields` (the default, with per field boosts such as `title^2` and a shared `operator`), and `bool` around them.
-  - The coordinator rewrites each such clause into the `lance_*` clause below with the same parameters before it plans the request, per index from its mapping, and ships the rewritten query to the executors, so a body in stock syntax plans, runs and scores exactly as the same body written with the `lance_*` queries. `GET /<index>/_lance/explain` shows the rewritten clause under `lance_clause`.
+  - The coordinator rewrites each such clause into the `lance_*` clause below with the same parameters before it plans the request, per index from its mapping, and ships the rewritten query to the executors, so a body in stock syntax plans, runs and scores exactly as the same body written with the `lance_*` queries. `GET /_plugins/_lance/explain/<index>` shows the rewritten clause under `lance_clause`.
   - The whole query text reaches Lance as one query and Lance tokenises it with the FTS index's analyzer.
   - `fuzziness: AUTO` becomes the edit distance OpenSearch derives from the length of the whole text (0 under three characters, 1 under six, else 2).
   - Ignored, no Lance counterpart: `minimum_should_match`, `zero_terms_query`, `lenient`, `fuzzy_transpositions` and `fuzzy_rewrite` on `match` / `multi_match`.
@@ -224,10 +224,10 @@ Notes per row:
 
 #### Building an FTS index and choosing its tokenizer
 
-- A Utf8 column is `lance_text` only when the Lance table already carries an inverted index on it; otherwise it is `keyword`, and a plain `POST /_lance/build_indexes/{index}` gives it a BTree scalar index. To create the inverted index from OpenSearch, name the column in `fts_columns`; the next freshness check re-derives the mapping and rebuilds the index as `lance_text`:
+- A Utf8 column is `lance_text` only when the Lance table already carries an inverted index on it; otherwise it is `keyword`, and a plain `POST /_plugins/_lance/build_indexes/{index}` gives it a BTree scalar index. To create the inverted index from OpenSearch, name the column in `fts_columns`; the next freshness check re-derives the mapping and rebuilds the index as `lance_text`:
 
   ```json
-  POST /_lance/build_indexes/demo
+  POST /_plugins/_lance/build_indexes/demo
   { "fts_columns": ["text"], "tokenizer": "lindera/ipadic", "with_position": true }
   ```
 
@@ -261,7 +261,7 @@ Notes per row:
 
 ### Hit shape
 
-- `_source` and `_id` are synthesised on the fly from Lance rows, taken per request with one `_rowaddr IN (...)` scan per leaf that holds a hit; the leaves of one executor are taken side by side, up to `lance.fragment_path.parallelism` at a time. Each data node keeps the cells it took in its [fetch cache](#fetch-cache), so a row the node fetched for an earlier request is rendered without a take while the table stays at its version; `GET /_lance/stats` counts and times the takes under `fetch` and the cache under `fetch_cache` (see [Cache statistics](#cache-statistics)). The body's `_source` element (`false`, an includes list, an includes / excludes object) is applied by OpenSearch's stock `FetchSourcePhase` over the synthesised source.
+- `_source` and `_id` are synthesised on the fly from Lance rows, taken per request with one `_rowaddr IN (...)` scan per leaf that holds a hit; the leaves of one executor are taken side by side, up to `lance.fragment_path.parallelism` at a time. Each data node keeps the cells it took in its [fetch cache](#fetch-cache), so a row the node fetched for an earlier request is rendered without a take while the table stays at its version; `GET /_plugins/_lance/stats` counts and times the takes under `fetch` and the cache under `fetch_cache` (see [Cache statistics](#cache-statistics)). The body's `_source` element (`false`, an includes list, an includes / excludes object) is applied by OpenSearch's stock `FetchSourcePhase` over the synthesised source.
   - The take reads only the columns the body renders. `_source: false` without `fields` reads the primary key column alone, and nothing at all on a table without a declared key or under `stored_fields: _none_`. An includes list reads the columns its patterns match plus the key; an excludes list drops the columns its patterns name. `fields` adds the columns its patterns match whatever the `_source` filter says; `docvalue_fields` adds none, because it reads doc values. A struct or nested column is read whole when any of its children is asked for, and the fetch phase filters the children. Without a `_source` element every surfaced column is read.
 - `stored_fields`, `docvalue_fields`, `fields` and `"explain": true` are rendered by the same stock fetch sub phases an ordinary index runs, over the executor's fragment readers.
   - `stored_fields: _none_` returns hits without `_id` or `_source`; a named `stored_fields` list yields `_id` (and `_source` when named), since the fragment readers store nothing else.
@@ -302,7 +302,7 @@ Notes per row:
 - `_count` runs on the fragment path (it is a `_search` with `size: 0` and `track_total_hits: true`), so it reads the same manifest version and takes the same count paths as `_search`; for a scalar filter that is one native Lance count over the node's fragments, for an FTS query one count-only Lance scan over the inverted index.
 - `"profile": true` renders `profile.lance.nodes.<node id>` with what each executor spent on the request. The fragment path runs no shard, so the stock `profile.shards` is not rendered. An answer served from the result cache ran on no executor and reports `profile.lance.cached: true` instead.
   - `query.millis` is the time to collect the page, the count and the aggregations. `query.fts_scans` is the number of Lance full text scans the request ran on that node, the hits scans of its full text clauses and the count only scans behind `hits.total` together; a bounded full text page reports 1, one with `track_total_hits: true` reports 2. `fetch.millis` is the time to materialise the rows behind the hits.
-  - `fetch.take_count`, `fetch.take_rows`, `fetch.take_columns` and `fetch.take_millis` count the `_rowaddr IN (...)` take scans the request issued on that node in either phase: the stored fields of a page are taken in the fetch phase, the sort column of a sparse full text or vector hit set in the query phase. `take_columns` is the number of columns the scans projected, summed over the scans; divided by `take_count` it is the width of one take, which the body's `_source` and `fields` decide (see [Hit shape](#hit-shape)). A `size: 0` request reports zero takes, and so does a page whose rows the node's [fetch cache](#fetch-cache) held. The same takes are counted node wide under `fetch` in `GET /_lance/stats`.
+  - `fetch.take_count`, `fetch.take_rows`, `fetch.take_columns` and `fetch.take_millis` count the `_rowaddr IN (...)` take scans the request issued on that node in either phase: the stored fields of a page are taken in the fetch phase, the sort column of a sparse full text or vector hit set in the query phase. `take_columns` is the number of columns the scans projected, summed over the scans; divided by `take_count` it is the width of one take, which the body's `_source` and `fields` decide (see [Hit shape](#hit-shape)). A `size: 0` request reports zero takes, and so does a page whose rows the node's [fetch cache](#fetch-cache) held. The same takes are counted node wide under `fetch` in `GET /_plugins/_lance/stats`.
 
 ### Timeout and cancellation
 
@@ -323,7 +323,7 @@ Seven kinds are supported: `type: date` on an epoch millis integer column, `type
 
 The attach body and the namespace register body accept an `indexes` clause next to `overrides`, selecting the Lance index type the build creates per column with the `params` each type takes. Without it a scalar column gets a BTree index and a vector column an IVF_PQ index. [mapping-overrides.md](mapping-overrides.md#index-type-selection) has the type table, the training minimums and where the preference persists.
 
-The scalar types are `btree`, `bitmap`, `zonemap`, `bloomfilter`, `ngram`, `labellist` and `none`; the vector types are `ivf_pq`, `ivf_flat`, `ivf_sq`, `ivf_rq`, `ivf_hnsw_pq` and `ivf_hnsw_sq`. `GET /_lance/stats` reports the types present under `indices.<index>.index_types`.
+The scalar types are `btree`, `bitmap`, `zonemap`, `bloomfilter`, `ngram`, `labellist` and `none`; the vector types are `ivf_pq`, `ivf_flat`, `ivf_sq`, `ivf_rq`, `ivf_hnsw_pq` and `ivf_hnsw_sq`. `GET /_plugins/_lance/stats` reports the types present under `indices.<index>.index_types`.
 
 ## Aggregations
 
@@ -335,7 +335,7 @@ The scalar types are `btree`, `bitmap`, `zonemap`, `bloomfilter`, `ngram`, `labe
   - The executors build only the bucket and metric aggregators, and the coordinator's `MergeReducer` calls `InternalAggregations.topLevelReduce` under the final reduce context carrying the request's pipeline tree, the call `SearchPhaseController` makes for an ordinary index. A `cumulative_sum` or `derivative` over a `date_histogram` whose buckets are spread over three data nodes therefore reads the merged sums, not a node's share, and `bucket_sort` / `bucket_selector` cut and drop the merged buckets.
   - The scripts of `bucket_script`, `bucket_selector` and `moving_fn` compile on the coordinator with the node's script service.
   - Core's refusals apply unchanged and before the routing decision (`bucket_sort` without `sort`, `size` or `from`; a `buckets_path` naming an aggregation that does not exist; a `buckets_path` into a single bucket aggregation), as does a script that fails to compile at the reduce (400 with the compiler's message on both paths).
-  - A tree carrying a pipeline is never pushed into the Lance scan; the executors run the aggregators for it and `GET /{index}/_lance/explain` names `pipeline aggregation` under `unplanned`.
+  - A tree carrying a pipeline is never pushed into the Lance scan; the executors run the aggregators for it and `GET /_plugins/_lance/explain/{index}` names `pipeline aggregation` under `unplanned`.
 - All run through OpenSearch's standard aggregator machinery over Lance-backed doc values, except the shapes [aggregations.md](aggregations.md) lists, which the scan computes. The coordinator reduces the per node results with the stock reduce.
   - The sketches of `percentiles` (tdigest) and `cardinality` are merged the way they are merged across shards: their values can differ from a single shard's within the algorithm's error, and `hdr` percentiles and every other listed aggregation are exact.
   - `sampler` and `diversified_sampler` keep `shard_size` documents per collection slice per executor, and `variable_width_histogram` clusters per executor before the coordinator merges the clusters (see [limitations.md](limitations.md)).
@@ -357,7 +357,7 @@ A `size: 0` request over `match_all` or a scalar filter whose tree is metrics on
 
 ## Query plan (preview)
 
-- `GET /{index}/_lance/explain` with a search body answers what the fragment coordinator would execute for that body against the index, without executing anything, and whether a search with it would be served from the [result cache](#result-cache) on a repeat (`cacheable`, `cacheable_reason`). The endpoint only reports; search behaviour is unchanged.
+- `GET /_plugins/_lance/explain/{index}` with a search body answers what the fragment coordinator would execute for that body against the index, without executing anything, and whether a search with it would be served from the [result cache](#result-cache) on a repeat (`cacheable`, `cacheable_reason`). The endpoint only reports; search behaviour is unchanged.
   - The body is planned through the same entry point the coordinator plans a search with: the same shard free query rewrite, one translation of the whole body, one Volcano run with the same cost inputs (the cluster's data node count, the storage kind of the table URI, this node's CPUs, and the current `lance.aggregation.pushdown_parallelism`, `lance.fragment_path.slices`, `lance.aggregation.pushdown` and `lance.aggregation.pushdown_max_groups`), and the answer renders what that run produced.
 - The response is `{"index": ..., "route": ..., "logical": "...", "physical": "...", "fragment_plan": {...}, "unplanned": "...", "refinements_possible": [...], "traits": {...}}`. [query-plan.md](query-plan.md) is the field by field reference with an example.
   - `route` is `fragment`, or `unsupported` when the body carries `suggest` or `highlight`: no plan answers those; a `_search` refuses them with 400, explain answers 200 with the same message under `unplanned` and nothing else (see [limitations.md](limitations.md#search-body-elements-the-plugin-refuses)).
@@ -369,7 +369,7 @@ A `size: 0` request over `match_all` or a scalar filter whose tree is metrics on
   - For an aggregation over a table of a million rows or more the two forms are priced by a latency model fitted to the measured benchmark shapes, so the physical plan depends on the table size, the data node count and the storage kind; below that, and for every hits tree, the pushed form wins whenever a rule folds the tree (a `cardinality` metric excepted).
   - `lance.aggregation.pushdown: false` and a group estimate above `lance.aggregation.pushdown_max_groups` are cost inputs that price the pushed scan as infinite, so the Lucene operator answers with nothing `unplanned`.
   - The coordinator's distribution (`FanOutExec`, `MergeExec`) is a pair of plan operators too.
-- The coordinator plans every target once and ships the per node subtree as a `FragmentPlan`; the data nodes run no planner and may only downgrade a pushed operation to Lucene, for one of four reasons counted under `plan.refinements` in `GET /_lance/stats` (`security_wrapper`, `sort_field_type`, `aggregate_resolution`, `column_store_warm`). The order the reasons fire in, and why their counters do not add up, is in [query-plan.md](query-plan.md#refinements).
+- The coordinator plans every target once and ships the per node subtree as a `FragmentPlan`; the data nodes run no planner and may only downgrade a pushed operation to Lucene, for one of four reasons counted under `plan.refinements` in `GET /_plugins/_lance/stats` (`security_wrapper`, `sort_field_type`, `aggregate_resolution`, `column_store_warm`). The order the reasons fire in, and why their counters do not add up, is in [query-plan.md](query-plan.md#refinements).
   - `plan.executed` next to it counts the requests the Lance scan and Lucene answered and `plan.pruned` the fragments the executors skipped under [fragment pruning](#fragment-pruning).
   - `plan.statistics.failures` counts the table statistics collections that threw on the node (the requests planned without statistics until the next collection works; the `WARN` line `table statistics of <table>@v<version> could not be collected` names the cause) and `plan.pruned.zone_map_failures` the requests the node coordinated whose zone maps could not be read (planned without pruning, every fragment scanned). Both answers stay correct; the counters are what shows the plan quality dropped.
 - The per node plan and the explain response are wire formats internal to the plugin, as is every other message the plugin sends between nodes (the fragment request and response, the per node stats and build messages, the sync, poll, namespace update and attach messages). Each opens with a version marker and appends the fields of every later version as a block, so a node of the previous plugin version reads what it knows and steps over the rest, and a rolling upgrade between the current and the previous plugin version keeps the cluster answering.
@@ -383,7 +383,7 @@ A `size: 0` request over `match_all` or a scalar filter whose tree is metrics on
 
 - When a column the query filters on carries a Lance zone map index (`"scalar": "zonemap"` under `indexes` at attach or namespace register, see [Index type selection](#index-type-selection), or a zone map another writer built on the table), the coordinator checks the query predicate against the zone map's per zone minimum, maximum and null count before it ships the plan, and lists the fragments no matching row can come from under `excluded_fragment_ids` of the `FragmentPlan`.
   - Each data node leaves those fragments out of every scan of the request: the fragment reader, the pushed page or aggregate scan, the full text or `lance_knn` prefilter, and the count.
-  - `GET /{index}/_lance/explain` shows the list as `fragment_plan.excluded_fragment_ids`, and `GET /_lance/stats` counts the fragments each node skipped under `plan.pruned.fragments`.
+  - `GET /_plugins/_lance/explain/{index}` shows the list as `fragment_plan.excluded_fragment_ids`, and `GET /_plugins/_lance/stats` counts the fragments each node skipped under `plan.pruned.fragments`.
 - Pruning reads `term`, `terms`, `range` and `exists` clauses (and the `bool` combinations of them: `must` / `filter` exclude what any clause excludes, `should` what every clause excludes, `must_not` is never read), on integer, float, boolean, keyword, `date` and timestamp columns and on struct children.
   - A fragment is excluded only when every one of its zones is proven empty; a fragment the zone map does not cover (rows appended after the index was built), a zone with unknown bounds, a `NaN` bound, a negated clause, a pattern query and a `post_filter` all keep the fragment.
   - Excluding a fragment never changes a result; it changes which fragments the executors open, so the benefit shows on tables whose data is sorted or clustered on the filtered column (a time ordered `timestamp`, a monotonic id), where a range touches a few fragments out of many. Pruning applies to whatever physical form the planner chose for the request.
@@ -403,11 +403,11 @@ A `size: 0` request over `match_all` or a scalar filter whose tree is metrics on
 
 ## Follow-forward and version pinning
 
-- The plugin follows the Lance manifest forward automatically. When Lance advances to a new version, the freshness check on the node holding the shard notices (or `POST /{index}/_lance/sync` runs it now), `LanceReaderManager` swaps in a fresh reader, and the next `_search` sees the new fragments. No index close, no shard reallocation, no request downtime.
+- The plugin follows the Lance manifest forward automatically. When Lance advances to a new version, the freshness check on the node holding the shard notices (or `POST /_plugins/_lance/sync/{index}` runs it now), `LanceReaderManager` swaps in a fresh reader, and the next `_search` sees the new fragments. No index close, no shard reallocation, no request downtime.
 - Attach also accepts `"version": N` in the body to pin an index to a specific manifest version. Pinned indices are never checked (they must never advance, by design).
 - Attach accepts `"tag": "name"` as a moving pin: the index reads the version the tag points at, stored in `index.lance.tag`. Every check resolves the tag again and refreshes the reader when the tag has been moved on the Lance side (forwards or backwards).
   - `index.lance.tag` is a dynamic setting, so an operator can repoint the index at another tag on the fly with `PUT /{index}/_settings` (an empty string reverts to latest-follow); the next check after the update swaps the reader onto the new tag's version.
-  - Branches can only be listed (`GET /_lance/refs/{index}`); the Lance Java SDK has no branch checkout.
+  - Branches can only be listed (`GET /_plugins/_lance/refs/{index}`); the Lance Java SDK has no branch checkout.
 - `_search` (fragment path) and `GET /_doc/{id}` (engine path) do not share a freshness view. Fragment path reads the latest version per query (through the snapshot cache below); engine path advances only with the freshness check. Both read the same snapshot once they are on the same version. See [limitations.md](limitations.md).
 
 ### Schema drift
@@ -416,8 +416,8 @@ Every derived mapping field carries the Lance immutable field id and an Arrow ty
 
 - **Rename** (same field id, same Arrow type, new name). The mapping gains the new name with the same derivation, and every `index.lance.overrides` entry keyed by the old name is re-keyed to the new name first, so an operator's `type` / `format` / `fields` rules follow the column.
   - Queries against the old name answer 0 hits: the field type lookup treats a `lance_dropped` field as unmapped, so no Lance SQL ever names the stale column. Query values still parse against the stale mapping type, so for example an ISO date against a stale `epoch_millis` field is still a 400 parse error.
-  - `lance_match` / `lance_knn` against the old name answer 400, and `GET /{index}/_lance/explain` keeps an aggregation on it on the Lucene aggregators and names the rename as `unplanned`: `field [old] was renamed to [new] in the Lance table`.
-  - `GET /_lance/stats` reports every recorded rename under `indices.<index>.renamed_fields` as `{"from": ..., "to": ..., "lance_field_id": N}`, so clients know which field names to move to.
+  - `lance_match` / `lance_knn` against the old name answer 400, and `GET /_plugins/_lance/explain/{index}` keeps an aggregation on it on the Lucene aggregators and names the rename as `unplanned`: `field [old] was renamed to [new] in the Lance table`.
+  - `GET /_plugins/_lance/stats` reports every recorded rename under `indices.<index>.renamed_fields` as `{"from": ..., "to": ..., "lance_field_id": N}`, so clients know which field names to move to.
 - **Reset** (a column's type changed; Lance assigns a new field id when a column is cast). The mapping re-derives with the new type.
   - An override the new type still admits stays in the setting (`type: date` on a column recast from Int64 to Timestamp); one it does not admit is dropped from the setting with one warning naming the column, the override and the new type.
   - When the new mapping type cannot merge over the old one in place (PutMapping refuses the type change), the index is rebuilt (delete plus recreate with the surviving overrides); the Lance table itself is untouched, so no data is lost.
@@ -439,7 +439,7 @@ Test settings, all node scope and dynamic; do not change them on a real node:
 | `lance.test.max_docs_per_reader` | `IndexWriter.MAX_DOCS`, minimum 1 | the bound the coordinator, attach and the engine apply, so the integration tests can exercise the split on a small table. A reader already open keeps its fragments until the next refresh swaps it |
 | `lance.test.index_cache_shard_share` | 0 = use the installed Session's sizing | overrides the index cache shard share the admission gate compares its estimates with (an estimate at or below the share is zero), so the tests can declare a small fixture table's indexes and scans as not fitting the cache |
 | `lance.test.admission_available_memory` | empty = read the kernel's `MemAvailable` | a list of byte sizes the admission gate hands out in place of its available memory readings, one per reading with the last one repeating; while it is set the process resident set is not consulted. The tests script the reading at an admission and at the scan's completion to prove the retained credit |
-| `lance.test.statistics_collect_delay` | `0` | makes every background collection of the planner's table statistics wait this long before it reads the table, so the tests can observe the request that plans without them and the `plan.statistics.pending` and `planned_without` counters of `GET /_lance/stats` |
+| `lance.test.statistics_collect_delay` | `0` | makes every background collection of the planner's table statistics wait this long before it reads the table, so the tests can observe the request that plans without them and the `plan.statistics.pending` and `planned_without` counters of `GET /_plugins/_lance/stats` |
 
 ## Snapshot and column cache
 
@@ -467,7 +467,7 @@ Test settings, all node scope and dynamic; do not change them on a real node:
 
 ### Cache statistics
 
-`GET /_lance/stats` (and `GET /_lance/stats/{nodeId}`, comma separated node ids) reports the cache per node, in the `_nodes` / `cluster_name` / `nodes` envelope of `_nodes/stats`. Read only; there is no API that clears the cache. The action name is `cluster:monitor/lance/stats`. Per node:
+`GET /_plugins/_lance/stats` (and `GET /_plugins/_lance/{node_id}/stats`, comma separated node ids) reports the cache per node, in the `_nodes` / `cluster_name` / `nodes` envelope of `_nodes/stats`. Read only; there is no API that clears the cache. The action name is `cluster:monitor/lance/stats`. Per node:
 
 - `snapshots`: `enabled` (current `lance.cache.enabled`), `count` (snapshots held, referenced or idle), `retired` (held snapshots that were retired but are still leased, most often a shard's previous reader waiting for its last searcher), `dataset_open_count` (tables opened for a request on this node: the snapshot builds, and the open of every request the node coordinates other than a result cache hit on an index pinned to a version), `snapshot_build_count`, `snapshot_hit_count` (acquires served by an existing snapshot). Counters are cumulative since node start.
 - `column_store`: `bytes` (off-heap bytes the store holds), `limit_bytes` (its budget), `entries` (`(snapshot, column, fragment)` slices held), `hits` (column requests answered without a scan), `loads` (scans run to fill slices), `evictions`, `budget_misses` (requests that loaded into heap because the budget could not be met).
@@ -512,8 +512,8 @@ Test settings, all node scope and dynamic; do not change them on a real node:
 
 - The plugin keeps its own result cache on every node that coordinates requests: the reduced answer of a `size: 0` request against one Lance backed index (its aggregations, `hits.total`, `terminated_early`), served again while the table stays at the version it was computed from. The fragment path does not reach OpenSearch's shard request cache (`indices.requests.cache.*`, whose counters stay 0 for a Lance backed index).
   - A dashboard that refreshes the same aggregation body every few seconds fans out and scans the table once per table version instead of once per refresh.
-  - A hit answers in a few milliseconds with a `took` of its own and the same `_shards` envelope; nothing in the body marks it, the `request_cache.hits` counter of `GET /_lance/stats` does.
-  - A hit sends no per node request. What it costs is finding the table version for the key. An index pinned to a version has it in its settings and is looked up before the table is opened, so a hit opens nothing. An index that follows the table opens it to read the manifest, about 1 ms on a local disk and 10 to 15 ms over S3. An index that follows a tag resolves the tag on every request, one open of the latest manifest, and is then looked up like a pinned index, so a hit on it pays that one round trip. The `snapshots.dataset_open_count` counter of the coordinating node in `GET /_lance/stats` counts the open of an index that follows the table and not the tag resolution.
+  - A hit answers in a few milliseconds with a `took` of its own and the same `_shards` envelope; nothing in the body marks it, the `request_cache.hits` counter of `GET /_plugins/_lance/stats` does.
+  - A hit sends no per node request. What it costs is finding the table version for the key. An index pinned to a version has it in its settings and is looked up before the table is opened, so a hit opens nothing. An index that follows the table opens it to read the manifest, about 1 ms on a local disk and 10 to 15 ms over S3. An index that follows a tag resolves the tag on every request, one open of the latest manifest, and is then looked up like a pinned index, so a hit on it pays that one round trip. The `snapshots.dataset_open_count` counter of the coordinating node in `GET /_plugins/_lance/stats` counts the open of an index that follows the table and not the tag resolution.
 - The key is `(index uuid, manifest version, data node ids, canonical body)`.
   - The manifest version is the one the coordinator observes for the request (the latest for an index that follows the table, the pinned or tag version otherwise), so an append, a compaction or a tag move forms a new key and the first request after it computes the answer anew; there is no refresh interval to reason about and nothing to invalidate for freshness.
   - The data node ids are in the key because a `terms` aggregation with a `shard_size` below the number of distinct values reports what the executors kept, and the fragments are assigned to executors by a round robin over the data node list, so a node joining or leaving changes what a request answers.
@@ -528,7 +528,7 @@ Test settings, all node scope and dynamic; do not change them on a real node:
 - The cache is per coordinating node and nothing is shared between nodes: the same body sent to two nodes computes the answer on each and stores it on each.
   - Entries leave the cache least recently used at `lance.request_cache.size`, after `lance.request_cache.expire` when that is set, when their index is deleted (the cache listens to cluster state on every node), and when `lance.request_cache.enabled` is set to `false`.
   - `POST /{index}/_cache/clear` with `request=true` or no cache named at all (the stock endpoint) drops the index's entries: the plugin fans the clear out to every node before the stock action clears the shard caches, so one call clears the entries everywhere.
-- `GET /{index}/_lance/explain` reports `cacheable: true` when a `_search` with the body would be cached on this node, or `cacheable: false` with `cacheable_reason` (`size > 0`, `from > 0`, `dls`, `disabled`). The search's own `request_cache=false` and a target of several indexes are not visible to explain, which takes one index and a body.
+- `GET /_plugins/_lance/explain/{index}` reports `cacheable: true` when a `_search` with the body would be cached on this node, or `cacheable: false` with `cacheable_reason` (`size > 0`, `from > 0`, `dls`, `disabled`). The search's own `request_cache=false` and a target of several indexes are not visible to explain, which takes one index and a body.
 
 | setting | scope | default | dynamic | effect |
 |---|---|---|---|---|
@@ -541,7 +541,7 @@ Test settings, all node scope and dynamic; do not change them on a real node:
 
 - Every data node keeps the cells of the rows it took for the hits of a page (`_id`, `_source`, `fields`), one entry per `(index uuid, manifest version, row address, column)`, in heap. A page whose rows the node took for an earlier request renders them from the cache and issues no `_rowaddr IN (...)` take for them: a dashboard refresh, a step back in a pagination or the same search again costs no storage round trip for its rows.
   - On object storage a take is a round trip of tens of milliseconds and the fetch phase of a `size: 10` page can be more than half of `took`; that share goes on every page after the first.
-  - Nothing in the response marks a served row; `fetch.take_count` in `profile.lance` reads zero for the node and `fetch_cache.rows_served` in `GET /_lance/stats` moves.
+  - Nothing in the response marks a served row; `fetch.take_count` in `profile.lance` reads zero for the node and `fetch_cache.rows_served` in `GET /_plugins/_lance/stats` moves.
 - A Lance fragment is immutable and every write is a new manifest version, so a cell at one version never changes: an entry is valid for as long as its version exists and there is no freshness to reason about. An append, a deletion or a compaction makes the next request key on the new version and take its rows again; the entries of the version that was retired are dropped when its snapshot closes (see [Snapshot and column cache](#snapshot-and-column-cache)), and a deleted index's entries when the deletion reaches the cluster state.
 - The key is per column because every request projects its own columns (see [Hit shape](#hit-shape)).
   - A row whose every projected cell is held is served. A row with some cells held (a request with `_source: false` left the key alone, a later one asks for every column) is taken whole, and the take writes every cell back, so the next request for those columns is served.
@@ -568,11 +568,11 @@ Test settings, all node scope and dynamic; do not change them on a real node:
   - `all` additionally reads every BTree page and every bitmap (`col >= <lowest value of the type>`) and every IVF partition (a probe count above any partition count), full-text indexes being opened as under `metadata`. A table whose index files (full-text excluded) exceed half of the Session index cache capacity is opened only, because its pages would evict each other.
   - `all` is bounded by the cache and never by the admission gate: every BTree page, bitmap and IVF partition the warm-up reads is a cache entry of its own that fits one shard, Lance's `quick_cache` admits each and evicts the least recently used ones once the capacity is reached, and the only transient memory beyond the cache is the pages in flight (up to the CPU count of them), so on a 10B row table `all` costs time and cache churn, not a node. The pages a request needs are still gated when the request loads them.
   - Index types without a warm-up scan (zone map, bloom filter, label list, n-gram) are recorded as skipped.
-- Each index logs one INFO line when it finishes and one WARN line when it fails; the table logs one INFO line. `GET /_lance/stats` reports the same in `warm_up` ([Cache statistics](#cache-statistics)). Deleting the index cancels a pending or running warm-up.
+- Each index logs one INFO line when it finishes and one WARN line when it fails; the table logs one INFO line. `GET /_plugins/_lance/stats` reports the same in `warm_up` ([Cache statistics](#cache-statistics)). Deleting the index cancels a pending or running warm-up.
 - The full-text probe is the one warm-up scan the admission gate judges. Before the probe runs the warm-up estimates it as the gate's `fts` kind does for a one row page (`rows × 52 bytes` plus 24 bytes, zero when the document set fits the shard share). When the estimate exceeds the available memory minus the headroom plus the retained credit, the probe is skipped, not refused: nothing waits for it, and the first full-text query is gated on its own.
   - Why the probe is gated: Lance rebuilds the inverted index's document set for it (a legacy single file index on the open, a partitioned index written without per partition corpus statistics through every partition's document lengths), the allocation the gate exists to keep off a node that cannot hold it.
   - A skipped index is recorded as `skipped` with the figures in `detail` and one WARN line, `skipped the inverted index warm up of [<index>] [<column>]: estimate [X] exceeds available [Y] minus headroom [Z] plus [R] retained by earlier admitted scans`.
-  - An admitted probe is bracketed like a request's scan so the retained pool accounts for what it leaves behind. Either way `GET /_lance/stats` reports the decision under `admission` with `last_source: warm_up`.
+  - An admitted probe is bracketed like a request's scan so the retained pool accounts for what it leaves behind. Either way `GET /_plugins/_lance/stats` reports the decision under `admission` with `last_source: warm_up`.
   - The Lance Java SDK (12.0.0) has no way to open an inverted index without a full-text scan, and every `FullTextQuery` shape takes this path, so a probe that does not fit is skipped rather than replaced.
 
 ## Hybrid search
@@ -582,7 +582,7 @@ Test settings, all node scope and dynamic; do not change them on a real node:
 
 ## Storage options
 
-- Per-table object-store credentials, endpoints, and timeouts are supplied through a `storage_options` map on `POST /_lance/attach` and `POST /_lance/namespace`:
+- Per-table object-store credentials, endpoints, and timeouts are supplied through a `storage_options` map on `POST /_plugins/_lance/attach` and `POST /_plugins/_lance/namespace`:
 
   ```json
   "storage_options": {
@@ -641,7 +641,7 @@ Types not yet surfaced: the geo family. `Utf8` list, `Decimal`, and `FloatingPoi
 - `_source` and GET by id render the column as the array of element objects; a zero-element list renders as `[]`.
 - `inner_hits` is not served: a `nested` query carrying one is refused with 400. The `nested` and `reverse_nested` aggregations run through the aggregators on the fragment executors (the leaf reader carries the parent join they read) and never through the scan.
 - Nested predicates are not pushed down to Lance SQL (DataFusion has no `UNNEST` in a filter), so a `nested` query keeps its filter on the Lucene side: the scan runs unfiltered and Lucene filters, and the Lance sort pushdown is skipped for requests carrying a `nested` query.
-- `GET /_lance/stats` reports the hidden child docs per index as `indices.<index>.nested_docs`, and the attach-time Lucene bound arithmetic counts rows plus nested elements.
+- `GET /_plugins/_lance/stats` reports the hidden child docs per index as `indices.<index>.nested_docs`, and the attach-time Lucene bound arithmetic counts rows plus nested elements.
 
 ## Native memory bounds
 

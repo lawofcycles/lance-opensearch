@@ -22,7 +22,7 @@ import org.opensearch.tasks.Task;
 
 /**
  * Request for {@link LanceAttachAction}: the parsed body of
- * {@code POST /_lance/attach}.
+ * {@code POST /_plugins/_lance/attach}.
  *
  * <p>A {@link ClusterManagerNodeRequest} so the transport action can
  * forward it to the elected cluster manager; the inherited

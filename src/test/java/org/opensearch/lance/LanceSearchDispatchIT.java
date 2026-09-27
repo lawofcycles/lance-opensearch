@@ -41,7 +41,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             String matchAllBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}"));
@@ -113,7 +113,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             // Date-only literals: ids 2 (2024-03-10) and 3 (2024-03-25)
@@ -196,7 +196,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             // 2024-03-01T00:00:00Z = 1709251200000
@@ -256,7 +256,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             // Pruning reads the zone maps out of the table statistics,
             // which the first request of a version plans without.
@@ -355,7 +355,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             Map<String, Long> before = planStatistics();
             long prunedBefore = prunedFragments();
 
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             // The first search answers at once and correctly; without
@@ -432,7 +432,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             String numeric = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"range\":{\"unmapped_int\":{\"gte\":1}}}}"));
@@ -486,7 +486,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             String matchBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}},\"size\":0}"));
@@ -539,7 +539,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             String matchBody = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match\":{\"body\":\"lance\"}},\"size\":3}"));
@@ -609,7 +609,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             String rangeBody = readAll(
@@ -674,7 +674,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             // Every match_all hit scores 1.0: a threshold above it
@@ -756,7 +756,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             String plain = readAll(postJson("/" + indexName + "/_search", "{\"size\":1,\"query\":{\"match_all\":{}}}"));
@@ -832,7 +832,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             // A scalar first pass (every hit scores 1.0) re scored by a
@@ -923,7 +923,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             // Keyword field under match_all: the first row of every
@@ -1095,7 +1095,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             String trackBoundBody = readAll(
@@ -1275,7 +1275,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             String plain = readAll(postJson("/" + indexName + "/_search", "{\"size\":2,\"query\":{\"match_all\":{}}}"));
@@ -1328,7 +1328,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         LanceTableFactory.writeMultiFragmentTable(scratchDir, large, 12, 4);
         try {
             for (String table : List.of(small, large)) {
-                Response attach = postJson("/_lance/attach", "{\"table\":\"" + scratchDir.resolve(table + ".lance") + "\"}");
+                Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + scratchDir.resolve(table + ".lance") + "\"}");
                 assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             }
             Request create = new Request("PUT", "/" + lucene);
@@ -1435,7 +1435,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             // id desc is [5, 4, 3, 2, 1, 0]; from=2, size=2 keeps [3, 2].
@@ -1464,7 +1464,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             String body = readAll(
@@ -1492,7 +1492,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             // id desc is [5, 4, 3, 2, 1, 0].
@@ -1530,7 +1530,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             String body = readAll(
@@ -1755,7 +1755,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // over the first fragment, every search shape must answer from
         // all 120 rows through six fragment requests, GET must reach
         // every row, a body no plan answers must be refused, and attach
-        // and _lance/stats must say what happened.
+        // and _plugins/_lance/stats must say what happened.
         updateClusterSetting("lance.test.max_docs_per_reader", "20");
         String suffix = "bound-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
@@ -1766,19 +1766,19 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         LanceTableFactory.writeStringPkTable(scratchDir, pkTable, 12, 4);
         String pkTableUri = scratchDir.resolve(pkTable + ".lance").toString();
         try {
-            String attach = readAll(postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}"));
+            String attach = readAll(postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}"));
             assertEquals("attach must succeed for a table above the bound: " + attach, 120, extractIntPath(attach, "rows"));
             assertTrue("attach must flag the bound: " + attach, attach.contains("\"lucene_bound_exceeded\":true"));
             ensureGreen(tableName);
-            String pkAttach = readAll(postJson("/_lance/attach", "{\"table\":\"" + pkTableUri + "\"}"));
+            String pkAttach = readAll(postJson("/_plugins/_lance/attach", "{\"table\":\"" + pkTableUri + "\"}"));
             assertFalse("a table of 12 rows in 3 fragments of 4 is under the bound of 20: " + pkAttach, pkAttach.contains("lucene_bound"));
             ensureGreen(pkTable);
 
             // The shard reader holds the first fragment only; _stats
-            // counts it, _lance/stats reports both figures.
+            // counts it, _plugins/_lance/stats reports both figures.
             String docStats = readAll(client().performRequest(new Request("GET", "/" + tableName + "/_stats/docs")));
             assertEquals(20, extractIntPath(docStats, "indices", tableName, "primaries", "docs", "count"));
-            String lanceStats = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+            String lanceStats = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
             Map<String, Object> nodes = castMap(parseJson(lanceStats).get("nodes"));
             Map<String, Object> indices = castMap(castMap(nodes.values().iterator().next()).get("indices"));
             Map<String, Object> indexStats = castMap(indices.get(tableName));

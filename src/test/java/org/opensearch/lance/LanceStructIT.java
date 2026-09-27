@@ -41,7 +41,7 @@ public class LanceStructIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(
                 "attach on struct table failed: " + readAll(attach),
                 RestStatus.OK.getStatus(),

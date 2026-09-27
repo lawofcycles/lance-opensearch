@@ -19,7 +19,7 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.engine.LanceIndexWarmer;
 
 /**
- * One table's index warm-up as {@code GET /_lance/stats} reports it: the
+ * One table's index warm-up as {@code GET /_plugins/_lance/stats} reports it: the
  * OpenSearch index and Lance table, the manifest version the warm-up
  * read, the mode it ran under, its state, when it started, how long it
  * took, and one {@link IndexEntry} per Lance index it visited. Built by

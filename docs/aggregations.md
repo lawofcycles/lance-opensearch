@@ -35,7 +35,7 @@ A scalar filter (`term`, `terms`, `range`, `exists`, `wildcard`, `regexp`, `pref
 - Lance decodes either into the same DataFusion expression, plans it through the same scalar indexes and evaluates it the same way, so the results and `hits.total` do not depend on the choice.
 - The Substrait encoding addresses columns by position rather than by name and accepts expressions the SQL printer has no spelling for (arithmetic in a comparison).
 - The SQL encoding is the only one for a predicate on a struct child (`parent.child`), for the prefilter of a full text or `lance_knn` clause, for a pushed sorted page and for the filter under a pushed aggregate.
-- `GET /<index>/_lance/explain` shows the choice as `filter_substrait_bytes` next to `filter_sql` in `fragment_plan`.
+- `GET /_plugins/_lance/explain/<index>` shows the choice as `filter_substrait_bytes` next to `filter_sql` in `fragment_plan`.
 - When the scan carries a filter, Lance's scalar index resolver consults the BTree, Bitmap and Zone Map indexes on the filtered columns automatically and prunes fragments and pages before the aggregate runs.
 
 ## Shapes the scan computes
@@ -96,7 +96,7 @@ tdigest `percentiles` / `percentile_ranks` take two rounds of scans: the first r
 - Nested `terms` levels multiply the key combinations the scan may return. `lance.aggregation.pushdown_max_groups` bounds them in two places:
   - The coordinator's planner estimates the group rows the executor would hold from the table statistics (the distinct counts of the bitmap indexes, the value ranges of the BTree indexes over integer columns, the date intervals, the range and filter counts, capped at the row count, and cut to the `shard_size` retention of a single count or metric ordered `terms` level) and prices the pushed scan as infinite when the estimate exceeds the bound, so the plan is the Lucene operator and explain shows it.
     - A key whose column has neither a distinct count nor an integer range (no bitmap index and no BTree over an integer column, or a `histogram`) has no statistics estimate, and a tree with such a key is not judged against the bound by the planner.
-  - The executor estimates the groups again from the request shape (the product of the levels' `shard_size`; a `range` / `filters` level counts as its bucket count plus one) and refuses the shipped pushed aggregate when its own estimate exceeds the same bound; the refusal is counted as `plan.refinements.aggregate_resolution` in `GET /_lance/stats` and the request runs on the aggregators. This second bound protects the executor's group state when the statistics said fewer groups than the request shape implies, or said nothing.
+  - The executor estimates the groups again from the request shape (the product of the levels' `shard_size`; a `range` / `filters` level counts as its bucket count plus one) and refuses the shipped pushed aggregate when its own estimate exceeds the same bound; the refusal is counted as `plan.refinements.aggregate_resolution` in `GET /_plugins/_lance/stats` and the request runs on the aggregators. This second bound protects the executor's group state when the statistics said fewer groups than the request shape implies, or said nothing.
 
 ## Shapes that stay on the aggregators
 
@@ -107,6 +107,6 @@ tdigest `percentiles` / `percentile_ranks` take two rounds of scans: the first r
 
 ## Observing the plan
 
-- `GET /<index>/_lance/explain` prints the pushed aggregate with its `filter=...`, or `LuceneAggregateExec` with the reason under `unplanned` when the tree stays on the aggregators ([query-plan.md](query-plan.md)).
-- `GET /_lance/stats` counts the executor's refusal under `plan.refinements.aggregate_resolution` and the pushed and Lucene answers under `plan.executed`.
+- `GET /_plugins/_lance/explain/<index>` prints the pushed aggregate with its `filter=...`, or `LuceneAggregateExec` with the reason under `unplanned` when the tree stays on the aggregators ([query-plan.md](query-plan.md)).
+- `GET /_plugins/_lance/stats` counts the executor's refusal under `plan.refinements.aggregate_resolution` and the pushed and Lucene answers under `plan.executed`.
 - The admission gate judges a pushed aggregate under the `aggregate_scan` kind ([admission.md](admission.md#aggregate_scan)).

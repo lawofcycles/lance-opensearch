@@ -35,7 +35,7 @@ import org.opensearch.plugins.Plugin;
 import org.opensearch.test.OpenSearchSingleNodeTestCase;
 
 /**
- * {@code GET /_lance/stats} must not report a figure a reader wrapper (the
+ * {@code GET /_plugins/_lance/stats} must not report a figure a reader wrapper (the
  * security plugin's DLS / FLS wrapper) does not filter, nor name columns
  * it may hide. {@link WrapperOnPrefixPlugin} installs a wrapper on the
  * Lance-backed indexes whose name starts with {@code wrapped}, so one node

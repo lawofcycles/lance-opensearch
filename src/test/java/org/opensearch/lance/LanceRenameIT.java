@@ -39,7 +39,7 @@ public class LanceRenameIT extends LanceRestTestCase {
         String tableUri = LanceTableFactory.writeEpochMillisTable(scratchDir, tableName);
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"," + OVERRIDES_CLAUSE + "}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"," + OVERRIDES_CLAUSE + "}");
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             // Rename both overridden columns. The field ids stay, so the
@@ -103,7 +103,7 @@ public class LanceRenameIT extends LanceRestTestCase {
 
             // The explain endpoint names the rename: the aggregation
             // stays on the aggregators and the unplanned element says why.
-            Request explain = new Request("GET", "/" + indexName + "/_lance/explain");
+            Request explain = new Request("GET", "/_plugins/_lance/explain/" + indexName);
             explain.setJsonEntity("{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"label\"}}}}");
             String explained = readAll(client().performRequest(explain));
             assertEquals("LUCENE_AGGREGATE", stringPath(explained, "fragment_plan", "kind"));
@@ -111,7 +111,7 @@ public class LanceRenameIT extends LanceRestTestCase {
             assertTrue("explain must name the rename: " + reason, reason.contains("field [label] was renamed to [tag] in the Lance table"));
 
             // The stats list what to update in clients.
-            String stats = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+            String stats = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
             assertTrue("stats must report the label rename: " + stats, stats.contains("\"from\":\"label\",\"to\":\"tag\""));
             assertTrue("stats must report the ts rename: " + stats, stats.contains("\"from\":\"ts\",\"to\":\"event_ts\""));
         } finally {
@@ -134,7 +134,7 @@ public class LanceRenameIT extends LanceRestTestCase {
         String indexName = tableName;
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"overrides\":{\"ts\":{\"type\":\"date\"},\"category\":{\"type\":\"keyword\"}}}"
             );
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());

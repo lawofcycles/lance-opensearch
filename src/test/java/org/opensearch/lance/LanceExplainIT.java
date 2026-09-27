@@ -31,7 +31,7 @@ import org.opensearch.core.rest.RestStatus;
 public class LanceExplainIT extends LanceRestTestCase {
 
     private static Response explain(String indexName, String body) throws IOException {
-        Request request = new Request("GET", "/" + indexName + "/_lance/explain");
+        Request request = new Request("GET", "/_plugins/_lance/explain/" + indexName);
         request.setJsonEntity(body);
         return client().performRequest(request);
     }
@@ -55,7 +55,7 @@ public class LanceExplainIT extends LanceRestTestCase {
     }
 
     private static void attach(String tableUri) throws IOException {
-        Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+        Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
         assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
     }
 
@@ -509,7 +509,7 @@ public class LanceExplainIT extends LanceRestTestCase {
 
             // An empty body plans as _search without one: a match_all
             // page of ten.
-            Response empty = client().performRequest(new Request("GET", "/" + indexName + "/_lance/explain"));
+            Response empty = client().performRequest(new Request("GET", "/_plugins/_lance/explain/" + indexName));
             assertEquals(RestStatus.OK.getStatus(), empty.getStatusLine().getStatusCode());
             String emptyBody = readAll(empty);
             @SuppressWarnings("unchecked")
@@ -604,7 +604,10 @@ public class LanceExplainIT extends LanceRestTestCase {
         String tableUri = LanceTableFactory.writeIpTable(scratchDir, tableName);
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"overrides\":{\"ip\":{\"type\":\"ip\"}}}");
+            Response attach = postJson(
+                "/_plugins/_lance/attach",
+                "{\"table\":\"" + tableUri + "\",\"overrides\":{\"ip\":{\"type\":\"ip\"}}}"
+            );
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             // The sort over the ip column folds into the scan as a
@@ -826,7 +829,7 @@ public class LanceExplainIT extends LanceRestTestCase {
         String indexName = "demo-" + suffix;
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"overrides\":{\"body\":{\"type\":\"text_analyzer\",\"analyzer\":\"english\"}}}"
             );
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());

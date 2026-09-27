@@ -2,7 +2,7 @@
 
 The admission gate refuses a Lance scan that would not fit the node's physical memory before the scan starts. Lance allocates native memory the plugin's breakers never see, so on a large enough table such a scan ends the node with a kernel OOM kill before any accounting sees it. Before each gated scan the executor estimates what it will make Lance allocate and answers 429 `circuit_breaking_exception` under the label `lance_admission` when the node's available memory minus a headroom, plus what earlier admitted scans of the same identity retained, cannot hold it.
 
-[features.md](features.md#native-memory-bounds) lists the other memory bounds. `GET /_lance/stats` reports the decisions under `admission` ([Cache statistics](features.md#cache-statistics)).
+[features.md](features.md#native-memory-bounds) lists the other memory bounds. `GET /_plugins/_lance/stats` reports the decisions under `admission` ([Cache statistics](features.md#cache-statistics)).
 
 - [Settings](#settings)
 - [The decision](#the-decision)
@@ -141,5 +141,5 @@ Who is credited:
 ## Observing the gate
 
 - The 429 message names the credited figure next to the available memory and the headroom.
-- `GET /_lance/stats` reports the pool as `admission.retained_bytes` and its identity as `admission.retained_scope` (`kind:table:columns`), the last decision under `admission.last_estimate_bytes`, `admission.last_kind` and `admission.last_source`, and the refusals per kind under `admission.rejections`. The full shape of the `admission` object is under [Cache statistics](features.md#cache-statistics).
+- `GET /_plugins/_lance/stats` reports the pool as `admission.retained_bytes` and its identity as `admission.retained_scope` (`kind:table:columns`), the last decision under `admission.last_estimate_bytes`, `admission.last_kind` and `admission.last_source`, and the refusals per kind under `admission.rejections`. The full shape of the `admission` object is under [Cache statistics](features.md#cache-statistics).
 - The metadata warm up's full text probe is judged by the same gate and skipped, not refused, when it does not fit; see [Index warm-up](features.md#index-warm-up).

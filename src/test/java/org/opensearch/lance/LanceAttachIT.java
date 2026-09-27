@@ -19,7 +19,7 @@ import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
 
 /**
- * Explicit attach through {@code /_lance/attach}: request validation,
+ * Explicit attach through {@code /_plugins/_lance/attach}: request validation,
  * storage options, version pinning, {@code multi_fields} and {@code
  * overrides} clauses, re-attach after the table is recreated, and mapping
  * drift when the writer drops a column.
@@ -32,14 +32,14 @@ public class LanceAttachIT extends LanceRestTestCase {
         String bogus = scratchPathString("missing") + ".lance";
         ResponseException failure = expectThrows(
             ResponseException.class,
-            () -> postJson("/_lance/attach", "{\"table\":\"" + bogus + "\"}")
+            () -> postJson("/_plugins/_lance/attach", "{\"table\":\"" + bogus + "\"}")
         );
         int status = failure.getResponse().getStatusLine().getStatusCode();
         assertEquals("expected 400 for missing table, saw: " + status, 400, status);
     }
 
     public void testAttachRejectsMissingTableField() throws IOException {
-        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/attach", "{}"));
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_plugins/_lance/attach", "{}"));
         int status = failure.getResponse().getStatusLine().getStatusCode();
         assertEquals("expected 400 for missing table field, saw " + status, 400, status);
         String body = readAll(failure.getResponse());
@@ -49,7 +49,7 @@ public class LanceAttachIT extends LanceRestTestCase {
     public void testCreateIndexRejectsLanceTableSetting() throws IOException {
         // PUT /{index} with index.lance.table would wire the engine
         // without deriving a mapping; the request is rejected and points
-        // at POST /_lance/attach instead.
+        // at POST /_plugins/_lance/attach instead.
         String indexName = "rawput-" + randomAlphaOfLength(6).toLowerCase(Locale.ROOT);
         Request create = new Request("PUT", "/" + indexName);
         create.setJsonEntity("{\"settings\":{\"index.lance.table\":\"/tmp/does-not-matter.lance\"}}");
@@ -59,7 +59,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         assertEquals("expected 400 for direct PUT with index.lance.table, saw " + status, 400, status);
         String body = readAll(failure.getResponse());
         assertTrue("expected error to mention [index.lance.table]: " + body, body.contains("index.lance.table"));
-        assertTrue("expected error to point at /_lance/attach: " + body, body.contains("/_lance/attach"));
+        assertTrue("expected error to point at /_plugins/_lance/attach: " + body, body.contains("/_plugins/_lance/attach"));
     }
 
     public void testAttachFlagsATableAboveTheLuceneBoundAndRefusesAnOversizeFragment() throws Exception {
@@ -75,13 +75,13 @@ public class LanceAttachIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         try {
             setMaxDocsPerReader("4");
-            String attach = readAll(postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}"));
+            String attach = readAll(postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}"));
             assertEquals(attach, 12, extractIntPath(attach, "rows"));
             assertEquals(attach, 3, extractIntPath(attach, "fragments"));
             assertTrue(attach, attach.contains("\"lucene_bound_exceeded\":true"));
             assertTrue(attach, attach.contains("\"already_attached\":false"));
             ensureGreen(tableName);
-            String again = readAll(postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}"));
+            String again = readAll(postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}"));
             assertTrue(again, again.contains("\"already_attached\":true"));
             assertTrue(again, again.contains("\"lucene_bound_exceeded\":true"));
             client().performRequest(new Request("DELETE", "/" + tableName));
@@ -89,7 +89,7 @@ public class LanceAttachIT extends LanceRestTestCase {
             setMaxDocsPerReader("3");
             ResponseException refused = expectThrows(
                 ResponseException.class,
-                () -> postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}")
+                () -> postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}")
             );
             assertEquals(400, refused.getResponse().getStatusLine().getStatusCode());
             String body = readAll(refused.getResponse());
@@ -100,7 +100,7 @@ public class LanceAttachIT extends LanceRestTestCase {
 
             // Under the default bound the flag is absent.
             setMaxDocsPerReader(null);
-            String plain = readAll(postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}"));
+            String plain = readAll(postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}"));
             assertFalse(plain, plain.contains("lucene_bound_exceeded"));
         } finally {
             setMaxDocsPerReader(null);
@@ -123,7 +123,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         // fragment, so an explicit number_of_shards is rejected rather
         // than silently ignored.
         String payload = "{\"table\":\"/tmp/does-not-matter.lance\",\"number_of_shards\":3}";
-        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/attach", payload));
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_plugins/_lance/attach", payload));
         int status = failure.getResponse().getStatusLine().getStatusCode();
         assertEquals("expected 400 for number_of_shards, saw " + status, 400, status);
         String body = readAll(failure.getResponse());
@@ -142,7 +142,7 @@ public class LanceAttachIT extends LanceRestTestCase {
             String tablePath = scratchPathString(indexName) + ".lance";
             ResponseException failure = expectThrows(
                 ResponseException.class,
-                () -> postJson("/_lance/attach", "{\"table\":\"" + tablePath + "\",\"name\":\"" + indexName + "\"}")
+                () -> postJson("/_plugins/_lance/attach", "{\"table\":\"" + tablePath + "\",\"name\":\"" + indexName + "\"}")
             );
             int status = failure.getResponse().getStatusLine().getStatusCode();
             // 409 for the name clash, or another 4xx if the fake table path
@@ -165,7 +165,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         String indexName = tableName;
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\""
                     + tableUri
                     + "\",\"storage_options\":{\"aws_region\":\"us-east-1\",\"aws_endpoint\":\"https://s3.example.internal\"}}"
@@ -211,7 +211,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         String sessionToken = "TOKENFILTERME" + randomAlphaOfLength(12);
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\""
                     + tableUri
                     + "\",\"storage_options\":{\"aws_access_key_id\":\""
@@ -263,7 +263,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             Response settings = client().performRequest(new Request("GET", "/" + indexName + "/_settings"));
@@ -290,10 +290,13 @@ public class LanceAttachIT extends LanceRestTestCase {
         String latestIndex = tableName + "-latest";
         String pinnedIndex = tableName + "-v1";
         try {
-            Response attachLatest = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"name\":\"" + latestIndex + "\"}");
+            Response attachLatest = postJson(
+                "/_plugins/_lance/attach",
+                "{\"table\":\"" + tableUri + "\",\"name\":\"" + latestIndex + "\"}"
+            );
             assertEquals(RestStatus.OK.getStatus(), attachLatest.getStatusLine().getStatusCode());
             Response attachPinned = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"name\":\"" + pinnedIndex + "\",\"version\":1}"
             );
             assertEquals(RestStatus.OK.getStatus(), attachPinned.getStatusLine().getStatusCode());
@@ -358,7 +361,7 @@ public class LanceAttachIT extends LanceRestTestCase {
             + "\"c\":{\"value_count\":{\"field\":\"rating\"}},\"s\":{\"sum\":{\"field\":\"rating\"}},"
             + "\"top\":{\"terms\":{\"field\":\"rating\",\"size\":3,\"order\":{\"_key\":\"desc\"}}}}}";
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             long sumAll = 0L;
@@ -417,7 +420,7 @@ public class LanceAttachIT extends LanceRestTestCase {
 
     public void testAttachRejectsNegativeVersion() throws IOException {
         String payload = "{\"table\":\"/tmp/does-not-matter.lance\",\"version\":-1}";
-        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/attach", payload));
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_plugins/_lance/attach", payload));
         int status = failure.getResponse().getStatusLine().getStatusCode();
         assertEquals("expected 400 for negative version, saw " + status, 400, status);
         String body = readAll(failure.getResponse());
@@ -428,7 +431,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         // `version` is a fixed pin and `tag` a moving one; the body may
         // carry only one of them.
         String payload = "{\"table\":\"/tmp/does-not-matter.lance\",\"version\":1,\"tag\":\"v1\"}";
-        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/attach", payload));
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_plugins/_lance/attach", payload));
         int status = failure.getResponse().getStatusLine().getStatusCode();
         assertEquals("expected 400 for version + tag, saw " + status, 400, status);
         String body = readAll(failure.getResponse());
@@ -446,7 +449,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         try {
             ResponseException failure = expectThrows(
                 ResponseException.class,
-                () -> postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"tag\":\"no-such-tag\"}")
+                () -> postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\",\"tag\":\"no-such-tag\"}")
             );
             int status = failure.getResponse().getStatusLine().getStatusCode();
             assertEquals("expected 400 for unknown tag, saw " + status, 400, status);
@@ -484,14 +487,14 @@ public class LanceAttachIT extends LanceRestTestCase {
         String fragmentBody = "{\"query\":{\"match_all\":{}},\"size\":0}";
         try {
             Response attachTag = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"name\":\"" + tagIndex + "\",\"tag\":\"v1\"}"
             );
             String attachTagBody = readAll(attachTag);
             assertEquals("attach with tag failed: " + attachTagBody, RestStatus.OK.getStatus(), attachTag.getStatusLine().getStatusCode());
             assertEquals("attach must report the tag's version", (int) versionA, extractIntPath(attachTagBody, "version"));
             Response attachPinned = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"name\":\"" + pinnedIndex + "\",\"version\":" + versionA + "}"
             );
             assertEquals(RestStatus.OK.getStatus(), attachPinned.getStatusLine().getStatusCode());
@@ -546,10 +549,10 @@ public class LanceAttachIT extends LanceRestTestCase {
         LanceTableFactory.createTag(tableUri, "release", version);
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            Response refs = client().performRequest(new Request("GET", "/_lance/refs/" + indexName));
+            Response refs = client().performRequest(new Request("GET", "/_plugins/_lance/refs/" + indexName));
             assertEquals(RestStatus.OK.getStatus(), refs.getStatusLine().getStatusCode());
             String body = readAll(refs);
             assertTrue("expected index in body: " + body, body.contains("\"index\":\"" + indexName + "\""));
@@ -562,7 +565,7 @@ public class LanceAttachIT extends LanceRestTestCase {
 
             ResponseException missing = expectThrows(
                 ResponseException.class,
-                () -> client().performRequest(new Request("GET", "/_lance/refs/does-not-exist-" + suffix))
+                () -> client().performRequest(new Request("GET", "/_plugins/_lance/refs/does-not-exist-" + suffix))
             );
             assertEquals(404, missing.getResponse().getStatusLine().getStatusCode());
         } finally {
@@ -581,7 +584,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         try {
             ResponseException failure = expectThrows(
                 ResponseException.class,
-                () -> client().performRequest(new Request("GET", "/_lance/refs/" + indexName))
+                () -> client().performRequest(new Request("GET", "/_plugins/_lance/refs/" + indexName))
             );
             int status = failure.getResponse().getStatusLine().getStatusCode();
             assertEquals("expected 400 for a non-Lance index, saw " + status, 400, status);
@@ -594,7 +597,7 @@ public class LanceAttachIT extends LanceRestTestCase {
 
     public void testAttachRejectsNonObjectStorageOptions() throws IOException {
         String payload = "{\"table\":\"/tmp/does-not-matter.lance\",\"storage_options\":\"not-an-object\"}";
-        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/attach", payload));
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_plugins/_lance/attach", payload));
         int status = failure.getResponse().getStatusLine().getStatusCode();
         assertEquals("expected 400 for non-object storage_options, saw " + status, 400, status);
         String body = readAll(failure.getResponse());
@@ -606,7 +609,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         // Values must be strings; a nested object would be stringified at
         // the JNI boundary.
         String payload = "{\"table\":\"/tmp/does-not-matter.lance\"," + "\"storage_options\":{\"aws_config\":{\"nested\":\"value\"}}}";
-        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/attach", payload));
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_plugins/_lance/attach", payload));
         int status = failure.getResponse().getStatusLine().getStatusCode();
         assertEquals("expected 400 for nested storage_options value, saw " + status, 400, status);
         String body = readAll(failure.getResponse());
@@ -616,7 +619,10 @@ public class LanceAttachIT extends LanceRestTestCase {
 
     public void testBuildIndexesOnUnknownIndexFails() throws IOException {
         String unknown = "does-not-exist-" + randomAlphaOfLength(8);
-        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/build_indexes/" + unknown, "{}"));
+        ResponseException failure = expectThrows(
+            ResponseException.class,
+            () -> postJson("/_plugins/_lance/build_indexes/" + unknown, "{}")
+        );
         int status = failure.getResponse().getStatusLine().getStatusCode();
         assertEquals("expected 404 for unknown index, saw: " + status, 404, status);
     }
@@ -638,7 +644,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         // First table: keys alpha-0..alpha-3. A GET primes the cache.
         LanceTableFactory.writeStringPkTable(scratchDir, tableName, 4);
         try {
-            Response attach1 = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach1 = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals("first attach failed: " + readAll(attach1), RestStatus.OK.getStatus(), attach1.getStatusLine().getStatusCode());
 
             Response beforeGet = client().performRequest(new Request("GET", "/" + indexName + "/_doc/alpha-2"));
@@ -654,7 +660,7 @@ public class LanceAttachIT extends LanceRestTestCase {
             deleteRecursively(tablePath);
             LanceTableFactory.writeStringPkTable(scratchDir, tableName, 2);
 
-            Response attach2 = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach2 = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals("second attach failed: " + readAll(attach2), RestStatus.OK.getStatus(), attach2.getStatusLine().getStatusCode());
 
             Response afterHit = client().performRequest(new Request("GET", "/" + indexName + "/_doc/alpha-1"));
@@ -710,7 +716,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         String indexName = tableName;
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"multi_fields\":{\"body\":{\"raw\":{\"type\":\"keyword\"}}}}"
             );
             assertEquals(
@@ -800,7 +806,7 @@ public class LanceAttachIT extends LanceRestTestCase {
             ResponseException nonUtf8 = expectThrows(
                 ResponseException.class,
                 () -> postJson(
-                    "/_lance/attach",
+                    "/_plugins/_lance/attach",
                     "{\"table\":\"" + tableUri + "\",\"multi_fields\":{\"id\":{\"raw\":{\"type\":\"keyword\"}}}}"
                 )
             );
@@ -813,7 +819,7 @@ public class LanceAttachIT extends LanceRestTestCase {
             ResponseException unknownColumn = expectThrows(
                 ResponseException.class,
                 () -> postJson(
-                    "/_lance/attach",
+                    "/_plugins/_lance/attach",
                     "{\"table\":\"" + tableUri + "\",\"multi_fields\":{\"noSuchCol\":{\"raw\":{\"type\":\"keyword\"}}}}"
                 )
             );
@@ -826,7 +832,7 @@ public class LanceAttachIT extends LanceRestTestCase {
             ResponseException badSubType = expectThrows(
                 ResponseException.class,
                 () -> postJson(
-                    "/_lance/attach",
+                    "/_plugins/_lance/attach",
                     "{\"table\":\"" + tableUri + "\",\"multi_fields\":{\"body\":{\"raw\":{\"type\":\"text\"}}}}"
                 )
             );
@@ -852,7 +858,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         String indexName = tableName;
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"overrides\":{\"body\":{\"fields\":{\"raw\":{\"type\":\"keyword\"}}}}}"
             );
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
@@ -884,7 +890,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         ResponseException failure = expectThrows(
             ResponseException.class,
-            () -> postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"overrides\":{\"body\":{\"type\":\"text\"}}}")
+            () -> postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\",\"overrides\":{\"body\":{\"type\":\"text\"}}}")
         );
         assertEquals(400, failure.getResponse().getStatusLine().getStatusCode());
         String body = readAll(failure.getResponse());
@@ -905,7 +911,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         ResponseException failure = expectThrows(
             ResponseException.class,
             () -> postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\""
                     + tableUri
                     + "\","

@@ -26,7 +26,7 @@ import org.opensearch.threadpool.ThreadPool;
  * would wire up the engine without the derive step, leaving the mapping
  * empty so every typed query fails with "No mapping found" while
  * {@code _count} returns the Lance metadata count. Rejecting up front
- * points the caller at {@code POST /_lance/attach} instead.
+ * points the caller at {@code POST /_plugins/_lance/attach} instead.
  *
  * <p>Plugin-internal callers stamp {@link
  * LanceInternalHeaders#LANCE_INTERNAL_CREATE_INDEX} on their
@@ -90,7 +90,7 @@ public final class LanceCreateIndexActionFilter implements ActionFilter {
             new IllegalArgumentException(
                 "["
                     + LanceEngineFactory.TABLE_SETTING
-                    + "] cannot be set through PUT /{index}; use POST /_lance/attach so the mapping is derived from the Lance schema"
+                    + "] cannot be set through PUT /{index}; use POST /_plugins/_lance/attach so the mapping is derived from the Lance schema"
             )
         );
     }

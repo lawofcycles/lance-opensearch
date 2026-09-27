@@ -49,7 +49,7 @@ public class LanceTextAnalyzerIT extends LanceRestTestCase {
         String indexName = indexNameOf(tableUri);
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"overrides\":{\"body\":{\"type\":\"text_analyzer\",\"analyzer\":\"english\"}}}"
             );
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
@@ -114,7 +114,7 @@ public class LanceTextAnalyzerIT extends LanceRestTestCase {
             // Re-attach is idempotent: the derived column and its index
             // already exist.
             Response again = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"overrides\":{\"body\":{\"type\":\"text_analyzer\",\"analyzer\":\"english\"}}}"
             );
             assertEquals(RestStatus.OK.getStatus(), again.getStatusLine().getStatusCode());
@@ -130,7 +130,7 @@ public class LanceTextAnalyzerIT extends LanceRestTestCase {
         String indexName = indexNameOf(tableUri);
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"overrides\":{\"body\":{\"type\":\"text_analyzer\",\"analyzer\":\"whitespace\"}}}"
             );
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
@@ -156,7 +156,7 @@ public class LanceTextAnalyzerIT extends LanceRestTestCase {
         String indexName = indexNameOf(tableUri);
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\""
                     + tableUri
                     + "\",\"derive\":\"async\",\"overrides\":{\"body\":{\"type\":\"text_analyzer\",\"analyzer\":\"english\"}}}"
@@ -220,7 +220,7 @@ public class LanceTextAnalyzerIT extends LanceRestTestCase {
         String indexName = indexNameOf(tableUri);
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\""
                     + tableUri
                     + "\",\"derive\":\"async\",\"overrides\":{\"body\":{\"type\":\"text_analyzer\",\"analyzer\":\"english\"}}}"
@@ -257,7 +257,7 @@ public class LanceTextAnalyzerIT extends LanceRestTestCase {
 
             // No refused mapping update is left behind on any node, and
             // the manual check answers without one.
-            Map<String, Object> stats = parseJson(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+            Map<String, Object> stats = parseJson(readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats"))));
             @SuppressWarnings("unchecked")
             Map<String, Object> nodes = (Map<String, Object>) stats.get("nodes");
             for (Object node : nodes.values()) {
@@ -265,7 +265,7 @@ public class LanceTextAnalyzerIT extends LanceRestTestCase {
                 Map<String, Object> freshness = (Map<String, Object>) ((Map<String, Object>) node).get("freshness");
                 assertEquals("no refused mapping update in the stats: " + freshness, Map.of(), freshness.get("mapping_errors"));
             }
-            String sync = readAll(client().performRequest(new Request("POST", "/" + indexName + "/_lance/sync")));
+            String sync = readAll(client().performRequest(new Request("POST", "/_plugins/_lance/sync/" + indexName)));
             assertFalse("the manual check reports no refusal: " + sync, sync.contains("mapping_error"));
         } finally {
             deleteIndexQuietly(indexName);
@@ -293,7 +293,7 @@ public class LanceTextAnalyzerIT extends LanceRestTestCase {
             // backfills nor builds; the derived column exists, which is
             // what the tagged attach requires.
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\""
                     + tableUri
                     + "\",\"tag\":\"flip\",\"overrides\":{\"body\":{\"type\":\"text_analyzer\",\"analyzer\":\"whitespace\"}}}"
@@ -353,7 +353,7 @@ public class LanceTextAnalyzerIT extends LanceRestTestCase {
     }
 
     private static Response explain(String indexName, String body) throws IOException {
-        Request request = new Request("GET", "/" + indexName + "/_lance/explain");
+        Request request = new Request("GET", "/_plugins/_lance/explain/" + indexName);
         request.setJsonEntity(body);
         return client().performRequest(request);
     }
@@ -363,7 +363,7 @@ public class LanceTextAnalyzerIT extends LanceRestTestCase {
         ResponseException e = expectThrows(
             ResponseException.class,
             () -> postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"overrides\":{\"body\":{\"type\":\"text_analyzer\",\"analyzer\":\"no_such_analyzer\"}}}"
             )
         );
@@ -375,7 +375,7 @@ public class LanceTextAnalyzerIT extends LanceRestTestCase {
         String tableUri = writeTable("derivekey");
         ResponseException e = expectThrows(
             ResponseException.class,
-            () -> postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"derive\":\"async\"}")
+            () -> postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\",\"derive\":\"async\"}")
         );
         assertEquals(RestStatus.BAD_REQUEST.getStatus(), e.getResponse().getStatusLine().getStatusCode());
         assertTrue(e.getMessage(), e.getMessage().contains("[derive] is only accepted"));
@@ -386,7 +386,7 @@ public class LanceTextAnalyzerIT extends LanceRestTestCase {
         ResponseException e = expectThrows(
             ResponseException.class,
             () -> postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\""
                     + tableUri
                     + "\",\"version\":1,\"overrides\":{\"body\":{\"type\":\"text_analyzer\",\"analyzer\":\"english\"}}}"

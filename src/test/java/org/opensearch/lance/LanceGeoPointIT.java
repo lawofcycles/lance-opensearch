@@ -47,7 +47,7 @@ public class LanceGeoPointIT extends LanceRestTestCase {
         String tableUri = LanceTableFactory.writeGeoStructTable(scratchDir, indexName);
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"overrides\":{\"location\":{\"type\":\"geo_point\"}}}"
             );
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
@@ -86,7 +86,7 @@ public class LanceGeoPointIT extends LanceRestTestCase {
         String tableUri = LanceTableFactory.writeGeoFslTable(scratchDir, indexName, false);
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"overrides\":{\"location\":{\"type\":\"geo_point\",\"order\":\"lon_lat\"}}}"
             );
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());

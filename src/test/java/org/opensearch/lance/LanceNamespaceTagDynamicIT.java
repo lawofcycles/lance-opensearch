@@ -42,7 +42,10 @@ public class LanceNamespaceTagDynamicIT extends LanceRestTestCase {
         String indexName = tableName + "-dyntag";
         String matchAllBody = "{\"query\":{\"match_all\":{}},\"size\":0}";
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"name\":\"" + indexName + "\",\"tag\":\"v1\"}");
+            Response attach = postJson(
+                "/_plugins/_lance/attach",
+                "{\"table\":\"" + tableUri + "\",\"name\":\"" + indexName + "\",\"tag\":\"v1\"}"
+            );
             String attachBody = readAll(attach);
             assertEquals("attach with tag v1 failed: " + attachBody, RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals("attach must report v1's version", (int) versionA, extractIntPath(attachBody, "version"));

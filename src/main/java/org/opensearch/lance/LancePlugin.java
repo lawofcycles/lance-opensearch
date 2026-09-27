@@ -647,7 +647,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * table. Zero (the default) collects at once. It exists so the
      * integration tests can observe, on a small table whose statistics
      * would otherwise be ready within milliseconds, the request that
-     * plans without them and the {@code GET /_lance/stats} counters that
+     * plans without them and the {@code GET /_plugins/_lance/stats} counters that
      * record it; do not set it on a real node. Dynamic.
      */
     public static final Setting<TimeValue> TEST_STATISTICS_COLLECT_DELAY_SETTING = Setting.timeSetting(
@@ -1289,7 +1289,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         clusterService.addListener(indexWarmer);
         this.maxDocsPerReader = MAX_DOCS_PER_READER_SETTING.get(environment.settings());
         clusterService.getClusterSettings().addSettingsUpdateConsumer(MAX_DOCS_PER_READER_SETTING, value -> maxDocsPerReader = value);
-        // Read side of GET /_lance/stats. The session size is read through
+        // Read side of GET /_plugins/_lance/stats. The session size is read through
         // the registry here because the stats package cannot see the
         // registry's package-private session accessor.
         // Freshness of the Lance-backed shards this node holds: one
@@ -1623,6 +1623,26 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         );
     }
 
+    /**
+     * The plugin's REST surface. Every path sits under
+     * {@code /_plugins/_lance}:
+     * <ul>
+     *   <li>{@code POST /_plugins/_lance/attach} ({@link RestAttachAction})</li>
+     *   <li>{@code POST /_plugins/_lance/build_indexes/{index}} ({@link RestBuildIndexesAction})</li>
+     *   <li>{@code POST GET DELETE /_plugins/_lance/namespace},
+     *       {@code POST /_plugins/_lance/namespace/tables},
+     *       {@code POST /_plugins/_lance/namespace/_poll} ({@link RestNamespaceAction})</li>
+     *   <li>{@code GET /_plugins/_lance/refs/{index}} ({@link RestRefsAction})</li>
+     *   <li>{@code GET /_plugins/_lance/stats},
+     *       {@code GET /_plugins/_lance/{node_id}/stats} ({@link RestLanceStatsAction})</li>
+     *   <li>{@code GET /_plugins/_lance/explain/{index}} ({@link RestLanceExplainAction})</li>
+     *   <li>{@code POST /_plugins/_lance/sync/{index}} ({@link RestLanceSyncAction})</li>
+     * </ul>
+     * Each handler also serves the path it had before the move through
+     * {@code replacedRoutes()}, so a request on an old path is answered
+     * with a deprecation {@code Warning} header. The old paths go away in
+     * the next minor release.
+     */
     @Override
     public List<RestHandler> getRestHandlers(
         Settings settings,

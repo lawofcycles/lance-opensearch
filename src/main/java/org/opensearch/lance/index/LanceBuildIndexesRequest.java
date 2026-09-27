@@ -17,7 +17,7 @@ import org.opensearch.core.common.io.stream.StreamOutput;
 
 /**
  * Request for {@link LanceBuildIndexesAction}: the parsed body of
- * {@code POST /_lance/build_indexes/{index}}.
+ * {@code POST /_plugins/_lance/build_indexes/{index}}.
  *
  * <p>Implements {@link IndicesRequest} so a security plugin can apply
  * index-level permissions to the one index named in the path.

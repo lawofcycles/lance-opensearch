@@ -50,7 +50,7 @@ public class LanceDeletionFileIT extends LanceRestTestCase {
             // title.raw gives the terms aggregation a keyword key: one
             // bucket per live row.
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"overrides\":{\"title\":{\"fields\":{\"raw\":{\"type\":\"keyword\"}}}}}"
             );
             String attachBody = readAll(attach);
@@ -179,7 +179,7 @@ public class LanceDeletionFileIT extends LanceRestTestCase {
     /** The {@code fragment_plan.kind} of {@code body}'s explain: which operator answers the page. */
     @SuppressWarnings("unchecked")
     private static String planKind(String index, String body) throws Exception {
-        Request explain = new Request("GET", "/" + index + "/_lance/explain");
+        Request explain = new Request("GET", "/_plugins/_lance/explain/" + index);
         explain.setJsonEntity(body);
         String explained = readAll(client().performRequest(explain));
         assertEquals(explained, "fragment", stringPath(explained, "route"));
@@ -213,7 +213,7 @@ public class LanceDeletionFileIT extends LanceRestTestCase {
         return fetch;
     }
 
-    /** The {@code fetch} counters of the single data node in {@code GET /_lance/stats}. */
+    /** The {@code fetch} counters of the single data node in {@code GET /_plugins/_lance/stats}. */
     @SuppressWarnings("unchecked")
     private static Map<String, Object> fetchStats() throws Exception {
         return statsBlock("fetch");
@@ -224,7 +224,7 @@ public class LanceDeletionFileIT extends LanceRestTestCase {
     }
 
     private static Map<String, Object> statsBlock(String name) throws Exception {
-        Map<String, Object> stats = parseJson(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> stats = parseJson(readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats"))));
         Map<String, Object> nodes = (Map<String, Object>) stats.get("nodes");
         assertEquals("single node cluster: " + stats, 1, nodes.size());
         Map<String, Object> node = (Map<String, Object>) nodes.values().iterator().next();

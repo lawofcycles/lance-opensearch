@@ -46,7 +46,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             // id = 0..5: count 6, sum 15, avg 2.5, min 0, max 5.
@@ -121,7 +121,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             // Six single-doc buckets; avg over each equals the id.
@@ -193,7 +193,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
         String indexName = tableName;
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 // body.raw gives the terms aggregations a keyword key.
                 "{\"table\":\"" + tableUri + "\",\"multi_fields\":{\"body\":{\"raw\":{\"type\":\"keyword\"}}}}"
             );
@@ -281,7 +281,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             String metricBody = readAll(
@@ -472,13 +472,13 @@ public class LanceAggregationIT extends LanceRestTestCase {
         }
     }
 
-    /** The {@code column_store} object of the single test node from {@code GET /_lance/stats}. */
+    /** The {@code column_store} object of the single test node from {@code GET /_plugins/_lance/stats}. */
     @SuppressWarnings("unchecked")
     private static Map<String, Object> columnStoreStats() throws IOException {
         return (Map<String, Object>) singleNodeStats().get("column_store");
     }
 
-    /** The {@code plan.refinements} counters of the single test node from {@code GET /_lance/stats}, keyed by reason. */
+    /** The {@code plan.refinements} counters of the single test node from {@code GET /_plugins/_lance/stats}, keyed by reason. */
     @SuppressWarnings("unchecked")
     private static Map<String, Object> planRefinements() throws IOException {
         Map<String, Object> plan = (Map<String, Object>) singleNodeStats().get("plan");
@@ -487,7 +487,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
 
     @SuppressWarnings("unchecked")
     private static Map<String, Object> singleNodeStats() throws IOException {
-        String json = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+        String json = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
         try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, json)) {
             Map<String, Object> nodes = (Map<String, Object>) parser.map().get("nodes");
             assertEquals("single node cluster", 1, nodes.size());
@@ -852,7 +852,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
         String indexName = tableName;
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"multi_fields\":{\"category\":{\"raw\":{\"type\":\"keyword\"}}}}"
             );
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
@@ -932,7 +932,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             String[] shapes = new String[] {
                 "{\"size\":0,\"aggs\":{\"d\":{\"date_range\":{\"field\":\"ts\",\"ranges\":[{\"to\":\"2024-03-01\"},{\"from\":\"2024-03-01\",\"to\":\"2024-04-01\"},{\"from\":\"2024-04-01\"}]},"
@@ -1161,7 +1161,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             String[] shapes = new String[] {
                 "{\"size\":0,\"aggs\":{\"m\":{\"max\":{\"field\":\"id\"}},\"s\":{\"sum\":{\"field\":\"id\"}},\"a\":{\"avg\":{\"field\":\"id\"}},\"c\":{\"value_count\":{\"field\":\"id\"}}}}",
@@ -1764,7 +1764,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
             "\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"h\":{\"histogram\":{\"field\":\"id\",\"interval\":8},"
                 + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}},\"ab\":{\"avg_bucket\":{\"buckets_path\":\"h>s\"}}}}}" };
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             long fanOutBefore = fanOutLogLines(index);
             int requests = 0;
@@ -2008,7 +2008,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             long fanOutBefore = fanOutLogLines(indexName);
             String[] shapes = {

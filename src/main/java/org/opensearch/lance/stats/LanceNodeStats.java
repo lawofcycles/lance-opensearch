@@ -37,7 +37,7 @@ import org.opensearch.lance.query.ScanAdmission;
  * {@code request_cache}, {@code native_memory}, {@code fts},
  * {@code admission}, {@code warm_up}, {@code plan}, {@code freshness},
  * {@code fetch}, {@code fetch_cache} and {@code indices} objects of one node in
- * {@code GET /_lance/stats}. {@code request_cache}
+ * {@code GET /_plugins/_lance/stats}. {@code request_cache}
  * is the coordinator result cache ({@link RequestCacheStats}); {@code admission} carries the admission
  * gate's settings in force, its rejections per kind, the estimate,
  * kind and source (a request or the warm up) of its last decision, the
@@ -75,7 +75,7 @@ import org.opensearch.lance.query.ScanAdmission;
  * coordinator. Version 1 laid out every figure but the pruned fragment
  * counter, which version 2 added as a block a coordinator of the
  * previous plugin version steps over, so a mixed version cluster
- * answers {@code GET /_lance/stats} without that counter instead of
+ * answers {@code GET /_plugins/_lance/stats} without that counter instead of
  * failing; version 3 added the source of the last admission decision
  * the same way, and an older coordinator shows it as {@code none};
  * version 4 added the freshness service's refused mapping updates per

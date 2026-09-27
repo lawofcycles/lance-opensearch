@@ -1145,7 +1145,7 @@ public final class LanceEngineFactory implements EngineFactory {
          * re-creates the clone at the new version and rebuilds the reader
          * over it; the clone inherits whatever indexes the source carries,
          * and indexes that were built into the previous clone only exist
-         * again after the next {@code POST /_lance/build_indexes}. A build
+         * again after the next {@code POST /_plugins/_lance/build_indexes}. A build
          * commit into the current clone (the clone's own latest version
          * moved past the version the reader holds) swaps the reader so GET
          * and the mixed target searches see the new indexes; the served base

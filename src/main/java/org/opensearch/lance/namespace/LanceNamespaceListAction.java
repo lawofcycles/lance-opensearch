@@ -8,8 +8,8 @@ package org.opensearch.lance.namespace;
 import org.opensearch.action.ActionType;
 
 /**
- * Read-only namespace action behind {@code GET /_lance/namespace} and
- * {@code POST /_lance/namespace/tables}. Both endpoints answer from
+ * Read-only namespace action behind {@code GET /_plugins/_lance/namespace} and
+ * {@code POST /_plugins/_lance/namespace/tables}. Both endpoints answer from
  * the registered namespaces, so they share one action name and one
  * privilege: a request without a path lists the registered roots, a
  * request with a path lists the tables under that root.

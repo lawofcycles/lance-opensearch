@@ -30,7 +30,7 @@ import org.opensearch.core.xcontent.XContentParser;
  * lance_match}, {@code lance_match_phrase}, {@code lance_multi_match},
  * {@code lance_fts_boost} and {@code lance_fts_bool}, including their
  * validation errors. Also the {@code tokenizer} option of
- * {@code POST /_lance/build_indexes/{index}}, checked against Japanese
+ * {@code POST /_plugins/_lance/build_indexes/{index}}, checked against Japanese
  * text where the choice of tokenizer decides whether a one-word query
  * matches at all.
  */
@@ -173,7 +173,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
 
             // The explain endpoint reports the rewritten clause: the
             // stock bool plans as one fused lance_fts_bool.
-            Request explain = new Request("GET", "/" + indexName + "/_lance/explain");
+            Request explain = new Request("GET", "/_plugins/_lance/explain/" + indexName);
             explain.setJsonEntity(
                 "{\"size\":5,\"query\":{\"bool\":{\"must\":[{\"match\":{\"body\":\"hello\"}},{\"match\":{\"title\":\"sunny\"}}]}}}"
             );
@@ -656,7 +656,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         // request reads the store instead of taking. The reference is a
         // terms filter on id selecting the same rows, which runs on the
         // scalar path and never sees a hint. Ids, sort values and buckets
-        // must agree in every state, and GET /_lance/stats shows which
+        // must agree in every state, and GET /_plugins/_lance/stats shows which
         // state the store is in: no load during the cold round, no load
         // during the warm round.
         try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 10_000, "lmatchsparse")) {
@@ -777,10 +777,10 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         assertEquals(state, idsAndSortValuesOf(refByRating).subList(0, 10), idsAndSortValuesOf(withPage));
     }
 
-    /** {@code column_store.loads} of the single test node from {@code GET /_lance/stats}. */
+    /** {@code column_store.loads} of the single test node from {@code GET /_plugins/_lance/stats}. */
     @SuppressWarnings("unchecked")
     private static int columnStoreLoads() throws IOException {
-        String json = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+        String json = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
         try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, json)) {
             Map<String, Object> nodes = (Map<String, Object>) parser.map().get("nodes");
             assertEquals("single node cluster", 1, nodes.size());
@@ -1656,7 +1656,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         // an inverted index on such a column.
         try (SurfacedIndex fixture = SurfacedIndex.japanese("jabtree")) {
             String indexName = fixture.indexName();
-            String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{}"));
+            String build = readAll(postJson("/_plugins/_lance/build_indexes/" + indexName, "{}"));
             assertTrue("expected no FTS index built: " + build, build.contains("\"fts\":[]"));
             assertTrue(
                 "expected text among the scalar builds: " + build,
@@ -1675,7 +1675,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         // query finds nothing; the whole sentence finds its own row.
         try (SurfacedIndex fixture = SurfacedIndex.japanese("jasimple")) {
             String indexName = fixture.indexName();
-            String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"]}"));
+            String build = readAll(postJson("/_plugins/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"]}"));
             assertTrue(
                 "expected text in fts built list: " + build,
                 build.contains("\"fts\":[{\"column\":\"text\",\"type\":\"INVERTED\"}]")
@@ -1698,7 +1698,9 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         // 京都 in row 2.
         try (SurfacedIndex fixture = SurfacedIndex.japanese("jaicu")) {
             String indexName = fixture.indexName();
-            String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"],\"tokenizer\":\"icu\"}"));
+            String build = readAll(
+                postJson("/_plugins/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"],\"tokenizer\":\"icu\"}")
+            );
             assertTrue(
                 "expected text in fts built list: " + build,
                 build.contains("\"fts\":[{\"column\":\"text\",\"type\":\"INVERTED\"}]")
@@ -1713,7 +1715,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             // existing index: the column is skipped, the response lists
             // nothing under fts, and queries keep the icu segmentation.
             String rebuild = readAll(
-                postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"],\"tokenizer\":\"simple\"}")
+                postJson("/_plugins/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"],\"tokenizer\":\"simple\"}")
             );
             assertTrue("expected empty fts list on rebuild: " + rebuild, rebuild.contains("\"fts\":[]"));
             assertEquals("existing index keeps its tokenizer after a rebuild request", 2, lanceMatchHits(indexName, "天気"));
@@ -1740,7 +1742,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         try (SurfacedIndex fixture = SurfacedIndex.japanese("jalindera")) {
             String indexName = fixture.indexName();
             String build = readAll(
-                postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"],\"tokenizer\":\"lindera/ipadic\"}")
+                postJson("/_plugins/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"],\"tokenizer\":\"lindera/ipadic\"}")
             );
             assertTrue(
                 "expected text in fts built list: " + build,
@@ -1762,7 +1764,10 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             String indexName = fixture.indexName();
             ResponseException failure = expectThrows(
                 ResponseException.class,
-                () -> postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"text\"],\"tokenizer\":\"no-such-tokenizer\"}")
+                () -> postJson(
+                    "/_plugins/_lance/build_indexes/" + indexName,
+                    "{\"fts_columns\":[\"text\"],\"tokenizer\":\"no-such-tokenizer\"}"
+                )
             );
             int status = failure.getResponse().getStatusLine().getStatusCode();
             assertEquals("expected 400 for unknown tokenizer, saw " + status, 400, status);
@@ -1800,7 +1805,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
                 );
                 ResponseException failure = expectThrows(
                     ResponseException.class,
-                    () -> postJson("/_lance/build_indexes/" + indexName, "{\"columns\":[\"id\"]}")
+                    () -> postJson("/_plugins/_lance/build_indexes/" + indexName, "{\"columns\":[\"id\"]}")
                 );
                 int status = failure.getResponse().getStatusLine().getStatusCode();
                 String body = readAll(failure.getResponse());
@@ -1823,7 +1828,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         // and answers 200 because a skip is not a failure.
         try (SurfacedIndex fixture = SurfacedIndex.japanese("jaskipped")) {
             String indexName = fixture.indexName();
-            String first = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"columns\":[\"id\"]}"));
+            String first = readAll(postJson("/_plugins/_lance/build_indexes/" + indexName, "{\"columns\":[\"id\"]}"));
             assertTrue(
                 "expected id built: " + first,
                 first.contains("\"built\":{\"fts\":[],\"scalar\":[{\"column\":\"id\",\"type\":\"BTREE\"}],\"vector\":[]}")
@@ -1831,7 +1836,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             assertTrue("expected nothing skipped: " + first, first.contains("\"skipped\":{\"fts\":[],\"scalar\":[],\"vector\":[]}"));
             assertTrue("expected nothing failed: " + first, first.contains("\"failed\":{\"fts\":[],\"scalar\":[],\"vector\":[]}"));
 
-            Response second = postJson("/_lance/build_indexes/" + indexName, "{}");
+            Response second = postJson("/_plugins/_lance/build_indexes/" + indexName, "{}");
             assertEquals(200, second.getStatusLine().getStatusCode());
             String body = readAll(second);
             assertTrue(
@@ -1856,7 +1861,9 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         // phrase that only row 3 satisfies and "3 row" nothing does.
         try (SurfacedIndex fixture = SurfacedIndex.keywordOnly("withpos", 5)) {
             String indexName = fixture.indexName();
-            String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"],\"with_position\":true}"));
+            String build = readAll(
+                postJson("/_plugins/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"],\"with_position\":true}")
+            );
             assertTrue(
                 "expected label in fts built list: " + build,
                 build.contains("\"fts\":[{\"column\":\"label\",\"type\":\"INVERTED\"}]")
@@ -1885,7 +1892,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         // Lance refuses a tokenizer.
         try (SurfacedIndex fixture = SurfacedIndex.keywordOnly("nopos", 5)) {
             String indexName = fixture.indexName();
-            String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"]}"));
+            String build = readAll(postJson("/_plugins/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"]}"));
             assertTrue(
                 "expected label in fts built list: " + build,
                 build.contains("\"fts\":[{\"column\":\"label\",\"type\":\"INVERTED\"}]")
@@ -2009,7 +2016,10 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
     }
 
     private static void assertBuildIndexesRejected(String indexName, String body, String expectedMessage) throws IOException {
-        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/build_indexes/" + indexName, body));
+        ResponseException failure = expectThrows(
+            ResponseException.class,
+            () -> postJson("/_plugins/_lance/build_indexes/" + indexName, body)
+        );
         int status = failure.getResponse().getStatusLine().getStatusCode();
         String response = readAll(failure.getResponse());
         assertEquals("expected 400 for " + body + ", saw " + status + ": " + response, 400, status);
@@ -2119,7 +2129,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
             String indexName = "demo-" + suffix;
             writer.write(scratchDir, indexName);
 
-            Response register = postJson("/_lance/namespace", "{\"path\":\"" + scratchDir + "\"}");
+            Response register = postJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir + "\"}");
             assertEquals("namespace register failed: " + readAll(register), 200, register.getStatusLine().getStatusCode());
             assertBusy(() -> {
                 String cat = readAll(client().performRequest(new Request("GET", "/_cat/indices?format=json")));
@@ -2137,7 +2147,7 @@ public class LanceFtsQueryIT extends LanceRestTestCase {
         @Override
         public void close() throws IOException {
             try {
-                deleteJson("/_lance/namespace", "{\"path\":\"" + scratchDir + "\"}");
+                deleteJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir + "\"}");
             } catch (Exception ignored) {
                 // best-effort cleanup
             }

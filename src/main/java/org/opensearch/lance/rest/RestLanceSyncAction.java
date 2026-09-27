@@ -15,7 +15,7 @@ import org.opensearch.rest.action.RestToXContentListener;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
- * POST /{index}/_lance/sync
+ * POST /_plugins/_lance/sync/{index}
  *
  * Runs the freshness check of one Lance backed index now instead of at
  * the next {@code lance.namespace.poll_cadence} tick. The handler only
@@ -24,6 +24,12 @@ import org.opensearch.transport.client.node.NodeClient;
  * index's shard; the table open and the mapping update happen there,
  * on the generic pool. Idempotent: a check that finds the shard at the
  * table's version does nothing and answers {@code moved: false}.
+ *
+ * <p>The index comes after the verb, as in {@code build_indexes/{index}}
+ * and {@code refs/{index}}, because {@code /_plugins/_lance/{index}/_sync}
+ * would put an {@code {index}} wildcard on the same path segment as the
+ * {@code {node_id}} of {@code /_plugins/_lance/{node_id}/stats}, which
+ * the REST path trie rejects at registration.
  */
 public class RestLanceSyncAction extends BaseRestHandler {
 
@@ -33,8 +39,8 @@ public class RestLanceSyncAction extends BaseRestHandler {
     }
 
     @Override
-    public List<Route> routes() {
-        return List.of(new Route(RestRequest.Method.POST, "/{index}/_lance/sync"));
+    public List<ReplacedRoute> replacedRoutes() {
+        return List.of(new ReplacedRoute(RestRequest.Method.POST, "/_plugins/_lance/sync/{index}", "/{index}/_lance/sync"));
     }
 
     @Override

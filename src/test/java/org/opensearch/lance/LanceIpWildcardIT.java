@@ -49,7 +49,7 @@ public class LanceIpWildcardIT extends LanceRestTestCase {
         String tableUri = LanceTableFactory.writeIpTable(scratchDir, tableName);
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"," + OVERRIDES_CLAUSE + "}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"," + OVERRIDES_CLAUSE + "}");
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             String mapping = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
@@ -236,12 +236,12 @@ public class LanceIpWildcardIT extends LanceRestTestCase {
         String keywordIndex = "oracle-" + suffix;
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"overrides\":{\"path\":{\"type\":\"wildcard\"}}}"
             );
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             Response attachOracle = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"name\":\"" + keywordIndex + "\",\"overrides\":{\"path\":{\"type\":\"keyword\"}}}"
             );
             assertEquals(RestStatus.OK.getStatus(), attachOracle.getStatusLine().getStatusCode());
@@ -295,7 +295,7 @@ public class LanceIpWildcardIT extends LanceRestTestCase {
         String indexName = tableName;
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"overrides\":{\"label\":{\"type\":\"wildcard\"}}}"
             );
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
@@ -333,7 +333,7 @@ public class LanceIpWildcardIT extends LanceRestTestCase {
         LanceTableFactory.writeTable(scratchDir, withoutIp, 4);
         try {
             Response register = postJson(
-                "/_lance/namespace",
+                "/_plugins/_lance/namespace",
                 "{\"path\":\"" + scratchDir.toString() + "\",\"overrides\":{\"ip\":{\"type\":\"ip\"}}}"
             );
             assertEquals("register failed: " + readAll(register), RestStatus.OK.getStatus(), register.getStatusLine().getStatusCode());
@@ -360,7 +360,7 @@ public class LanceIpWildcardIT extends LanceRestTestCase {
                 } catch (Exception ignored) {}
             }
             try {
-                deleteJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+                deleteJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             } catch (Exception ignored) {}
         }
     }

@@ -94,7 +94,7 @@ public class LancePrimaryKeyIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(
                 "attach on Utf8 PK table failed: " + readAll(attach),
                 RestStatus.OK.getStatus(),
@@ -179,7 +179,7 @@ public class LancePrimaryKeyIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(
                 "attach on UInt64 PK table failed: " + readAll(attach),
                 RestStatus.OK.getStatus(),
@@ -256,7 +256,7 @@ public class LancePrimaryKeyIT extends LanceRestTestCase {
         LanceTableFactory.deleteRows(tableUri, "key IN ('alpha-1', 'alpha-4')");
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             // _count (engine path) and hits.total (fragment path) must

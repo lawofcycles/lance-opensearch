@@ -13,7 +13,7 @@ import org.opensearch.lance.engine.LanceIndexBuilder.Failed;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
- * The status rule of {@code POST /_lance/build_indexes/{index}}: skipped
+ * The status rule of {@code POST /_plugins/_lance/build_indexes/{index}}: skipped
  * columns are not failures, Lance's invalid-input rejections are the
  * caller's fault (400), anything else Lance throws is 500, and a mix is
  * 500 because that is the one the operator has to act on.

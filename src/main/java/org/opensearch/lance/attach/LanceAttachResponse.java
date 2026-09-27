@@ -22,7 +22,7 @@ import org.opensearch.lance.WireVersion;
 /**
  * Response for {@link LanceAttachAction}: what the derivation found in
  * the table plus whether the index already existed for the same table.
- * {@link #toXContent} produces the {@code POST /_lance/attach} body.
+ * {@link #toXContent} produces the {@code POST /_plugins/_lance/attach} body.
  * Opens with {@link #WIRE_VERSION} (see {@link WireVersion}).
  */
 public final class LanceAttachResponse extends ActionResponse implements ToXContentObject {

@@ -21,7 +21,7 @@ import org.opensearch.lance.stats.LanceNodeStats;
  * so the counters say how many scans the requests still paid for, how
  * many rows and columns they asked for and how long they took, and the
  * share of a request the takes account for can be read off
- * {@code GET /_lance/stats} ({@code fetch}) next to the request's
+ * {@code GET /_plugins/_lance/stats} ({@code fetch}) next to the request's
  * {@code took}.
  *
  * <p>Static for the same reason as {@link HeapFallbackStats}: the
@@ -120,7 +120,7 @@ public final class FetchTakeStats {
         }
     }
 
-    /** The counters since the node started, in the shape {@code GET /_lance/stats} reports. */
+    /** The counters since the node started, in the shape {@code GET /_plugins/_lance/stats} reports. */
     public static LanceNodeStats.FetchStats snapshot() {
         return new LanceNodeStats.FetchStats(
             COUNT.sum(),

@@ -17,7 +17,7 @@ import org.opensearch.core.common.io.stream.StreamOutput;
 /**
  * Response of {@link LanceBuildIndexesNodesAction}: the build outcome of
  * every data node that answered. {@link TransportLanceBuildIndexesAction}
- * merges it into the {@code POST /_lance/build_indexes/{index}} response
+ * merges it into the {@code POST /_plugins/_lance/build_indexes/{index}} response
  * body, keyed under {@code nodes} by node id.
  */
 public final class LanceBuildIndexesNodesResponse extends BaseNodesResponse<LanceBuildIndexesNodeResponse> {

@@ -17,7 +17,7 @@ import java.io.IOException;
 
 /**
  * Request for {@link LanceExplainAction}: the index named in
- * {@code GET /<index>/_lance/explain} and the parsed search body whose
+ * {@code GET /_plugins/_lance/explain/<index>} and the parsed search body whose
  * plan is explained. The body is optional on the wire; an absent body
  * plans as {@code _search} without a body does, a {@code match_all}
  * page of ten.

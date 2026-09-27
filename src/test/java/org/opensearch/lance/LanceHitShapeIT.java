@@ -31,7 +31,7 @@ import org.opensearch.client.Response;
 public class LanceHitShapeIT extends LanceRestTestCase {
 
     private static String explainBody(String indexName, String body) throws IOException {
-        Request request = new Request("GET", "/" + indexName + "/_lance/explain");
+        Request request = new Request("GET", "/_plugins/_lance/explain/" + indexName);
         request.setJsonEntity(body);
         Response response = client().performRequest(request);
         return readAll(response);
@@ -286,7 +286,7 @@ public class LanceHitShapeIT extends LanceRestTestCase {
 
     /** Attach the table at {@code tableUri}; the index takes the table's name. */
     private static String attachTable(String tableUri, String name) throws IOException {
-        Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+        Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
         assertEquals(200, attach.getStatusLine().getStatusCode());
         return name;
     }

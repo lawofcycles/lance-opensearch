@@ -106,7 +106,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
     private static final String UNCOVERED_FRAGMENT_POLICY_SETTING = "index.lance.uncovered_fragment_policy";
 
     /**
-     * What one check found and did; the answer of {@code POST /{index}/_lance/sync}.
+     * What one check found and did; the answer of {@code POST /_plugins/_lance/sync/{index}}.
      * {@code mappingChanged} is true once the cluster manager acknowledged
      * the mapping update the check sent (or the index was rebuilt);
      * {@code mappingError} is the message of the {@code PutMapping} the
@@ -212,7 +212,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
      * shard leaves this node. A check that derives nothing (the version
      * stood still) keeps the entry: the refused mapping is still the one
      * the index should have. Reported under
-     * {@code freshness.mapping_errors} of {@code GET /_lance/stats},
+     * {@code freshness.mapping_errors} of {@code GET /_plugins/_lance/stats},
      * because a refused update otherwise leaves the index serving the
      * stale mapping with nothing but a WARN line to say so.
      */
@@ -458,7 +458,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
                 // branch: the plugin never writes to a user table, so
                 // folding appended fragments into the existing indexes is
                 // left to the table's writer or to
-                // POST /_lance/build_indexes/{index}.
+                // POST /_plugins/_lance/build_indexes/{index}.
                 warnWaitPolicyOnce(indexName);
             }
             entry.derivedOnce = true;
@@ -636,13 +636,13 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
             LOG.info(
                 "index [{}] has index.lance.uncovered_fragment_policy=wait, but the plugin no longer runs auto-optimize on the user's Lance table. "
                     + "Index maintenance is expected to happen outside OpenSearch (Python, Ray, Spark, or the Lance Java SDK) or via "
-                    + "an explicit POST /_lance/build_indexes/{{index}} call. The wait value is accepted for a future async-optimize implementation.",
+                    + "an explicit POST /_plugins/_lance/build_indexes/{{index}} call. The wait value is accepted for a future async-optimize implementation.",
                 indexName
             );
         }
     }
 
-    /** This node's counters for {@code GET /_lance/stats}, with the mapping updates still refused per index. */
+    /** This node's counters for {@code GET /_plugins/_lance/stats}, with the mapping updates still refused per index. */
     public LanceNodeStats.FreshnessStats stats() {
         Map<String, String> errors = new TreeMap<>();
         for (Map.Entry<String, RefusedMapping> entry : mappingErrors.entrySet()) {

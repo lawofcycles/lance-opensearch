@@ -134,7 +134,7 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
         }
 
         private static LanceTestCluster registerAndWait(Path scratchDir, String indexName) throws Exception {
-            Response register = postJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+            Response register = postJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             assertEquals(
                 "namespace register failed: " + readAll(register),
                 RestStatus.OK.getStatus(),
@@ -336,14 +336,14 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
     /**
      * How many fragment requests the data nodes have executed so far:
      * the sum over the nodes of {@code plan.executed} (both the Lance
-     * scan and the Lucene counters) in {@code GET /_lance/stats}. A
+     * scan and the Lucene counters) in {@code GET /_plugins/_lance/stats}. A
      * request served by the fragment path advances it by one per
      * executor; a request the stock search action served leaves it
      * unchanged.
      */
     @SuppressWarnings("unchecked")
     static long fragmentRequestsExecuted() throws IOException {
-        Map<String, Object> stats = parseJson(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> stats = parseJson(readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats"))));
         Map<String, Object> nodes = (Map<String, Object>) stats.get("nodes");
         long total = 0L;
         for (Object node : nodes.values()) {
@@ -359,11 +359,11 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
     /**
      * How many fragments the data nodes' executors have skipped under
      * zone map pruning so far: the sum over the nodes of
-     * {@code plan.pruned.fragments} in {@code GET /_lance/stats}.
+     * {@code plan.pruned.fragments} in {@code GET /_plugins/_lance/stats}.
      */
     @SuppressWarnings("unchecked")
     static long prunedFragments() throws IOException {
-        Map<String, Object> stats = parseJson(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> stats = parseJson(readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats"))));
         Map<String, Object> nodes = (Map<String, Object>) stats.get("nodes");
         long total = 0L;
         for (Object node : nodes.values()) {
@@ -375,7 +375,7 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
     }
 
     /**
-     * The planner's table statistics counters of {@code GET /_lance/stats}
+     * The planner's table statistics counters of {@code GET /_plugins/_lance/stats}
      * summed over the nodes: {@code tables} (entries held),
      * {@code pending} (collections queued or running),
      * {@code planned_without} (plans made without statistics) and
@@ -383,7 +383,7 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
      */
     @SuppressWarnings("unchecked")
     static Map<String, Long> planStatistics() throws IOException {
-        Map<String, Object> stats = parseJson(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> stats = parseJson(readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats"))));
         Map<String, Object> nodes = (Map<String, Object>) stats.get("nodes");
         Map<String, Long> totals = new LinkedHashMap<>();
         for (Object node : nodes.values()) {
@@ -421,7 +421,7 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
      * index estimates) calls this after attaching.
      */
     static void warmTableStatistics(String indexName) throws Exception {
-        Request explain = new Request("GET", "/" + indexName + "/_lance/explain");
+        Request explain = new Request("GET", "/_plugins/_lance/explain/" + indexName);
         explain.setJsonEntity("{\"size\":0}");
         client().performRequest(explain);
         awaitTableStatistics();

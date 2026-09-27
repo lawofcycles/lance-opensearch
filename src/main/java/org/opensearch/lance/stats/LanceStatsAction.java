@@ -10,7 +10,7 @@ import org.opensearch.action.ActionType;
 /**
  * Per node cache statistics of the plugin, served by
  * {@link TransportLanceStatsAction} and exposed as
- * {@code GET /_lance/stats}. The name sits under {@code cluster:monitor/}
+ * {@code GET /_plugins/_lance/stats}. The name sits under {@code cluster:monitor/}
  * so a security plugin can grant it to read only roles the way it grants
  * {@code cluster:monitor/nodes/stats}.
  */
