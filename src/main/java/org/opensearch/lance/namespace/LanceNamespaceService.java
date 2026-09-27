@@ -340,10 +340,15 @@ public final class LanceNamespaceService implements Closeable {
                 warnedInitFailure.remove(entry.name());
                 return created;
             } catch (Exception e) {
-                String message = e.getMessage() == null ? e.toString() : e.getMessage();
+                // The message is reported by the namespace listing and
+                // the exception logged, so both get credential shaped
+                // values redacted (a catalog error body quoting the
+                // bearer token or an access key id).
+                Exception reported = StorageOptions.redactCredentials(e);
+                String message = reported.getMessage() == null ? reported.toString() : reported.getMessage();
                 unavailable.put(entry.name(), message);
                 if (warnedInitFailure.add(entry.name())) {
-                    LOG.warn("failed to initialise namespace {} (type {}); retrying on every poll", entry.name(), entry.type(), e);
+                    LOG.warn("failed to initialise namespace {} (type {}); retrying on every poll", entry.name(), entry.type(), reported);
                 }
                 return null;
             }
@@ -546,7 +551,7 @@ public final class LanceNamespaceService implements Closeable {
                         // a database the endpoint cannot reach): the
                         // tables below it stay hidden until a poll walks
                         // it, so the registration shows as partial.
-                        String message = listed.firstNamespacesFailure().getMessage();
+                        String message = StorageOptions.redactCredentials(listed.firstNamespacesFailure().getMessage());
                         partial.put(entry.name(), message);
                         report.partial.put(entry.name(), message);
                         LOG.warn("namespace poll of {} could not list every subnamespace: {}", entry.name(), message);
@@ -559,11 +564,12 @@ public final class LanceNamespaceService implements Closeable {
                     // A listing failure (unreachable endpoint, revoked
                     // credentials after a successful initialise) marks the
                     // registration unavailable until a poll succeeds again.
-                    String message = e.getMessage() == null ? e.toString() : e.getMessage();
+                    Exception reported = StorageOptions.redactCredentials(e);
+                    String message = reported.getMessage() == null ? reported.toString() : reported.getMessage();
                     unavailable.put(entry.name(), message);
                     partial.remove(entry.name());
                     report.unavailable.put(entry.name(), message);
-                    LOG.warn("namespace poll failed for {}", entry.name(), e);
+                    LOG.warn("namespace poll failed for {}", entry.name(), reported);
                 }
             }
             if (awaitCreates) {
@@ -604,7 +610,7 @@ public final class LanceNamespaceService implements Closeable {
                             pending.namespace(),
                             pending.table(),
                             pending.index(),
-                            "create index failed: " + e.getMessage()
+                            "create index failed: " + StorageOptions.redactCredentials(e.getMessage())
                         )
                     );
                 }
@@ -651,8 +657,9 @@ public final class LanceNamespaceService implements Closeable {
             // The registration was removed mid-cycle; nothing to surface.
             return;
         } catch (Exception e) {
-            LOG.warn("describe_table failed for {} in namespace {}: {}", indexName, entry.name(), e.getMessage());
-            report.skipped.add(new PollReport.SkippedTable(entry.name(), indexName, indexName, "describe_table failed: " + e.getMessage()));
+            String message = StorageOptions.redactCredentials(e.getMessage());
+            LOG.warn("describe_table failed for {} in namespace {}: {}", indexName, entry.name(), message);
+            report.skipped.add(new PollReport.SkippedTable(entry.name(), indexName, indexName, "describe_table failed: " + message));
             return;
         }
         String location = LanceCatalogEnumerator.tableLocation(described);
@@ -773,8 +780,13 @@ public final class LanceNamespaceService implements Closeable {
                 )
             );
         } catch (Exception e) {
-            LOG.warn("surface failed for table {} as index {}", table, indexName, e);
-            report.skipped.add(new PollReport.SkippedTable(namespaceName, indexName, indexName, "surface failed: " + e.getMessage()));
+            // surface opens the table, so an object store error body,
+            // with the access key id S3 echoes, is what arrives here.
+            Exception reported = StorageOptions.redactCredentials(e);
+            LOG.warn("surface failed for table {} as index {}", table, indexName, reported);
+            report.skipped.add(
+                new PollReport.SkippedTable(namespaceName, indexName, indexName, "surface failed: " + reported.getMessage())
+            );
         }
     }
 
@@ -832,7 +844,12 @@ public final class LanceNamespaceService implements Closeable {
                     if (isAlreadyExists(e)) {
                         LOG.debug("surface for {} raced with an existing index", indexName);
                     } else {
-                        LOG.warn("surface failed for {} at version {}: {}", indexName, version, e.getMessage());
+                        LOG.warn(
+                            "surface failed for {} at version {}: {}",
+                            indexName,
+                            version,
+                            StorageOptions.redactCredentials(e.getMessage())
+                        );
                     }
                     future.onFailure(e);
                 }

@@ -8,8 +8,10 @@ package org.opensearch.lance.engine;
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
@@ -20,15 +22,18 @@ import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.LogEvent;
 import org.lance.Dataset;
 import org.lance.index.IndexDescription;
 import org.lance.ipc.ScanOptions;
 import org.lance.schema.LanceField;
+import org.opensearch.ExceptionsHelper;
 import org.opensearch.Version;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
+import org.opensearch.lance.InvalidAccessKeyIdS3Fixture;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.NativeMemoryLimit;
@@ -155,6 +160,70 @@ public class LanceIndexWarmerTests extends OpenSearchTestCase {
             assertEquals(index.toString(), State.DONE, index.state());
         }
         warmer.close();
+    }
+
+    /**
+     * A table whose store refuses the access key id fails the warm up
+     * with S3's {@code InvalidAccessKeyId} body, which echoes the key
+     * id, in Lance's message. The status the warmer publishes and the
+     * WARN it logs (the message and the exception's chain) carry the
+     * body without the key id; the error code stays so the operator
+     * can tell what went wrong.
+     */
+    public void testWarmUpOfATableTheStoreRefusesReportsAndLogsWithoutTheAccessKeyId() throws Exception {
+        String keyId = "AKIA" + randomAlphaOfLength(16).toUpperCase(Locale.ROOT);
+        try (InvalidAccessKeyIdS3Fixture s3 = new InvalidAccessKeyIdS3Fixture(keyId)) {
+            String table = "s3://redaction-bucket/warm-" + getTestName().toLowerCase(Locale.ROOT) + ".lance";
+            Settings settings = Settings.builder()
+                .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                .put(IndexMetadata.SETTING_INDEX_UUID, "warm-refused-uuid")
+                .put(LanceEngineFactory.TABLE_SETTING, table)
+                .put(StorageOptions.INDEX_SETTING_PREFIX + "aws_access_key_id", keyId)
+                .put(StorageOptions.INDEX_SETTING_PREFIX + "aws_secret_access_key", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+                .put(StorageOptions.INDEX_SETTING_PREFIX + "aws_region", "us-east-1")
+                .put(StorageOptions.INDEX_SETTING_PREFIX + "aws_endpoint", s3.endpoint())
+                .put(StorageOptions.INDEX_SETTING_PREFIX + "allow_http", "true")
+                .build();
+            IndexMetadata metadata = IndexMetadata.builder("warm-refused").settings(settings).build();
+            LanceIndexWarmer warmer = new LanceIndexWarmer(cache, executor, Mode.METADATA);
+            List<LogEvent> warnings = new ArrayList<>();
+            try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(LanceIndexWarmer.class))) {
+                appender.addExpectation(new MockLogAppender.LoggingExpectation() {
+                    @Override
+                    public void match(LogEvent event) {
+                        if (event.getLevel() == Level.WARN) {
+                            warnings.add(event.toImmutable());
+                        }
+                    }
+
+                    @Override
+                    public void assertMatched() {
+                        assertFalse("the open failure is warned", warnings.isEmpty());
+                    }
+                });
+                warmer.schedule(metadata);
+                TableStatus status = awaitFinished(warmer, "warm-refused");
+                assertEquals(status.toString(), State.FAILED, status.state());
+                assertEquals(status.toString(), 1, status.indexes().size());
+                String detail = status.indexes().get(0).detail();
+                assertTrue("the status names the S3 error: " + detail, detail.contains("InvalidAccessKeyId"));
+                assertFalse("the status must not carry the key id: " + detail, detail.contains(keyId));
+                appender.assertAllExpectationsMatched();
+            } finally {
+                warmer.close();
+            }
+            for (LogEvent warning : warnings) {
+                String line = warning.getMessage().getFormattedMessage();
+                String trace = warning.getThrown() == null ? "" : ExceptionsHelper.stackTrace(warning.getThrown());
+                assertFalse("the WARN line must not carry the key id: " + line, line.contains(keyId));
+                assertFalse("the WARN's exception chain must not carry the key id: " + trace, trace.contains(keyId));
+                if (warning.getThrown() != null) {
+                    assertTrue("the logged exception names the S3 error: " + trace, trace.contains("InvalidAccessKeyId"));
+                }
+            }
+        }
     }
 
     public void testCloseWaitsForTheRunningWarmUp() throws Exception {

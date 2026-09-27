@@ -527,11 +527,19 @@ public final class LanceEngineFactory implements EngineFactory {
                 } catch (Throwable suppressed) {
                     t.addSuppressed(suppressed);
                 }
+                // The failure becomes the shard's failure reason in the
+                // cluster state, which the allocation APIs show, so an
+                // object store error body is handed on with credential
+                // shaped values redacted.
                 if (t instanceof IOException io) {
-                    throw new EngineException(config.getShardId(), "Failed to open initial Lance reader", io);
+                    throw new EngineException(
+                        config.getShardId(),
+                        "Failed to open initial Lance reader",
+                        StorageOptions.redactCredentials(io)
+                    );
                 }
                 if (t instanceof RuntimeException re) {
-                    throw re;
+                    throw StorageOptions.redactCredentials(re);
                 }
                 if (t instanceof Error err) {
                     throw err;
@@ -789,7 +797,7 @@ public final class LanceEngineFactory implements EngineFactory {
             try {
                 lanceReaderManager.maybeRefresh();
             } catch (IOException e) {
-                LOG.warn("Lance refresh failed for shard {}", config().getShardId(), e);
+                LOG.warn("Lance refresh failed for shard {}", config().getShardId(), StorageOptions.redactCredentials(e));
             }
         }
 

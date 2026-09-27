@@ -41,6 +41,7 @@ import org.lance.index.vector.VectorIndexParams;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.LanceOverrides;
+import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.query.LanceInvalidInput;
 import org.opensearch.lance.rest.RestAttachAction;
 
@@ -108,7 +109,9 @@ public final class LanceIndexBuilder {
 
     /**
      * A column whose build threw. {@link #reason()} carries Lance's
-     * message. {@link #invalidInput()} is true when
+     * message with credential shaped values redacted (the build reads
+     * the table, so an object store error body can be the message).
+     * {@link #invalidInput()} is true when
      * {@link LanceInvalidInput#isInvalidInput} recognises the cause as
      * Lance refusing the input (unknown tokenizer, malformed index
      * params), which the caller can answer as a client error rather
@@ -122,7 +125,7 @@ public final class LanceIndexBuilder {
 
     private static String messageOf(Exception e) {
         String message = e.getMessage();
-        return message == null || message.isEmpty() ? e.toString() : message;
+        return StorageOptions.redactCredentials(message == null || message.isEmpty() ? e.toString() : message);
     }
 
     /**
@@ -263,7 +266,7 @@ public final class LanceIndexBuilder {
                     dataset.version()
                 );
             } catch (Exception e) {
-                LOG.warn("FTS build failed for column {}", column, e);
+                LOG.warn("FTS build failed for column {}", column, StorageOptions.redactCredentials(e));
                 result.addFailed(column, e);
             }
         }
@@ -378,7 +381,7 @@ public final class LanceIndexBuilder {
                     dataset.version()
                 );
             } catch (Exception e) {
-                LOG.warn("scalar build failed for column {}", column, e);
+                LOG.warn("scalar build failed for column {}", column, StorageOptions.redactCredentials(e));
                 result.addFailed(column, e);
             }
         }
@@ -513,7 +516,7 @@ public final class LanceIndexBuilder {
                     dataset.version()
                 );
             } catch (Exception e) {
-                LOG.warn("vector build failed for column {}", column, e);
+                LOG.warn("vector build failed for column {}", column, StorageOptions.redactCredentials(e));
                 result.addFailed(column, e);
             }
         }

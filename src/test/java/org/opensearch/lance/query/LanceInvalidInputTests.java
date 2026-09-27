@@ -106,6 +106,33 @@ public class LanceInvalidInputTests extends OpenSearchTestCase {
     }
 
     /**
+     * A Lance invalid input whose message quotes an object store error
+     * body (S3 echoes the access key id in {@code InvalidAccessKeyId})
+     * is reported without the key id, still as an
+     * {@link IllegalArgumentException} the REST layer answers with 400,
+     * while the original stays as it was for the debug log.
+     */
+    public void testUnwrapRedactsTheAccessKeyIdOfAnObjectStoreErrorBody() {
+        String keyId = "AKIAIOSFODNN7EXAMPLE";
+        String message = "Invalid user input: Generic S3 error: Client error with status 403 Forbidden: "
+            + "<Error><Code>InvalidAccessKeyId</Code><AWSAccessKeyId>"
+            + keyId
+            + "</AWSAccessKeyId></Error>, /rust/lance-io/src/object_store.rs:1:1";
+        IllegalArgumentException lance = new IllegalArgumentException(message);
+        IOException wrapped = new IOException(lance);
+        Exception reported = LanceInvalidInput.unwrap(wrapped);
+        assertNotSame(lance, reported);
+        assertTrue(reported.toString(), reported instanceof IllegalArgumentException);
+        assertEquals(RestStatus.BAD_REQUEST, ExceptionsHelper.status(reported));
+        assertFalse("the key id must not be reported: " + reported.getMessage(), reported.getMessage().contains(keyId));
+        assertTrue("the S3 error code stays: " + reported.getMessage(), reported.getMessage().contains("InvalidAccessKeyId"));
+        assertEquals(message, lance.getMessage());
+        // A message without a credential is reported as the exception itself.
+        IllegalArgumentException clean = new IllegalArgumentException(LANCE_MESSAGE);
+        assertSame(clean, LanceInvalidInput.unwrap(new IOException(clean)));
+    }
+
+    /**
      * The criterion depends on two conventions of the bundled Lance SDK:
      * the display prefix of {@code Error::InvalidInput} and the package
      * its native methods live in. Both are checked here against

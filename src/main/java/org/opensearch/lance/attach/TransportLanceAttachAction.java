@@ -178,7 +178,17 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         // failed with ResourceAlreadyExistsException, which this state
         // predates. verifyExistingLanceIndex reads a fresher state then.
         BooleanSupplier cancelled = task instanceof CancellableTask cancellable ? cancellable::isCancelled : () -> false;
-        attach(request, cancelled, listener);
+        try {
+            attach(request, cancelled, listener);
+        } catch (Exception e) {
+            // A Lance open against an object store fails with the
+            // store's error body in the message, and S3 echoes the
+            // access key id in it. The exception goes to the client as
+            // the response and to the REST layer's WARN line, so hand
+            // out a copy with the credential shaped values redacted;
+            // the copy keeps the status and the frames.
+            throw StorageOptions.redactCredentials(e);
+        }
     }
 
     private void attach(LanceAttachRequest request, BooleanSupplier cancelled, ActionListener<LanceAttachResponse> listener)
@@ -375,7 +385,11 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
                         ensured.existing()
                     );
                 } catch (Exception e) {
-                    LOG.warn("async text_analyzer backfill failed for table {}; re-attach to retry", table, e);
+                    LOG.warn(
+                        "async text_analyzer backfill failed for table {}; re-attach to retry",
+                        table,
+                        StorageOptions.redactCredentials(e)
+                    );
                 }
             });
             return new LanceAttachResponse.Backfill(estimatedBytes, "none", threads);

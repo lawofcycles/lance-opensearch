@@ -372,7 +372,10 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
             }
         }
         for (FailedNodeException failure : nodesResponse.failures()) {
-            nodes.put(failure.nodeId(), new LanceBuildIndexesResponse.NodeResult(null, null, null, failure.getMessage()));
+            nodes.put(
+                failure.nodeId(),
+                new LanceBuildIndexesResponse.NodeResult(null, null, null, StorageOptions.redactCredentials(failure.getMessage()))
+            );
             sawServerError = true;
         }
         RestStatus status = sawServerError ? RestStatus.INTERNAL_SERVER_ERROR : sawBadRequest ? RestStatus.BAD_REQUEST : RestStatus.OK;

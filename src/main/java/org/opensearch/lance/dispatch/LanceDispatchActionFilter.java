@@ -32,6 +32,7 @@ import org.opensearch.index.query.DisMaxQueryBuilder;
 import org.opensearch.index.query.NestedQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.tasks.Task;
@@ -188,10 +189,20 @@ public class LanceDispatchActionFilter implements ActionFilter {
         searchRequest.setParentTask(clusterService.localNode().getId(), task.getId());
         @SuppressWarnings("unchecked")
         final ActionListener<SearchResponse> typedListener = (ActionListener<SearchResponse>) listener;
+        // The failure of a fragment executor arrives here with Lance's
+        // message, and an object store error body in it echoes the
+        // access key id. This is the last plugin code before the REST
+        // layer renders the failure and logs it, so the client and the
+        // log get a copy with credential shaped values redacted; a
+        // failure without any is passed on as it is.
+        final ActionListener<SearchResponse> redactingListener = ActionListener.wrap(
+            typedListener::onResponse,
+            e -> typedListener.onFailure(StorageOptions.redactCredentials(e))
+        );
         AbstractRunnable entry = new AbstractRunnable() {
             @Override
             protected void doRun() {
-                client.execute(LanceCoordinatorAction.INSTANCE, searchRequest, typedListener);
+                client.execute(LanceCoordinatorAction.INSTANCE, searchRequest, redactingListener);
             }
 
             @Override

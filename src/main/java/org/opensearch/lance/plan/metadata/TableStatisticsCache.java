@@ -20,6 +20,8 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
+import org.opensearch.lance.StorageOptions;
+
 /**
  * Node scoped cache of {@link TableStatistics}, one entry per
  * {@code (table URI, manifest version)}. A manifest version is immutable,
@@ -194,9 +196,18 @@ public final class TableStatisticsCache {
             } finally {
                 pending.remove(key);
             }
-        } catch (RuntimeException e) {
+        } catch (Exception e) {
+            // Exception, not RuntimeException: the Lance JNI throws the
+            // checked IOException of a failed object store open without
+            // declaring it. The exception is logged with credential
+            // shaped values redacted (S3 echoes the access key id in its
+            // error body).
             failures.incrementAndGet();
-            LOGGER.warn("table statistics of {} could not be collected; requests plan without them", tableUri, e);
+            LOGGER.warn(
+                "table statistics of {} could not be collected; requests plan without them",
+                tableUri,
+                StorageOptions.redactCredentials(e)
+            );
         }
     }
 
@@ -209,16 +220,22 @@ public final class TableStatisticsCache {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             LOGGER.debug("table statistics collection of {} interrupted", key);
-        } catch (RuntimeException e) {
+        } catch (Exception e) {
             // Statistics are an input to plan quality, not to
             // correctness: the requests keep planning without them and
             // the next lookup tries again. The counter is what tells an
             // operator that the collections keep failing (a table that
             // moved, revoked credentials): a permanent failure is a
             // counter that keeps climbing while the miss counter alone
-            // also climbs on legitimate misses.
+            // also climbs on legitimate misses. Exception, not
+            // RuntimeException, because the Lance JNI throws the checked
+            // IOException of a failed open without declaring it.
             failures.incrementAndGet();
-            LOGGER.warn("table statistics of {} could not be collected; requests plan without them", key, e);
+            LOGGER.warn(
+                "table statistics of {} could not be collected; requests plan without them",
+                key,
+                StorageOptions.redactCredentials(e)
+            );
         } finally {
             pending.remove(key);
         }
