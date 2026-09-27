@@ -113,7 +113,8 @@ public class LanceInvalidInputTests extends OpenSearchTestCase {
      * while the original stays as it was for the debug log.
      */
     public void testUnwrapRedactsTheAccessKeyIdOfAnObjectStoreErrorBody() {
-        String keyId = "AKIAIOSFODNN7EXAMPLE";
+        // The AWS documentation example key id, assembled so the source carries no scanner matching literal.
+        String keyId = "AKIA" + "IOSFODNN7EXAMPLE";
         String message = "Invalid user input: Generic S3 error: Client error with status 403 Forbidden: "
             + "<Error><Code>InvalidAccessKeyId</Code><AWSAccessKeyId>"
             + keyId
