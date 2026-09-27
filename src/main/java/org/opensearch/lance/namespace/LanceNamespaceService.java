@@ -42,6 +42,7 @@ import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceWarmCache;
+import org.opensearch.lance.query.LanceInvalidInput;
 import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
@@ -343,8 +344,10 @@ public final class LanceNamespaceService implements Closeable {
                 // The message is reported by the namespace listing and
                 // the exception logged, so both get credential shaped
                 // values redacted (a catalog error body quoting the
-                // bearer token or an access key id).
-                Exception reported = StorageOptions.redactCredentials(e);
+                // bearer token or an access key id). A store that
+                // refused the registration's credentials is named as
+                // such, so the listing tells it from an unreachable root.
+                Exception reported = LanceInvalidInput.openFailure(e, entry.name());
                 String message = reported.getMessage() == null ? reported.toString() : reported.getMessage();
                 unavailable.put(entry.name(), message);
                 if (warnedInitFailure.add(entry.name())) {
@@ -564,7 +567,7 @@ public final class LanceNamespaceService implements Closeable {
                     // A listing failure (unreachable endpoint, revoked
                     // credentials after a successful initialise) marks the
                     // registration unavailable until a poll succeeds again.
-                    Exception reported = StorageOptions.redactCredentials(e);
+                    Exception reported = LanceInvalidInput.openFailure(e, entry.name());
                     String message = reported.getMessage() == null ? reported.toString() : reported.getMessage();
                     unavailable.put(entry.name(), message);
                     partial.remove(entry.name());
