@@ -68,7 +68,7 @@ import org.opensearch.test.OpenSearchTestCase;
  * <p>Scans, each returning {@code _rowaddr} and {@code _score} like
  * the hits scan of {@code LanceFtsWeight}: (a) whole table with
  * {@code limit(1_000_000)}, the probe at the default
- * {@code lance.fts.subset_probe_limit}; (b) whole table without a
+ * {@code plugins.lance.fts.subset_probe_limit}; (b) whole table without a
  * limit, the probe without the top k plan the limit makes Lance
  * build; (c) restricted to fragments 0 to 2 without a limit, the
  * fallback; (d) the scan of (b) closed after the batch that carries

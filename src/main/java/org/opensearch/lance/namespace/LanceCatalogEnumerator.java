@@ -261,7 +261,7 @@ final class LanceCatalogEnumerator {
      * table's base location, and Unity the table's storage location. A
      * trailing slash (Glue storage descriptors sometimes carry one) is
      * stripped so the value matches the path shape
-     * {@code index.lance.table} persists.
+     * {@code index.plugins.lance.table} persists.
      */
     static String tableLocation(DescribeTableResponse response) {
         if (response == null) {

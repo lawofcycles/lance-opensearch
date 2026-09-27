@@ -24,7 +24,7 @@ import org.opensearch.tasks.Task;
 
 /**
  * ActionFilter that withholds the credential entries of
- * {@code index.lance.storage_options.*} from {@code GET /<index>} (the
+ * {@code index.plugins.lance.storage_options.*} from {@code GET /<index>} (the
  * get index API, {@code indices:admin/get}). The stock
  * {@code TransportGetIndexAction} applies OpenSearch's settings filter
  * to the response's {@code defaults} block only and writes each index's
@@ -35,7 +35,7 @@ import org.opensearch.tasks.Task;
  * ({@link StorageOptions#SENSITIVE_INDEX_SETTING_PATTERNS}) over the
  * settings of every Lance backed index in the response and hands the
  * caller a response with them replaced. The settings of an index
- * without {@code index.lance.table} pass through untouched, as does a
+ * without {@code index.plugins.lance.table} pass through untouched, as does a
  * response that carries no settings.
  */
 public final class LanceGetIndexActionFilter implements ActionFilter {
@@ -87,7 +87,7 @@ public final class LanceGetIndexActionFilter implements ActionFilter {
         Map<String, Settings> settings = response.settings();
         Map<String, Settings> filtered = null;
         for (Map.Entry<String, Settings> entry : settings.entrySet()) {
-            String table = entry.getValue().get(LanceEngineFactory.TABLE_SETTING);
+            String table = LanceEngineFactory.tableOf(entry.getValue());
             if (table == null || table.isEmpty()) {
                 continue;
             }

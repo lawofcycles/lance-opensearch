@@ -377,7 +377,7 @@ testClusters.integTest {
     // Speed up namespace surface for the IT. The plugin default (10s) is
     // fine for real deployments but wastes wall-clock time for tests that
     // register a table then assertBusy for the index to appear.
-    setting 'lance.namespace.poll_cadence', '1s'
+    setting 'plugins.lance.namespace.poll_cadence', '1s'
     setting 'path.repo', sharedRepoDir.absolutePath
     // One coordinator thread and a queue of one so the overload IT can
     // make the lance_coordinator pool refuse a request with a burst of
@@ -430,7 +430,7 @@ testClusters.multiNodeIntegTest {
     plugin(project.tasks.bundlePlugin.archiveFile)
     jvmArgs('--add-opens=java.base/java.nio=ALL-UNNAMED')
     systemProperty('arrow.allocation.manager.type', 'Unsafe')
-    setting 'lance.namespace.poll_cadence', '1s'
+    setting 'plugins.lance.namespace.poll_cadence', '1s'
     setting 'path.repo', sharedRepoDir.absolutePath
     // Same one-thread, one-slot lance_coordinator pool as integTest, so
     // the overload IT can make every coordinating node refuse requests.

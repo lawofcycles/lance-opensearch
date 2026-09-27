@@ -89,7 +89,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     private final StorageOptions storageOptions;
     /**
      * Lance manifest version the coordinator enumerated the fragments
-     * of this request from: the version {@code index.lance.version}
+     * of this request from: the version {@code index.plugins.lance.version}
      * or the index's tag pins, or the latest version the coordinator
      * observed when it opened a table that follows the manifest. The
      * coordinator resolves it once per request and ships it on the
@@ -435,7 +435,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
 
     /**
      * Manifest version the executor reads, or {@code -1} when none
-     * was resolved. Same encoding as the {@code index.lance.version}
+     * was resolved. Same encoding as the {@code index.plugins.lance.version}
      * index setting.
      */
     public long pinnedVersion() {

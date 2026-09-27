@@ -93,7 +93,7 @@ final class LanceSchemaDriftDetector {
      * restores the column.
      *
      * <p>The rewritten JSON is persisted with an update-settings call on
-     * {@code index.lance.overrides} (Dynamic for exactly this purpose).
+     * {@code index.plugins.lance.overrides} (Dynamic for exactly this purpose).
      * When persisting fails the stored overrides are returned unchanged
      * and the rewrite retries on the next check.
      */
@@ -164,7 +164,7 @@ final class LanceSchemaDriftDetector {
                 .setSettings(Settings.builder().put(LanceEngineFactory.OVERRIDES_SETTING, rewritten.toJson()).build())
                 .execute()
                 .actionGet();
-            LOG.info("rewrote index.lance.overrides of {} after a Lance schema change: {}", indexName, rewritten.toJson());
+            LOG.info("rewrote index.plugins.lance.overrides of {} after a Lance schema change: {}", indexName, rewritten.toJson());
             return rewritten;
         } catch (Exception e) {
             onFailure.run();

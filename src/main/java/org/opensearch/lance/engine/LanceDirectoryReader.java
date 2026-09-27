@@ -456,7 +456,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
      * of the reader cut into fragment groups by {@code groupScan} so a
      * request over many fragments loads a column on several threads (see
      * {@link FragmentGroupScan}). The fragment executor passes the node's
-     * {@code index_searcher} pool and {@code lance.fragment_path.parallelism};
+     * {@code index_searcher} pool and {@code plugins.lance.fragment_path.parallelism};
      * the six argument form scans on the calling thread.
      */
     public static LanceDirectoryReader openForSnapshot(

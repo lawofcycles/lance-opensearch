@@ -1021,7 +1021,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             if (indexMetadata == null) {
                 continue;
             }
-            String tableUri = indexMetadata.getSettings().get(LanceEngineFactory.TABLE_SETTING);
+            String tableUri = LanceEngineFactory.tableOf(indexMetadata.getSettings());
             if (tableUri == null || tableUri.isEmpty()) {
                 continue;
             }
@@ -1032,7 +1032,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             for (LanceMappingMeta.RenamedField renamed : LanceMappingMeta.renamedFields(indexMetadata.mapping())) {
                 renamedFields.put(renamed.from(), renamed.to());
             }
-            String primaryKeyField = indexMetadata.getSettings().get("index.lance.primary_key_field", "");
+            String primaryKeyField = LancePlugin.PRIMARY_KEY_FIELD_SETTING.get(indexMetadata.getSettings());
             targets.add(
                 new IndexTarget(
                     index,
@@ -1054,7 +1054,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
     /**
      * The manifest version a Lance-backed index reads right now, or
      * {@code -1} when it follows the latest. Same reading of
-     * {@code index.lance.version} as the shard engine
+     * {@code index.plugins.lance.version} as the shard engine
      * ({@link LanceEngineFactory#newReadWriteEngine}): -1 follows the
      * latest manifest, anything else pins. A tag-following index pins to
      * whatever version the tag points at right now; resolving it costs
@@ -1063,8 +1063,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * Session keeps cheap.
      */
     private static long resolvePinnedVersion(IndexMetadata indexMetadata, String tableUri, StorageOptions storageOptions) {
-        long pinnedVersion = indexMetadata.getSettings().getAsLong(LanceEngineFactory.VERSION_SETTING, -1L);
-        String tag = indexMetadata.getSettings().get(LanceEngineFactory.TAG_SETTING, "");
+        long pinnedVersion = LancePlugin.VERSION_SETTING.get(indexMetadata.getSettings());
+        String tag = LancePlugin.TAG_SETTING.get(indexMetadata.getSettings());
         if (pinnedVersion < 0 && !tag.isEmpty()) {
             pinnedVersion = LanceRegistry.resolveTagVersion(tableUri, storageOptions, tag);
         }
@@ -1082,7 +1082,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
 
     /**
      * One Lance-backed index in the request. {@code pinnedVersion}
-     * is the {@code index.lance.version} setting or the resolved tag
+     * is the {@code index.plugins.lance.version} setting or the resolved tag
      * version ({@code -1} when the index follows the latest
      * manifest); it drives the coordinator's own fragment
      * enumeration, whose observed version then travels with every

@@ -47,7 +47,7 @@ import org.opensearch.lance.stats.LanceNodeStats;
  * snapshots. The entries of a version are dropped eagerly when its
  * snapshot closes ({@link #invalidate}) and when the index is deleted
  * (the cache listens to cluster state), and otherwise leave the cache
- * least recently used at {@code lance.fetch_cache.size}.
+ * least recently used at {@code plugins.lance.fetch_cache.size}.
  *
  * <p>The key is per column because every request projects its own
  * columns (its {@code _source} filter, its {@code fields}, the primary
@@ -77,7 +77,7 @@ import org.opensearch.lance.stats.LanceNodeStats;
  * the heap the key and the decoded value cost ({@link #weightOf}), so a
  * long text column or a wide struct takes the room it uses and the
  * eviction keeps the budget honest. A cell above
- * {@code lance.fetch_cache.max_entry_size} is not stored; its row is
+ * {@code plugins.lance.fetch_cache.max_entry_size} is not stored; its row is
  * then taken on every request. Next to the store, the cache keeps the
  * keys of every {@code (index uuid, version)} it holds
  * ({@link #keysByVersion}), so dropping a version or an index touches
@@ -125,7 +125,7 @@ public final class LanceFetchCache implements ClusterStateListener {
     /**
      * One held cell: the decoded value (null for an Arrow null), the
      * estimate of its heap, and when it was stored on the cache's clock,
-     * for {@code lance.fetch_cache.expire}. {@link #MISSING} stands for
+     * for {@code plugins.lance.fetch_cache.expire}. {@link #MISSING} stands for
      * a row the take did not return.
      */
     static final class Entry {
@@ -293,8 +293,8 @@ public final class LanceFetchCache implements ClusterStateListener {
     /**
      * @param limitBytes    the most the entries may weigh together
      * @param maxEntryBytes the heaviest cell stored
-     * @param enabled       the initial {@code lance.fetch_cache.enabled}
-     * @param expire        the initial {@code lance.fetch_cache.expire}; zero or null for none
+     * @param enabled       the initial {@code plugins.lance.fetch_cache.enabled}
+     * @param expire        the initial {@code plugins.lance.fetch_cache.expire}; zero or null for none
      */
     public LanceFetchCache(long limitBytes, long maxEntryBytes, boolean enabled, TimeValue expire) {
         this(limitBytes, maxEntryBytes, enabled, expire, System::nanoTime);
@@ -358,12 +358,12 @@ public final class LanceFetchCache implements ClusterStateListener {
         return new Table(indexUuid, version);
     }
 
-    /** Current {@code lance.fetch_cache.enabled}. */
+    /** Current {@code plugins.lance.fetch_cache.enabled}. */
     public boolean isEnabled() {
         return enabled;
     }
 
-    /** Applies {@code lance.fetch_cache.enabled}; turning the cache off drops every entry. */
+    /** Applies {@code plugins.lance.fetch_cache.enabled}; turning the cache off drops every entry. */
     public void setEnabled(boolean enabled) {
         this.enabled = enabled;
         if (!enabled) {
@@ -371,7 +371,7 @@ public final class LanceFetchCache implements ClusterStateListener {
         }
     }
 
-    /** Applies {@code lance.fetch_cache.expire}; zero keeps entries until their version is dropped or they are evicted. */
+    /** Applies {@code plugins.lance.fetch_cache.expire}; zero keeps entries until their version is dropped or they are evicted. */
     public void setExpire(TimeValue expire) {
         this.expireNanos = expire == null ? 0L : expire.nanos();
     }

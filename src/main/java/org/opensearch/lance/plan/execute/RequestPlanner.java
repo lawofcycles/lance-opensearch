@@ -151,8 +151,8 @@ public final class RequestPlanner {
      * The cost inputs a coordinator plans with: the data nodes the
      * request fans out over, the storage kind of the table URI, this
      * node's CPUs, the two parallelism settings and the two aggregation
-     * routing settings ({@code lance.aggregation.pushdown},
-     * {@code lance.aggregation.pushdown_max_groups}) at their current
+     * routing settings ({@code plugins.lance.aggregation.pushdown},
+     * {@code plugins.lance.aggregation.pushdown_max_groups}) at their current
      * values. The coordinator and the explain endpoint both build their
      * inputs here, so the two plan the same request the same way.
      */

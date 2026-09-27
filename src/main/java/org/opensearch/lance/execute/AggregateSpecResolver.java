@@ -428,7 +428,7 @@ final class AggregateSpecResolver {
      * top-k instead of every group: {@code sortSlot} is the metric the
      * order names (-1 for {@code _count} descending), {@code sortAsc}
      * its direction, and {@code perScanLimit} is {@code shard_size}
-     * times {@code lance.aggregation.pushdown_topk_slack}, the groups
+     * times {@code plugins.lance.aggregation.pushdown_topk_slack}, the groups
      * each scan retains. Only set when every metric of the plan is a
      * plain measure: a {@code cardinality} spreads a group over its
      * distinct values and a {@code percentiles} needs the bounds of
@@ -528,7 +528,7 @@ final class AggregateSpecResolver {
      * estimate, built from the table statistics (the distinct counts of
      * the bitmap indexes, the date intervals, the range and filter
      * counts) when every key has one, with the same
-     * {@code lance.aggregation.pushdown_max_groups} and priced the
+     * {@code plugins.lance.aggregation.pushdown_max_groups} and priced the
      * pushed form as infinite when it exceeded the bound; this estimate
      * is built from the request shape instead ({@code shard_size} of
      * every terms level, the range and filter counts) and protects the
@@ -545,7 +545,7 @@ final class AggregateSpecResolver {
      * @param multiFields the index's keyword sub-field spec
      * @param qsc the mapping of the index the request targets
      * @param maxGroups the bound on the estimated number of groups,
-     *     {@code lance.aggregation.pushdown_max_groups} read from the
+     *     {@code plugins.lance.aggregation.pushdown_max_groups} read from the
      *     node settings
      */
     static ResolvedAggregate resolve(

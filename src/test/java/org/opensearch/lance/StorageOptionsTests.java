@@ -117,7 +117,7 @@ public class StorageOptionsTests extends OpenSearchTestCase {
         Settings settings = Settings.builder()
             .put(StorageOptions.INDEX_SETTING_PREFIX + "aws_region", "us-east-1")
             .put("index.number_of_shards", 1)
-            .put("index.lance.table", "/tmp/table.lance")
+            .put("index.plugins.lance.table", "/tmp/table.lance")
             .build();
         StorageOptions options = StorageOptions.fromIndexSettings(settings);
         assertEquals(Map.of("aws_region", "us-east-1"), options.asMap());

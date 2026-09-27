@@ -1205,7 +1205,7 @@ public class RestAttachAction extends BaseRestHandler {
         } catch (IllegalArgumentException e) {
             throw e;
         } catch (Exception e) {
-            throw new IllegalArgumentException("failed to parse index.lance.multi_fields JSON: " + e.getMessage(), e);
+            throw new IllegalArgumentException("failed to parse index.plugins.lance.multi_fields JSON: " + e.getMessage(), e);
         }
     }
 

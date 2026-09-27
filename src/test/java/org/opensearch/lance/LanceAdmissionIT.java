@@ -22,17 +22,17 @@ import org.opensearch.core.rest.RestStatus;
 /**
  * Admission control end to end. The fixture's indexes and scans are
  * declared as not fitting the index cache shard through
- * {@code lance.test.index_cache_shard_share}, and the headroom is
+ * {@code plugins.lance.test.index_cache_shard_share}, and the headroom is
  * raised to 1 PB so any host's available memory is below it: an
  * unbounded full text shape must answer 429 with the
  * {@code lance_admission} label before its scan starts, a bounded top-k
  * page must answer the same 429 (it rebuilds the same document set)
- * until {@code lance.admission.bounded_shapes_gated} opts it out, and
+ * until {@code plugins.lance.admission.bounded_shapes_gated} opts it out, and
  * disabling the gate must let the unbounded shape through again. The
  * stats block must count the rejections per kind, report the node's
  * available memory and the memory earlier admitted scans left behind,
  * and with the readings scripted through
- * {@code lance.test.admission_available_memory} a repeat of an admitted
+ * {@code plugins.lance.test.admission_available_memory} a repeat of an admitted
  * unbounded shape must be admitted on that credit alone. The other
  * kinds (a scalar index load, a filter scan, a nearest scan, a pushed
  * aggregate, a sorted page) are each refused under the same overrides
@@ -66,8 +66,8 @@ public class LanceAdmissionIT extends LanceRestTestCase {
             Map<String, Object> warm = admissionStats();
             assertTrue(warm.toString(), ((Number) warm.get("available_bytes")).longValue() > 0L);
 
-            updateClusterSetting("lance.test.index_cache_shard_share", "\"1b\"");
-            updateClusterSetting("lance.admission.headroom", "\"1pb\"");
+            updateClusterSetting("plugins.lance.test.index_cache_shard_share", "\"1b\"");
+            updateClusterSetting("plugins.lance.admission.headroom", "\"1pb\"");
             try {
                 ResponseException failure = expectThrows(
                     ResponseException.class,
@@ -96,16 +96,16 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 // Disabling the gate lets the same unbounded shape
                 // through; the rejection count stays where it was.
                 long rejected = rejections(admission, "fts");
-                updateClusterSetting("lance.admission.enabled", "false");
+                updateClusterSetting("plugins.lance.admission.enabled", "false");
                 String disabled = readAll(postJson("/" + indexName + "/_search?request_cache=false", UNBOUNDED));
                 assertEquals(8, extractIntPath(disabled, "hits", "total", "value"));
                 Map<String, Object> after = admissionStats();
                 assertEquals(after.toString(), false, after.get("enabled"));
                 assertEquals(after.toString(), rejected, rejections(after, "fts"));
             } finally {
-                updateClusterSetting("lance.admission.enabled", null);
-                updateClusterSetting("lance.admission.headroom", null);
-                updateClusterSetting("lance.test.index_cache_shard_share", null);
+                updateClusterSetting("plugins.lance.admission.enabled", null);
+                updateClusterSetting("plugins.lance.admission.headroom", null);
+                updateClusterSetting("plugins.lance.test.index_cache_shard_share", null);
             }
 
             // Back at the defaults the unbounded shape answers as before.
@@ -118,8 +118,8 @@ public class LanceAdmissionIT extends LanceRestTestCase {
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "ftsadmissionb")) {
             String indexName = fixture.indexName();
 
-            updateClusterSetting("lance.test.index_cache_shard_share", "\"1b\"");
-            updateClusterSetting("lance.admission.headroom", "\"1pb\"");
+            updateClusterSetting("plugins.lance.test.index_cache_shard_share", "\"1b\"");
+            updateClusterSetting("plugins.lance.admission.headroom", "\"1pb\"");
             try {
                 // A bounded top-k page rebuilds the same document set,
                 // so it is judged by the same comparison and refused.
@@ -132,7 +132,10 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 assertEquals("expected 429, saw " + status + ": " + body, RestStatus.TOO_MANY_REQUESTS.getStatus(), status);
                 assertTrue("expected the admission label: " + body, body.contains("lance_admission"));
                 assertTrue("expected the bounded wording: " + body, body.contains("bounded full text page"));
-                assertTrue("expected the opt-out setting in the message: " + body, body.contains("lance.admission.bounded_shapes_gated"));
+                assertTrue(
+                    "expected the opt-out setting in the message: " + body,
+                    body.contains("plugins.lance.admission.bounded_shapes_gated")
+                );
 
                 // The estimate carries the page's own scan buffer: 16
                 // rows at 52 bytes for the document set plus the page
@@ -151,7 +154,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 // the projected columns' widths plus the row address,
                 // doubled, do not fit a share of one byte and the headroom
                 // leaves nothing, so the 429 names fetch_take, not fts.
-                updateClusterSetting("lance.admission.bounded_shapes_gated", "false");
+                updateClusterSetting("plugins.lance.admission.bounded_shapes_gated", "false");
                 long ftsRejected = rejections(admission, "fts");
                 long takeRejected = rejections(admission, "fetch_take");
                 String take = expectAdmissionRefusal(indexName, BOUNDED, "fetch_take");
@@ -170,7 +173,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 assertTrue(readAll(stillGated.getResponse()).contains("fts estimate"));
                 // With the share back at the node's the page's take fits
                 // it and the page answers.
-                updateClusterSetting("lance.test.index_cache_shard_share", null);
+                updateClusterSetting("plugins.lance.test.index_cache_shard_share", null);
                 Response bounded = postJson("/" + indexName + "/_search?request_cache=false", BOUNDED);
                 assertEquals(RestStatus.OK.getStatus(), bounded.getStatusLine().getStatusCode());
                 assertEquals(8, extractIntPath(readAll(bounded), "hits", "total", "value"));
@@ -178,9 +181,9 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 assertEquals(afterPage.toString(), "fetch_take", afterPage.get("last_kind"));
                 assertEquals(afterPage.toString(), 0L, ((Number) afterPage.get("last_estimate_bytes")).longValue());
             } finally {
-                updateClusterSetting("lance.admission.bounded_shapes_gated", null);
-                updateClusterSetting("lance.admission.headroom", null);
-                updateClusterSetting("lance.test.index_cache_shard_share", null);
+                updateClusterSetting("plugins.lance.admission.bounded_shapes_gated", null);
+                updateClusterSetting("plugins.lance.admission.headroom", null);
+                updateClusterSetting("plugins.lance.test.index_cache_shard_share", null);
             }
 
             // Back at the defaults the bounded page answers as before.
@@ -201,14 +204,14 @@ public class LanceAdmissionIT extends LanceRestTestCase {
             // memory readings are scripted so what a scan leaves behind
             // is known: without the script a 16 row scan leaves nothing
             // the kernel's kibibyte granularity could show.
-            updateClusterSetting("lance.test.index_cache_shard_share", "\"1b\"");
+            updateClusterSetting("plugins.lance.test.index_cache_shard_share", "\"1b\"");
             try {
                 // The pool of memory earlier admitted scans left behind
                 // outlives the other tests of this cluster, and a pool
                 // above 356 bytes would admit the refusal below on its
                 // own. An admission at a reading above every earlier one
                 // starts the pool over with nothing retained.
-                updateClusterSetting("lance.test.admission_available_memory", "[\"1pb\"]");
+                updateClusterSetting("plugins.lance.test.admission_available_memory", "[\"1pb\"]");
                 String fresh = readAll(postJson("/" + indexName + "/_search?request_cache=false", UNBOUNDED));
                 assertEquals(8, extractIntPath(fresh, "hits", "total", "value"));
                 assertEquals(admissionStats().toString(), 0L, ((Number) admissionStats().get("retained_bytes")).longValue());
@@ -216,8 +219,8 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 // A reading of 1000 bytes and a headroom of 500 leave 500
                 // for an 856 byte estimate. Nothing has been retained
                 // yet, so the shape is refused and the message says so.
-                updateClusterSetting("lance.test.admission_available_memory", "[\"1000b\"]");
-                updateClusterSetting("lance.admission.headroom", "\"500b\"");
+                updateClusterSetting("plugins.lance.test.admission_available_memory", "[\"1000b\"]");
+                updateClusterSetting("plugins.lance.admission.headroom", "\"500b\"");
                 ResponseException refused = expectThrows(
                     ResponseException.class,
                     () -> postJson("/" + indexName + "/_search?request_cache=false", UNBOUNDED)
@@ -235,7 +238,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 // the pool records the 1000 byte drop clamped to the
                 // estimate. The stats then read 1000 and report the
                 // credit next to it.
-                updateClusterSetting("lance.test.admission_available_memory", "[\"2000b\",\"1000b\"]");
+                updateClusterSetting("plugins.lance.test.admission_available_memory", "[\"2000b\",\"1000b\"]");
                 String first = readAll(postJson("/" + indexName + "/_search?request_cache=false", UNBOUNDED));
                 assertEquals(8, extractIntPath(first, "hits", "total", "value"));
                 admission = admissionStats();
@@ -282,17 +285,17 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 // Recovery decays the credit: 300 of the 1000 bytes come
                 // back and 556 remain credited; all of it back and nothing
                 // is.
-                updateClusterSetting("lance.test.admission_available_memory", "[\"1300b\"]");
+                updateClusterSetting("plugins.lance.test.admission_available_memory", "[\"1300b\"]");
                 admission = admissionStats();
                 assertEquals(admission.toString(), 1300L, ((Number) admission.get("available_bytes")).longValue());
                 assertEquals(admission.toString(), estimate - 300L, ((Number) admission.get("retained_bytes")).longValue());
-                updateClusterSetting("lance.test.admission_available_memory", "[\"2000b\"]");
+                updateClusterSetting("plugins.lance.test.admission_available_memory", "[\"2000b\"]");
                 admission = admissionStats();
                 assertEquals(admission.toString(), 0L, ((Number) admission.get("retained_bytes")).longValue());
 
                 // With nothing retained the same 500 bytes left refuse
                 // again: the admissions above were the credit's doing.
-                updateClusterSetting("lance.admission.headroom", "\"1500b\"");
+                updateClusterSetting("plugins.lance.admission.headroom", "\"1500b\"");
                 ResponseException refusedAgain = expectThrows(
                     ResponseException.class,
                     () -> postJson("/" + indexName + "/_search?request_cache=false", UNBOUNDED)
@@ -306,9 +309,9 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 assertTrue(bodyAgain, bodyAgain.contains("[0b] retained by earlier admitted scans"));
                 assertEquals(rejected + 1, rejections(admissionStats(), "fts"));
             } finally {
-                updateClusterSetting("lance.admission.headroom", null);
-                updateClusterSetting("lance.test.admission_available_memory", null);
-                updateClusterSetting("lance.test.index_cache_shard_share", null);
+                updateClusterSetting("plugins.lance.admission.headroom", null);
+                updateClusterSetting("plugins.lance.test.admission_available_memory", null);
+                updateClusterSetting("plugins.lance.test.index_cache_shard_share", null);
             }
 
             // Back at the defaults the unbounded shape answers as before.
@@ -403,8 +406,8 @@ public class LanceAdmissionIT extends LanceRestTestCase {
             // plans; wait for them before the gated shapes run.
             awaitTableStatistics();
 
-            updateClusterSetting("lance.test.index_cache_shard_share", "\"1b\"");
-            updateClusterSetting("lance.admission.headroom", "\"1pb\"");
+            updateClusterSetting("plugins.lance.test.index_cache_shard_share", "\"1b\"");
+            updateClusterSetting("plugins.lance.admission.headroom", "\"1pb\"");
             try {
                 // A term on the bitmap column: the bitmap load is the
                 // first path judged and refused. The estimate is the
@@ -448,7 +451,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 // Disabling the gate lets every shape through again and
                 // the counters stand.
                 Map<String, Object> refused = admissionStats();
-                updateClusterSetting("lance.admission.enabled", "false");
+                updateClusterSetting("plugins.lance.admission.enabled", "false");
                 assertEquals(
                     bitmapHits,
                     extractIntPath(
@@ -479,9 +482,9 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 assertEquals(disabled.toString(), false, disabled.get("enabled"));
                 assertEquals(disabled.get("rejections").toString(), refused.get("rejections"), disabled.get("rejections"));
             } finally {
-                updateClusterSetting("lance.admission.enabled", null);
-                updateClusterSetting("lance.admission.headroom", null);
-                updateClusterSetting("lance.test.index_cache_shard_share", null);
+                updateClusterSetting("plugins.lance.admission.enabled", null);
+                updateClusterSetting("plugins.lance.admission.headroom", null);
+                updateClusterSetting("plugins.lance.test.index_cache_shard_share", null);
             }
 
             // Back at the defaults every shape answers as before.
@@ -523,8 +526,8 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 1,
                 extractIntPath(readAll(postJson("/" + indexName + "/_search?request_cache=false", term)), "hits", "total", "value")
             );
-            updateClusterSetting("lance.test.index_cache_shard_share", "\"1b\"");
-            updateClusterSetting("lance.admission.headroom", "\"1pb\"");
+            updateClusterSetting("plugins.lance.test.index_cache_shard_share", "\"1b\"");
+            updateClusterSetting("plugins.lance.admission.headroom", "\"1pb\"");
             try {
                 // id carries no scalar index: no scalar_index decision,
                 // the filter scan is refused on its row addresses (16
@@ -547,13 +550,13 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 String bounded = expectAdmissionRefusal(indexName, page, "filter_scan");
                 assertTrue(bounded, bounded.contains("bounded filter scan over"));
                 assertTrue(bounded, bounded.contains("3 of 16 rows expected to match"));
-                updateClusterSetting("lance.admission.bounded_shapes_gated", "false");
+                updateClusterSetting("plugins.lance.admission.bounded_shapes_gated", "false");
                 String capped = expectAdmissionRefusal(indexName, page, "filter_scan");
                 assertTrue(capped, capped.contains("2 of 16 rows expected to match"));
             } finally {
-                updateClusterSetting("lance.admission.bounded_shapes_gated", null);
-                updateClusterSetting("lance.admission.headroom", null);
-                updateClusterSetting("lance.test.index_cache_shard_share", null);
+                updateClusterSetting("plugins.lance.admission.bounded_shapes_gated", null);
+                updateClusterSetting("plugins.lance.admission.headroom", null);
+                updateClusterSetting("plugins.lance.test.index_cache_shard_share", null);
             }
             assertEquals(
                 1,
@@ -573,8 +576,8 @@ public class LanceAdmissionIT extends LanceRestTestCase {
             // first so no earlier take of this fixture has filled the
             // fetch cache with the rows the page renders.
             String page = "{\"size\":10,\"query\":{\"match_all\":{}}}";
-            updateClusterSetting("lance.test.index_cache_shard_share", "\"1b\"");
-            updateClusterSetting("lance.admission.headroom", "\"1pb\"");
+            updateClusterSetting("plugins.lance.test.index_cache_shard_share", "\"1b\"");
+            updateClusterSetting("plugins.lance.admission.headroom", "\"1pb\"");
             try {
                 Map<String, Object> before = admissionStats();
                 String body = expectAdmissionRefusal(indexName, page, "fetch_take");
@@ -590,8 +593,8 @@ public class LanceAdmissionIT extends LanceRestTestCase {
                 assertEquals(after.toString(), "request", after.get("last_source"));
                 assertTrue(after.toString(), ((Number) after.get("last_estimate_bytes")).longValue() > 0L);
             } finally {
-                updateClusterSetting("lance.admission.headroom", null);
-                updateClusterSetting("lance.test.index_cache_shard_share", null);
+                updateClusterSetting("plugins.lance.admission.headroom", null);
+                updateClusterSetting("plugins.lance.test.index_cache_shard_share", null);
             }
             // At the defaults the ten rows fit the node's shard share: the
             // take is admitted at estimate zero, recorded under its kind,

@@ -36,12 +36,13 @@ import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.LanceRegistry;
+import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.threadpool.ThreadPool;
 
 /**
  * Node-local shallow clones of Lance tables, for indexes attached with
- * {@code index.lance.index_placement = node_local}.
+ * {@code index.plugins.lance.index_placement = node_local}.
  *
  * <p>A table on a source the OpenSearch process cannot write to (a
  * read-only mount, an object-store prefix without write access) cannot
@@ -84,7 +85,7 @@ public final class LanceLocalClones implements ClusterStateListener {
 
     private static final Logger LOG = LogManager.getLogger(LanceLocalClones.class);
 
-    /** Values of {@code index.lance.index_placement}. */
+    /** Values of {@code index.plugins.lance.index_placement}. */
     public static final String PLACEMENT_IN_TABLE = "in_table";
     public static final String PLACEMENT_NODE_LOCAL = "node_local";
 
@@ -113,7 +114,7 @@ public final class LanceLocalClones implements ClusterStateListener {
 
     /** Whether the index settings ask for node-local placement. */
     public static boolean isNodeLocal(Settings indexSettings) {
-        return PLACEMENT_NODE_LOCAL.equals(indexSettings.get(LanceEngineFactory.INDEX_PLACEMENT_SETTING, PLACEMENT_IN_TABLE));
+        return PLACEMENT_NODE_LOCAL.equals(LancePlugin.INDEX_PLACEMENT_SETTING.get(indexSettings));
     }
 
     /** What the marker file records about the current clone. */

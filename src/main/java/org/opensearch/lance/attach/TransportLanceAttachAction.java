@@ -186,7 +186,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         String table = request.table();
         if (!allowedRoots.allows(table)) {
             throw new OpenSearchStatusException(
-                "table [" + table + "] is not under any of the configured lance.allowed_table_roots",
+                "table [" + table + "] is not under any of the configured plugins.lance.allowed_table_roots",
                 RestStatus.FORBIDDEN
             );
         }
@@ -526,7 +526,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
             + NativeMemoryLimit.humanReadable(estimate)
             + ") may not fit one index cache shard ("
             + NativeMemoryLimit.humanReadable(sizing.shardShareBytes())
-            + "); raise lance.native_memory.limit or lower lance.cache.column_share";
+            + "); raise plugins.lance.native_memory.limit or lower plugins.lance.cache.column_share";
     }
 
     private void createIndex(
@@ -557,7 +557,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         CreateIndexRequest create = new CreateIndexRequest(indexName).settings(settings.build()).mapping(derivation.mappingJson());
 
         // LanceCreateIndexActionFilter blocks user PUT /{index} that
-        // tries to set index.lance.table. Stamp the internal header so
+        // tries to set index.plugins.lance.table. Stamp the internal header so
         // this plugin-issued call is recognised as legitimate. The
         // header lives in this node's ThreadContext only, which is
         // enough because this code runs on the elected cluster manager
@@ -621,7 +621,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
             );
             return;
         }
-        String existing = md.getSettings().get(LanceEngineFactory.TABLE_SETTING);
+        String existing = LanceEngineFactory.tableOf(md.getSettings());
         if (existing == null) {
             listener.onFailure(
                 new OpenSearchStatusException(

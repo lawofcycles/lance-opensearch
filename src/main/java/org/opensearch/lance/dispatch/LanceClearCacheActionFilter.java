@@ -142,7 +142,7 @@ public final class LanceClearCacheActionFilter implements ActionFilter {
             if (indexMetadata == null) {
                 continue;
             }
-            String table = indexMetadata.getSettings().get(LanceEngineFactory.TABLE_SETTING);
+            String table = LanceEngineFactory.tableOf(indexMetadata.getSettings());
             if (table != null && !table.isEmpty()) {
                 uuids.add(index.getUUID());
             }

@@ -37,7 +37,15 @@ import org.opensearch.core.common.io.stream.StreamOutput;
 public final class StorageOptions {
 
     /** Index-settings prefix under which entries are persisted. */
-    public static final String INDEX_SETTING_PREFIX = "index.lance.storage_options.";
+    public static final String INDEX_SETTING_PREFIX = "index.plugins.lance.storage_options.";
+
+    /**
+     * Index-settings prefix the first preview releases persisted the
+     * entries under. Still read, through the fallback of the group setting
+     * registered in {@code LancePlugin}, so an index created under it keeps
+     * its options; never written.
+     */
+    public static final String DEPRECATED_INDEX_SETTING_PREFIX = "index.lance.storage_options.";
 
     /**
      * The words that mark a storage option or namespace config key as a
@@ -55,8 +63,9 @@ public final class StorageOptions {
 
     /**
      * Glob patterns for OpenSearch's {@code SettingsFilter} that remove
-     * the credential entries of {@link #INDEX_SETTING_PREFIX} from the
-     * settings and cluster state APIs. Three patterns per word of
+     * the credential entries of {@link #INDEX_SETTING_PREFIX} and of
+     * {@link #DEPRECATED_INDEX_SETTING_PREFIX} from the settings and
+     * cluster state APIs. Three patterns per prefix and word of
      * {@link #SENSITIVE_KEY_WORDS}: lower case ({@code aws_secret_access_key}),
      * upper case ({@code AWS_SECRET_ACCESS_KEY}) and capitalised
      * ({@code header.Authorization}). The filter matches
@@ -67,11 +76,13 @@ public final class StorageOptions {
     public static final List<String> SENSITIVE_INDEX_SETTING_PATTERNS = sensitiveIndexSettingPatterns();
 
     private static List<String> sensitiveIndexSettingPatterns() {
-        List<String> patterns = new ArrayList<>(SENSITIVE_KEY_WORDS.size() * 3);
-        for (String word : SENSITIVE_KEY_WORDS) {
-            patterns.add(INDEX_SETTING_PREFIX + "*" + word + "*");
-            patterns.add(INDEX_SETTING_PREFIX + "*" + word.toUpperCase(Locale.ROOT) + "*");
-            patterns.add(INDEX_SETTING_PREFIX + "*" + word.substring(0, 1).toUpperCase(Locale.ROOT) + word.substring(1) + "*");
+        List<String> patterns = new ArrayList<>(SENSITIVE_KEY_WORDS.size() * 6);
+        for (String prefix : List.of(INDEX_SETTING_PREFIX, DEPRECATED_INDEX_SETTING_PREFIX)) {
+            for (String word : SENSITIVE_KEY_WORDS) {
+                patterns.add(prefix + "*" + word + "*");
+                patterns.add(prefix + "*" + word.toUpperCase(Locale.ROOT) + "*");
+                patterns.add(prefix + "*" + word.substring(0, 1).toUpperCase(Locale.ROOT) + word.substring(1) + "*");
+            }
         }
         return Collections.unmodifiableList(patterns);
     }
@@ -163,12 +174,14 @@ public final class StorageOptions {
     }
 
     /**
-     * Read the {@code index.lance.storage_options.*} group from index
-     * settings back into a {@link StorageOptions}. Returns {@link #empty()}
+     * Read the {@code index.plugins.lance.storage_options.*} group from
+     * index settings back into a {@link StorageOptions}; an index created
+     * under the deprecated {@code index.lance.storage_options.*} prefix is
+     * read through the group setting's fallback. Returns {@link #empty()}
      * when the group is missing.
      */
     public static StorageOptions fromIndexSettings(Settings settings) {
-        Settings group = settings.getByPrefix(INDEX_SETTING_PREFIX);
+        Settings group = LancePlugin.STORAGE_OPTIONS_SETTING.get(settings);
         Map<String, String> map = new LinkedHashMap<>();
         for (String key : group.keySet()) {
             map.put(key, group.get(key));

@@ -350,7 +350,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         String body = "{\"query\":{\"range\":{\"id\":{\"gte\":250}}},\"size\":0,\"track_total_hits\":true,"
             + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}";
         try {
-            updateClusterSetting("lance.test.statistics_collect_delay", "8s");
+            updateClusterSetting("plugins.lance.test.statistics_collect_delay", "8s");
             awaitTableStatistics();
             Map<String, Long> before = planStatistics();
             long prunedBefore = prunedFragments();
@@ -399,7 +399,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertEquals(collected.get("collect_millis_total"), afterSecond.get("collect_millis_total"));
         } finally {
             try {
-                updateClusterSetting("lance.test.statistics_collect_delay", null);
+                updateClusterSetting("plugins.lance.test.statistics_collect_delay", null);
             } catch (Exception ignored) {}
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
@@ -1756,7 +1756,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // all 120 rows through six fragment requests, GET must reach
         // every row, a body no plan answers must be refused, and attach
         // and _plugins/_lance/stats must say what happened.
-        updateClusterSetting("lance.test.max_docs_per_reader", "20");
+        updateClusterSetting("plugins.lance.test.max_docs_per_reader", "20");
         String suffix = "bound-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -1816,7 +1816,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             // GET resolves the key through the Lance scan filter, so a
             // row in a fragment the shard reader does not hold is found.
             // The bound is lowered to one fragment of the key table too.
-            updateClusterSetting("lance.test.max_docs_per_reader", "4");
+            updateClusterSetting("plugins.lance.test.max_docs_per_reader", "4");
             client().performRequest(new Request("POST", "/" + pkTable + "/_close"));
             client().performRequest(new Request("POST", "/" + pkTable + "/_open"));
             ensureGreen(pkTable);
@@ -1850,7 +1850,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
 
             // With the bound back at its default the same requests run as
             // one fragment request and answer the same.
-            updateClusterSetting("lance.test.max_docs_per_reader", null);
+            updateClusterSetting("plugins.lance.test.max_docs_per_reader", null);
             String oneGroup = readAll(postJson("/" + tableName + "/_search", matchAll));
             assertEquals(120, extractIntPath(oneGroup, "hits", "total", "value"));
             assertEquals(idsOf(hitsOf(matchAllBody)), idsOf(hitsOf(oneGroup)));
@@ -1878,7 +1878,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertEquals(400, stillRefused.getResponse().getStatusLine().getStatusCode());
             assertEquals("the refusal ran no fragment request", executed, fragmentRequestsExecuted());
         } finally {
-            updateClusterSetting("lance.test.max_docs_per_reader", null);
+            updateClusterSetting("plugins.lance.test.max_docs_per_reader", null);
             for (String index : List.of(tableName, pkTable)) {
                 try {
                     client().performRequest(new Request("DELETE", "/" + index));

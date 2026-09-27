@@ -35,7 +35,7 @@ public class LanceStatsIT extends LanceRestTestCase {
         // inside the Lance scan and never touches the store, so the
         // pushdown is turned off for this test.
         Request disablePushdown = new Request("PUT", "/_cluster/settings");
-        disablePushdown.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":false}}");
+        disablePushdown.setJsonEntity("{\"transient\":{\"plugins.lance.aggregation.pushdown\":false}}");
         client().performRequest(disablePushdown);
         try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(2, 100, "stats")) {
             String index = fixture.indexName();
@@ -135,7 +135,7 @@ public class LanceStatsIT extends LanceRestTestCase {
             });
         } finally {
             Request enablePushdown = new Request("PUT", "/_cluster/settings");
-            enablePushdown.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":null}}");
+            enablePushdown.setJsonEntity("{\"transient\":{\"plugins.lance.aggregation.pushdown\":null}}");
             client().performRequest(enablePushdown);
         }
     }
@@ -254,7 +254,7 @@ public class LanceStatsIT extends LanceRestTestCase {
 
     public void testWarmUpNoneRecordsSkipped() throws Exception {
         Request none = new Request("PUT", "/_cluster/settings");
-        none.setJsonEntity("{\"transient\":{\"lance.attach.warm_indexes\":\"none\"}}");
+        none.setJsonEntity("{\"transient\":{\"plugins.lance.attach.warm_indexes\":\"none\"}}");
         client().performRequest(none);
         try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(2, 100, "warmnone")) {
             Map<String, Object> node = nodeStats();
@@ -266,7 +266,7 @@ public class LanceStatsIT extends LanceRestTestCase {
             client().performRequest(new Request("DELETE", "/" + fixture.indexName()));
         } finally {
             Request reset = new Request("PUT", "/_cluster/settings");
-            reset.setJsonEntity("{\"transient\":{\"lance.attach.warm_indexes\":null}}");
+            reset.setJsonEntity("{\"transient\":{\"plugins.lance.attach.warm_indexes\":null}}");
             client().performRequest(reset);
         }
     }

@@ -88,13 +88,13 @@ import org.opensearch.search.builder.SearchSourceBuilder;
  * and the index has no reader wrapper (the security plugin's document
  * and field level security, whose answers differ per user). An answer
  * that timed out is not stored (it is partial), nor is one whose
- * aggregations serialise above {@code lance.request_cache.max_entry_size},
+ * aggregations serialise above {@code plugins.lance.request_cache.max_entry_size},
  * nor one the store threw on. Every other request counts as skipped.
  *
  * <p>The store is OpenSearch's {@link Cache}, weighed by the serialised
  * size of the reduced aggregations plus the key, evicted least recently
- * used at {@code lance.request_cache.size}. An entry also leaves the
- * cache when {@code lance.request_cache.expire} has passed since it was
+ * used at {@code plugins.lance.request_cache.size}. An entry also leaves the
+ * cache when {@code plugins.lance.request_cache.expire} has passed since it was
  * stored (checked on the read, so the setting is dynamic), when its
  * index is deleted (the cache listens to cluster state), when
  * {@code POST /<index>/_cache/clear} names the index, and when the cache
@@ -106,7 +106,7 @@ public final class LanceRequestCache implements ClusterStateListener {
 
     /** Why a request was not served from or stored in the cache, as {@code GET /_plugins/_lance/explain/<index>} names it. */
     public enum Skip {
-        /** {@code lance.request_cache.enabled} is false on this node. */
+        /** {@code plugins.lance.request_cache.enabled} is false on this node. */
         DISABLED("disabled"),
         /** The request carried {@code request_cache=false}. */
         OPTED_OUT("request_cache=false"),
@@ -120,7 +120,7 @@ public final class LanceRequestCache implements ClusterStateListener {
         DLS("dls"),
         /** The answer was partial (a node did not answer in time). */
         TIMED_OUT("timed_out"),
-        /** The answer's aggregations serialise above {@code lance.request_cache.max_entry_size}. */
+        /** The answer's aggregations serialise above {@code plugins.lance.request_cache.max_entry_size}. */
         TOO_LARGE("entry above max_entry_size"),
         /** Storing the answer threw (its aggregations could not be measured, or the store rejected the entry). */
         STORE_FAILED("store_failed");
@@ -306,8 +306,8 @@ public final class LanceRequestCache implements ClusterStateListener {
     /**
      * @param limitBytes the most the entries may weigh together
      * @param maxEntryBytes the largest serialised aggregations block stored
-     * @param enabled the initial {@code lance.request_cache.enabled}
-     * @param expire the initial {@code lance.request_cache.expire}; zero for none
+     * @param enabled the initial {@code plugins.lance.request_cache.enabled}
+     * @param expire the initial {@code plugins.lance.request_cache.expire}; zero for none
      */
     public LanceRequestCache(long limitBytes, long maxEntryBytes, boolean enabled, TimeValue expire) {
         this(limitBytes, maxEntryBytes, enabled, expire, System::currentTimeMillis);
@@ -334,12 +334,12 @@ public final class LanceRequestCache implements ClusterStateListener {
             .build();
     }
 
-    /** Current {@code lance.request_cache.enabled}. */
+    /** Current {@code plugins.lance.request_cache.enabled}. */
     public boolean isEnabled() {
         return enabled;
     }
 
-    /** Applies {@code lance.request_cache.enabled}; turning the cache off drops every entry. */
+    /** Applies {@code plugins.lance.request_cache.enabled}; turning the cache off drops every entry. */
     public void setEnabled(boolean enabled) {
         this.enabled = enabled;
         if (!enabled) {
@@ -347,7 +347,7 @@ public final class LanceRequestCache implements ClusterStateListener {
         }
     }
 
-    /** Applies {@code lance.request_cache.expire}; zero keeps entries until their version moves on. */
+    /** Applies {@code plugins.lance.request_cache.expire}; zero keeps entries until their version moves on. */
     public void setExpire(TimeValue expire) {
         this.expireMillis = expire == null ? 0L : expire.millis();
     }

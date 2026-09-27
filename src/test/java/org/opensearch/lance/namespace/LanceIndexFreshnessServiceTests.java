@@ -223,11 +223,11 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
         String tableUri = writeTable("rebuild");
         // The shard's settings view carries the node's secure settings
         // (the keystore seed) next to the index settings; the recreate
-        // must copy the index.lance.* keys and nothing else.
+        // must copy the index.plugins.lance.* keys and nothing else.
         MockSecureSettings secure = new MockSecureSettings();
         secure.setString("keystore.seed", "seed");
         Settings settings = Settings.builder()
-            .put("index.lance.uncovered_fragment_policy", "immediate")
+            .put("index.plugins.lance.uncovered_fragment_policy", "immediate")
             .put("index.number_of_shards", 1)
             .put("index.refresh_interval", "5s")
             .setSecureSettings(secure)
@@ -256,14 +256,14 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
         assertEquals(
             "the previous index's lance settings are carried",
             "immediate",
-            create.settings().get("index.lance.uncovered_fragment_policy")
+            create.settings().get("index.plugins.lance.uncovered_fragment_policy")
         );
         assertFalse(
             "no secure setting travels with the create: " + create.settings().keySet(),
             create.settings().keySet().contains("keystore.seed")
         );
         assertFalse(
-            "only index.lance.* keys are carried: " + create.settings().keySet(),
+            "only index.plugins.lance.* keys are carried: " + create.settings().keySet(),
             create.settings().hasValue("index.refresh_interval")
         );
         assertTrue("the new mapping is the derived one", create.mappings().contains("\"properties\""));

@@ -114,7 +114,7 @@ import org.opensearch.secure_sm.AccessController;
  * pool over under its own identity. The pool is credited only while no
  * other gated request is in flight and no gated scan is running (their
  * memory is in use, not reusable), and not when the process's resident
- * set exceeds {@code lance.native_memory.limit} plus the JVM heap by
+ * set exceeds {@code plugins.lance.native_memory.limit} plus the JVM heap by
  * more than the pool (something the plugin does not account holds
  * memory). Every gated scan reports itself through {@link #scanStarted}
  * and {@link #scanFinished}; {@link LanceHitsAccounting#close} reports
@@ -122,14 +122,14 @@ import org.opensearch.secure_sm.AccessController;
  * so one request counts once in flight however many of its paths were
  * admitted, and is released whether or not its scans ran.
  *
- * <p>The settings ({@code lance.admission.enabled},
- * {@code lance.admission.headroom} and
- * {@code lance.admission.bounded_shapes_gated}) live in static holders
+ * <p>The settings ({@code plugins.lance.admission.enabled},
+ * {@code plugins.lance.admission.headroom} and
+ * {@code plugins.lance.admission.bounded_shapes_gated}) live in static holders
  * read by every decision, the same pattern as {@link LanceFtsQuery}'s
- * probe parameters. {@code lance.test.index_cache_shard_share} overrides
+ * probe parameters. {@code plugins.lance.test.index_cache_shard_share} overrides
  * the shard share the decision compares with so integration tests can
  * declare a small fixture table as not fitting; zero (the default) reads
- * the installed Session's sizing. {@code lance.test.admission_available_memory}
+ * the installed Session's sizing. {@code plugins.lance.test.admission_available_memory}
  * scripts the available memory readings.
  */
 public final class ScanAdmission {
@@ -139,7 +139,7 @@ public final class ScanAdmission {
     /** Label the 429 is reported under, and the prefix of its message. */
     public static final String LABEL = "lance_admission";
 
-    /** Default for {@code lance.admission.headroom}. */
+    /** Default for {@code plugins.lance.admission.headroom}. */
     public static final ByteSizeValue DEFAULT_HEADROOM = new ByteSizeValue(8, ByteSizeUnit.GB);
 
     /**
@@ -429,7 +429,7 @@ public final class ScanAdmission {
 
     /**
      * Scripted available memory readings installed by
-     * {@code lance.test.admission_available_memory}: handed out one per
+     * {@code plugins.lance.test.admission_available_memory}: handed out one per
      * reading, the last one repeating; {@code null} when no override is
      * in force. Guarded by {@link #LOCK}.
      */
@@ -642,7 +642,7 @@ public final class ScanAdmission {
 
     // ---- settings holders, probes and overrides ----
 
-    /** Current value of the {@code lance.admission.enabled} setting. */
+    /** Current value of the {@code plugins.lance.admission.enabled} setting. */
     public static boolean enabled() {
         return enabled;
     }
@@ -652,7 +652,7 @@ public final class ScanAdmission {
         enabled = value;
     }
 
-    /** Current value of the {@code lance.admission.bounded_shapes_gated} setting. */
+    /** Current value of the {@code plugins.lance.admission.bounded_shapes_gated} setting. */
     public static boolean boundedShapesGated() {
         return boundedShapesGated;
     }
@@ -662,7 +662,7 @@ public final class ScanAdmission {
         boundedShapesGated = value;
     }
 
-    /** Current value of the {@code lance.admission.headroom} setting, in bytes. */
+    /** Current value of the {@code plugins.lance.admission.headroom} setting, in bytes. */
     public static long headroomBytes() {
         return headroomBytes;
     }
@@ -673,7 +673,7 @@ public final class ScanAdmission {
     }
 
     /**
-     * Install the {@code lance.test.index_cache_shard_share} override.
+     * Install the {@code plugins.lance.test.index_cache_shard_share} override.
      * Zero clears it and the decisions read the installed Session's
      * sizing again.
      */
@@ -711,7 +711,7 @@ public final class ScanAdmission {
     }
 
     /**
-     * Install the {@code lance.test.admission_available_memory}
+     * Install the {@code plugins.lance.test.admission_available_memory}
      * override: the readings the gate hands out in place of
      * {@code MemAvailable}, one per read with the last one repeating.
      * While the override is in force the resident set is not consulted
@@ -723,7 +723,7 @@ public final class ScanAdmission {
         if (readings != null && !readings.isEmpty()) {
             queue = new ArrayDeque<>(readings.size());
             for (String reading : readings) {
-                queue.addLast(ByteSizeValue.parseBytesSizeValue(reading, "lance.test.admission_available_memory").getBytes());
+                queue.addLast(ByteSizeValue.parseBytesSizeValue(reading, "plugins.lance.test.admission_available_memory").getBytes());
             }
         }
         synchronized (LOCK) {
@@ -879,7 +879,7 @@ public final class ScanAdmission {
 
     /**
      * How far the process's resident set exceeds what the plugin
-     * accounts, {@code lance.native_memory.limit} plus the JVM heap:
+     * accounts, {@code plugins.lance.native_memory.limit} plus the JVM heap:
      * memory above that is held by something the gate does not see, and
      * a pool smaller than the excess is not credited. {@link Long#MIN_VALUE}
      * where the resident set or the limit cannot be read (no
@@ -1172,7 +1172,7 @@ public final class ScanAdmission {
     /**
      * Whether the gate judges {@code shape} before its scan starts:
      * every unbounded shape, and the bounded top-k pages while
-     * {@code lance.admission.bounded_shapes_gated} is {@code true}.
+     * {@code plugins.lance.admission.bounded_shapes_gated} is {@code true}.
      */
     public static boolean gates(Shape shape) {
         return shape.hasFtsClause() && (shape.unbounded() || boundedShapesGated);
@@ -1309,7 +1309,7 @@ public final class ScanAdmission {
      * Rows a filter scan is expected to return over {@code nodeRows}
      * physical rows: {@code selectivity} of them, capped by
      * {@code boundedRows} when the scan carries a limit and
-     * {@code capAtBound} is set ({@code lance.admission.bounded_shapes_gated}
+     * {@code capAtBound} is set ({@code plugins.lance.admission.bounded_shapes_gated}
      * {@code false}). With the setting on a bounded page is judged on
      * every matching row, because Lance's {@code MaterializeIndexExec}
      * materialises the whole scalar index result before the limit
@@ -1450,7 +1450,7 @@ public final class ScanAdmission {
     /**
      * Heap bytes of a pushed aggregate's group state: {@code groups}
      * (the resolver's estimate, bounded by
-     * {@code lance.aggregation.pushdown_max_groups}) times a base of
+     * {@code plugins.lance.aggregation.pushdown_max_groups}) times a base of
      * {@link #GROUP_STATE_BASE_BYTES} plus {@link #GROUP_STATE_BYTES_PER_METRIC}
      * per metric, once per parallel scan since every fragment group
      * keeps its own partial until the merge.
@@ -1461,7 +1461,7 @@ public final class ScanAdmission {
 
     /**
      * The {@link Kind#COLUMN_LOAD} estimate: {@code scans} parallel
-     * Lance scans (the {@code lance.fragment_path.parallelism} fragment
+     * Lance scans (the {@code plugins.lance.fragment_path.parallelism} fragment
      * groups of one column load) over {@code scannedRows} physical rows
      * in total, each streaming rows of {@code rowWidthBytes} (the
      * column's Arrow width plus the row address): per scan the queued
@@ -1499,7 +1499,7 @@ public final class ScanAdmission {
      *
      * <p>The heap copy of the decoded rows is not in this term: the
      * gate judges what Lance allocates natively, and the heap the fetch
-     * cache keeps of those rows is bounded by {@code lance.fetch_cache.size}.
+     * cache keeps of those rows is bounded by {@code plugins.lance.fetch_cache.size}.
      */
     static long fetchTakeEstimateBytes(long rows, long rowWidthBytes, long shardShareBytes) {
         long total = (long) (Math.max(0L, rows) * Math.max(1L, rowWidthBytes) * SCAN_BUFFER_FACTOR);
@@ -1917,10 +1917,10 @@ public final class ScanAdmission {
             + "] plus the hits scan buffers";
         String remedy = shape.unbounded()
             ? "Bound the shape (a top k page without sort or aggregations), attach the table to a node with a larger index cache, "
-                + "or relax lance.admission.headroom / lance.admission.enabled."
+                + "or relax plugins.lance.admission.headroom / plugins.lance.admission.enabled."
             : (prefilters > 0 ? "Drop the scalar filter" + (prefilters > 1 ? "s" : "") + ", attach" : "Attach")
-                + " the table to a node with a larger index cache, or relax lance.admission.bounded_shapes_gated / "
-                + "lance.admission.headroom / lance.admission.enabled.";
+                + " the table to a node with a larger index cache, or relax plugins.lance.admission.bounded_shapes_gated / "
+                + "plugins.lance.admission.headroom / plugins.lance.admission.enabled.";
         judge(new Scope(Kind.FTS, indexName, shape.columns()), estimate, 0L, Long.MAX_VALUE, what, remedy, ticket);
     }
 
@@ -2080,7 +2080,7 @@ public final class ScanAdmission {
     }
 
     private static String filterRemedy() {
-        return "Narrow the filter, spread the table over more data nodes, or relax lance.admission.headroom / lance.admission.enabled.";
+        return "Narrow the filter, spread the table over more data nodes, or relax plugins.lance.admission.headroom / plugins.lance.admission.enabled.";
     }
 
     /**
@@ -2199,8 +2199,8 @@ public final class ScanAdmission {
             + NativeMemoryLimit.humanReadable(shardShare)
             + "]";
         String remedy = (prefilters.isEmpty() ? "Lower" : "Drop the scalar filter, lower")
-            + " nprobes, attach the table to a node with a larger index cache, or relax lance.admission.headroom / "
-            + "lance.admission.enabled.";
+            + " nprobes, attach the table to a node with a larger index cache, or relax plugins.lance.admission.headroom / "
+            + "plugins.lance.admission.enabled.";
         judge(
             new Scope(Kind.VECTOR_INDEX, table, column == null ? Set.of() : Set.of(column)),
             estimate,
@@ -2368,8 +2368,8 @@ public final class ScanAdmission {
             + " groups takes ["
             + NativeMemoryLimit.humanReadable(heap)
             + "] of heap";
-        String remedy = "Lower lance.aggregation.pushdown_parallelism, spread the table over more data nodes, or relax "
-            + "lance.admission.headroom / lance.admission.enabled.";
+        String remedy = "Lower plugins.lance.aggregation.pushdown_parallelism, spread the table over more data nodes, or relax "
+            + "plugins.lance.admission.headroom / plugins.lance.admission.enabled.";
         judge(filterScope(Kind.AGGREGATE_SCAN, table, filterSql, statistics), estimate, heap, heapAvailableBytes, what, remedy, null);
     }
 
@@ -2451,8 +2451,8 @@ public final class ScanAdmission {
             + "] each (read queue and batches in flight per scan), against an index cache shard of ["
             + NativeMemoryLimit.humanReadable(shardShare)
             + "]";
-        String remedy = "Lower lance.fragment_path.parallelism, spread the table over more data nodes, or relax "
-            + "lance.admission.headroom / lance.admission.enabled.";
+        String remedy = "Lower plugins.lance.fragment_path.parallelism, spread the table over more data nodes, or relax "
+            + "plugins.lance.admission.headroom / plugins.lance.admission.enabled.";
         Scope scope = new Scope(Kind.COLUMN_LOAD, table, column == null ? Set.of() : Set.of(column));
         if (ticket != null) {
             judge(scope, estimate, 0L, Long.MAX_VALUE, what, remedy, ticket);
@@ -2551,7 +2551,8 @@ public final class ScanAdmission {
             + "shard of ["
             + NativeMemoryLimit.humanReadable(shardShare)
             + "]";
-        String remedy = "Narrow _source or fields, or lower size, or relax lance.admission.headroom / lance.admission.enabled.";
+        String remedy =
+            "Narrow _source or fields, or lower size, or relax plugins.lance.admission.headroom / plugins.lance.admission.enabled.";
         Scope scope = new Scope(Kind.FETCH_TAKE, table, takeColumns == null ? Set.of() : new HashSet<>(takeColumns));
         judge(scope, estimate, 0L, Long.MAX_VALUE, what, remedy, ticket);
     }

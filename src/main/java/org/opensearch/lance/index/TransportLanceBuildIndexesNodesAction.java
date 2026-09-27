@@ -91,7 +91,7 @@ public final class TransportLanceBuildIndexesNodesAction extends TransportNodesA
         if (metadata == null) {
             throw new IndexNotFoundException(request.index());
         }
-        String tableUri = metadata.getSettings().get(LanceEngineFactory.TABLE_SETTING);
+        String tableUri = LanceEngineFactory.tableOf(metadata.getSettings());
         StorageOptions storageOptions = StorageOptions.fromIndexSettings(metadata.getSettings());
         LanceLocalClones clones = LanceLocalClones.instance();
         if (clones == null) {

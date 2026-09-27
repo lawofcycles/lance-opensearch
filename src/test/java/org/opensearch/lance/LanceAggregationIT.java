@@ -316,7 +316,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
         // snapshot and loads the numeric, boolean and keyword columns it
         // reads into the off-heap column store; the second request reads
         // them from there. Both must answer the same, and so must the request
-        // path that runs with lance.cache.enabled false (per request
+        // path that runs with plugins.lance.cache.enabled false (per request
         // dataset open, heap columns with the filter pushed into the
         // column scan). The hint fixture has 3 fragments of 200 rows with
         // nullable rating (int), flag (bool), category (keyword) and an
@@ -391,7 +391,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
 
             // Disabled cache: same answers from the per request path.
             Request disable = new Request("PUT", "/_cluster/settings");
-            disable.setJsonEntity("{\"transient\":{\"lance.cache.enabled\":false}}");
+            disable.setJsonEntity("{\"transient\":{\"plugins.lance.cache.enabled\":false}}");
             client().performRequest(disable);
             try {
                 for (int i = 0; i < shapes.length; i++) {
@@ -400,7 +400,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 }
             } finally {
                 Request enable = new Request("PUT", "/_cluster/settings");
-                enable.setJsonEntity("{\"transient\":{\"lance.cache.enabled\":null}}");
+                enable.setJsonEntity("{\"transient\":{\"plugins.lance.cache.enabled\":null}}");
                 client().performRequest(enable);
             }
             // Back on: the snapshots were retired by the disable, so this
@@ -424,13 +424,13 @@ public class LanceAggregationIT extends LanceRestTestCase {
         // request scans the keyword column once and its dictionary enters
         // the store (loads + 1, no budget miss), the second reads the
         // store (no load), and the per request path with
-        // lance.cache.enabled false returns the same buckets. The
+        // plugins.lance.cache.enabled false returns the same buckets. The
         // aggregation pushdown is turned off because a size 0 terms over
         // match_all otherwise runs inside the Lance scan and never
         // touches the store. The hint fixture has 3 fragments of 200 rows
         // with category c0, c1, c2 on three rows out of four.
         Request disablePushdown = new Request("PUT", "/_cluster/settings");
-        disablePushdown.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":false}}");
+        disablePushdown.setJsonEntity("{\"transient\":{\"plugins.lance.aggregation.pushdown\":false}}");
         client().performRequest(disablePushdown);
         try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "kw-once")) {
             String index = fixture.indexName();
@@ -452,7 +452,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
             assertTrue("the second request read the store", number(afterSecond.get("hits")) > number(afterFirst.get("hits")));
 
             Request disable = new Request("PUT", "/_cluster/settings");
-            disable.setJsonEntity("{\"transient\":{\"lance.cache.enabled\":false}}");
+            disable.setJsonEntity("{\"transient\":{\"plugins.lance.cache.enabled\":false}}");
             client().performRequest(disable);
             try {
                 String uncached = withoutTook(readAll(postJson("/" + index + "/_search?request_cache=false", terms)));
@@ -462,12 +462,12 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 assertEquals(afterSecond.get("budget_misses"), afterUncached.get("budget_misses"));
             } finally {
                 Request enable = new Request("PUT", "/_cluster/settings");
-                enable.setJsonEntity("{\"transient\":{\"lance.cache.enabled\":null}}");
+                enable.setJsonEntity("{\"transient\":{\"plugins.lance.cache.enabled\":null}}");
                 client().performRequest(enable);
             }
         } finally {
             Request enablePushdown = new Request("PUT", "/_cluster/settings");
-            enablePushdown.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":null}}");
+            enablePushdown.setJsonEntity("{\"transient\":{\"plugins.lance.aggregation.pushdown\":null}}");
             client().performRequest(enablePushdown);
         }
     }
@@ -506,7 +506,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
         // downgrade) while both runs answer the same buckets. The real
         // effect over an object store is a benchmark question, not one
         // this fixture can ask.
-        putTransientSetting("lance.aggregation.pushdown", "false");
+        putTransientSetting("plugins.lance.aggregation.pushdown", "false");
         try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "warm-store")) {
             String index = fixture.indexName();
             String terms = "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\",\"size\":10}}}}";
@@ -523,7 +523,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 number(afterLucene.get("loads"))
             );
 
-            putTransientSetting("lance.aggregation.pushdown", null);
+            putTransientSetting("plugins.lance.aggregation.pushdown", null);
             String onScan = withoutTook(readAll(postJson("/" + index + "/_search", terms)));
             assertEquals("the pushed scan answers the same buckets", onAggregators, onScan);
             Map<String, Object> refinementsAfter = planRefinements();
@@ -533,7 +533,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 refinementsAfter.get("column_store_warm")
             );
         } finally {
-            putTransientSetting("lance.aggregation.pushdown", null);
+            putTransientSetting("plugins.lance.aggregation.pushdown", null);
         }
     }
 
@@ -554,9 +554,9 @@ public class LanceAggregationIT extends LanceRestTestCase {
     public void testHeapColumnLoadIsChargedToTheRequestBreakerAndRefusedAt429() throws Exception {
         // Every search opts out of the result cache: the test reads the
         // breaker charge and the store, which a cached answer never touches.
-        // With lance.cache.enabled false every column a request reads is
+        // With plugins.lance.cache.enabled false every column a request reads is
         // materialised in heap for that request, the path a column store
-        // budget miss takes (lance.cache.column_share is a startup
+        // budget miss takes (plugins.lance.cache.column_share is a startup
         // setting, so the store cannot be emptied at runtime). The hint
         // fixture has 3 fragments of 200 rows: the rating column costs a
         // little over 1.6 KB per fragment as long[200] plus its presence
@@ -567,9 +567,9 @@ public class LanceAggregationIT extends LanceRestTestCase {
         // otherwise run inside the Lance scan and never touch the column,
         // and the collection runs in one slice because every slice builds
         // its own aggregator tree with its own 5 KB reservation.
-        putTransientSetting("lance.aggregation.pushdown", "false");
-        putTransientSetting("lance.cache.enabled", "false");
-        putTransientSetting("lance.fragment_path.slices", "1");
+        putTransientSetting("plugins.lance.aggregation.pushdown", "false");
+        putTransientSetting("plugins.lance.cache.enabled", "false");
+        putTransientSetting("plugins.lance.fragment_path.slices", "1");
         String sum = "{\"size\":0,\"query\":{\"match_all\":{}},\"aggs\":{\"s\":{\"sum\":{\"field\":\"rating\"}}}}";
         try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "heap-breaker")) {
             String index = fixture.indexName();
@@ -632,15 +632,15 @@ public class LanceAggregationIT extends LanceRestTestCase {
             client().performRequest(new Request("DELETE", "/" + index));
             assertBusy(() -> assertEquals(0L, longNumber(columnStoreStats().get("heap_fallback_bytes"))));
         } finally {
-            putTransientSetting("lance.cache.enabled", null);
-            putTransientSetting("lance.aggregation.pushdown", null);
-            putTransientSetting("lance.fragment_path.slices", null);
+            putTransientSetting("plugins.lance.cache.enabled", null);
+            putTransientSetting("plugins.lance.aggregation.pushdown", null);
+            putTransientSetting("plugins.lance.fragment_path.slices", null);
         }
     }
 
     public void testSubstraitPushdownAnswersLikeTheAggregators() throws Exception {
         // Every size 0 shape the Substrait pushdown accepts, answered
-        // once with lance.aggregation.pushdown on (the default) and once
+        // once with plugins.lance.aggregation.pushdown on (the default) and once
         // with it off (Lucene aggregators over the fragment readers);
         // the two response bodies have to be identical, hits.total and
         // the terms error / other counts included. The hint fixture has
@@ -990,7 +990,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "{\"size\":0,\"query\":{\"range\":{\"rating\":{\"gte\":100}}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"id\",\"percents\":[50,95]}},\"u\":{\"cardinality\":{\"field\":\"rating\"}}}}}}";
             Request debug = new Request("PUT", "/_cluster/settings");
             debug.setJsonEntity(
-                "{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":\"DEBUG\",\"lance.aggregation.pushdown_parallelism\":1}}"
+                "{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":\"DEBUG\",\"plugins.lance.aggregation.pushdown_parallelism\":1}}"
             );
             client().performRequest(debug);
             try {
@@ -1016,7 +1016,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 );
 
                 Request disable = new Request("PUT", "/_cluster/settings");
-                disable.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":false}}");
+                disable.setJsonEntity("{\"transient\":{\"plugins.lance.aggregation.pushdown\":false}}");
                 client().performRequest(disable);
                 try {
                     Map<String, Object> countedByAggregators = parse(readAll(postJson("/" + index + "/_search", cardinality)));
@@ -1108,13 +1108,13 @@ public class LanceAggregationIT extends LanceRestTestCase {
                     }
                 } finally {
                     Request enable = new Request("PUT", "/_cluster/settings");
-                    enable.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":null}}");
+                    enable.setJsonEntity("{\"transient\":{\"plugins.lance.aggregation.pushdown\":null}}");
                     client().performRequest(enable);
                 }
             } finally {
                 Request reset = new Request("PUT", "/_cluster/settings");
                 reset.setJsonEntity(
-                    "{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":null,\"lance.aggregation.pushdown_parallelism\":null}}"
+                    "{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":null,\"plugins.lance.aggregation.pushdown_parallelism\":null}}"
                 );
                 client().performRequest(reset);
             }
@@ -1139,7 +1139,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "{\"size\":0,\"query\":{\"range\":{\"rating\":{\"gte\":500}}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}",
                 "{\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"rating\",\"interval\":100},\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}}}" };
             Request parallelism = new Request("PUT", "/_cluster/settings");
-            parallelism.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown_parallelism\":3}}");
+            parallelism.setJsonEntity("{\"transient\":{\"plugins.lance.aggregation.pushdown_parallelism\":3}}");
             client().performRequest(parallelism);
             try {
                 long before = pushdownLogLines(index, "in 3 scans");
@@ -1147,7 +1147,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 assertEquals("every pushdown answer came from three scans", before + shapes.length, pushdownLogLines(index, "in 3 scans"));
             } finally {
                 Request reset = new Request("PUT", "/_cluster/settings");
-                reset.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown_parallelism\":null}}");
+                reset.setJsonEntity("{\"transient\":{\"plugins.lance.aggregation.pushdown_parallelism\":null}}");
                 client().performRequest(reset);
             }
         }
@@ -1176,7 +1176,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
     }
 
     /**
-     * Runs every shape with {@code lance.aggregation.pushdown} on and
+     * Runs every shape with {@code plugins.lance.aggregation.pushdown} on and
      * off and asserts the two response bodies are identical apart from
      * {@code took}. The executor logs each request the pushdown answers
      * at DEBUG, so the node log has to gain one line per shape in
@@ -1191,7 +1191,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
     static void assertPushdownAgreesWithAggregators(String index, String[] pushdownShapes, String[] aggregatorShapes) throws Exception {
         Request debug = new Request("PUT", "/_cluster/settings");
         debug.setJsonEntity(
-            "{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":\"DEBUG\",\"lance.fragment_path.slices\":1}}"
+            "{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":\"DEBUG\",\"plugins.lance.fragment_path.slices\":1}}"
         );
         client().performRequest(debug);
         try {
@@ -1214,7 +1214,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
             );
 
             Request disable = new Request("PUT", "/_cluster/settings");
-            disable.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":false}}");
+            disable.setJsonEntity("{\"transient\":{\"plugins.lance.aggregation.pushdown\":false}}");
             client().performRequest(disable);
             try {
                 for (int i = 0; i < pushdownShapes.length; i++) {
@@ -1232,13 +1232,13 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 assertEquals("the setting off must not take the pushdown", before + pushdownShapes.length, pushdownLogLines(index));
             } finally {
                 Request enable = new Request("PUT", "/_cluster/settings");
-                enable.setJsonEntity("{\"transient\":{\"lance.aggregation.pushdown\":null}}");
+                enable.setJsonEntity("{\"transient\":{\"plugins.lance.aggregation.pushdown\":null}}");
                 client().performRequest(enable);
             }
         } finally {
             Request reset = new Request("PUT", "/_cluster/settings");
             reset.setJsonEntity(
-                "{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":null,\"lance.fragment_path.slices\":null}}"
+                "{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":null,\"plugins.lance.fragment_path.slices\":null}}"
             );
             client().performRequest(reset);
         }
@@ -1315,7 +1315,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
      * counter proves the fragment path served every shape.
      */
     public void testAggregationsOffTheFormerAllowListRunOnTheFragmentPath() throws Exception {
-        putTransientSetting("lance.fragment_path.slices", "1");
+        putTransientSetting("plugins.lance.fragment_path.slices", "1");
         try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 200, "former-allow-list")) {
             String index = fixture.indexName();
             String[] shapes = new String[] {
@@ -1416,7 +1416,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
             assertEquals(999.0d, ((Number) clusters.get(2).get("max")).doubleValue(), 0d);
             assertEquals("the fragment path served it", beforeClustering + 1, fragmentRequestsExecuted());
         } finally {
-            putTransientSetting("lance.fragment_path.slices", null);
+            putTransientSetting("plugins.lance.fragment_path.slices", null);
         }
     }
 
@@ -1856,7 +1856,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
      * The slice count does not change what the executor answers. Every
      * shape below runs through the Lucene collectors (the pushdown is off
      * and the sorted pages carry a full text query, which the Lance sort
-     * pushdown does not take) with {@code lance.fragment_path.slices} at
+     * pushdown does not take) with {@code plugins.lance.fragment_path.slices} at
      * 1 and at 3 against the three fragment hint fixture. The exact
      * aggregations and the hit pages have to answer byte for byte the
      * same; the sketches (tdigest percentiles, cardinality) within their
@@ -1896,7 +1896,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"id\",\"size\":5,\"shard_size\":5,\"show_term_doc_count_error\":true}}}}";
             Request debug = new Request("PUT", "/_cluster/settings");
             debug.setJsonEntity(
-                "{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":\"DEBUG\",\"lance.aggregation.pushdown\":false}}"
+                "{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":\"DEBUG\",\"plugins.lance.aggregation.pushdown\":false}}"
             );
             client().performRequest(debug);
             try {
@@ -1906,9 +1906,9 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 Map<Integer, Map<String, Object>> clippedBySlices = new LinkedHashMap<>();
                 for (int slices : new int[] { 1, 3 }) {
                     Request setSlices = new Request("PUT", "/_cluster/settings");
-                    setSlices.setJsonEntity("{\"transient\":{\"lance.fragment_path.slices\":" + slices + "}}");
+                    setSlices.setJsonEntity("{\"transient\":{\"plugins.lance.fragment_path.slices\":" + slices + "}}");
                     client().performRequest(setSlices);
-                    String detail = "3 leaves in " + slices + " slices (lance.fragment_path.slices " + slices + ")";
+                    String detail = "3 leaves in " + slices + " slices (plugins.lance.fragment_path.slices " + slices + ")";
                     long before = sliceLogLines(index, detail);
                     List<String> answers = new ArrayList<>();
                     for (String shape : exact) {
@@ -1983,7 +1983,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 Request reset = new Request("PUT", "/_cluster/settings");
                 reset.setJsonEntity(
                     "{\"transient\":{\"logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction\":null,"
-                        + "\"lance.aggregation.pushdown\":null,\"lance.fragment_path.slices\":null}}"
+                        + "\"plugins.lance.aggregation.pushdown\":null,\"plugins.lance.fragment_path.slices\":null}}"
                 );
                 client().performRequest(reset);
             }

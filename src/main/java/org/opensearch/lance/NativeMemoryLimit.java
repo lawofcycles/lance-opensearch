@@ -12,7 +12,7 @@ import org.opensearch.monitor.jvm.JvmInfo;
 import org.opensearch.monitor.os.OsProbe;
 
 /**
- * Parse the {@code lance.native_memory.limit} node setting. The setting
+ * Parse the {@code plugins.lance.native_memory.limit} node setting. The setting
  * accepts either an absolute {@link ByteSizeValue} (for example
  * {@code "10gb"}, {@code "512mb"}) or a percentage suffix
  * (for example {@code "40%"}) that resolves to a fraction of the memory
@@ -26,7 +26,7 @@ import org.opensearch.monitor.os.OsProbe;
  * roughly 38.8 GiB, while on t3.medium (4 GiB / 2 GiB heap) the same
  * 40% resolves to roughly 800 MiB.
  *
- * <p>The parsed value is split in two: a {@code lance.cache.column_share}
+ * <p>The parsed value is split in two: a {@code plugins.lance.cache.column_share}
  * fraction goes to the fragment path's off-heap column cache, and the
  * rest to the two Lance {@link org.lance.Session} caches using Lance's own
  * default ratio of 6:1 (index cache to metadata cache), so operators
@@ -207,7 +207,7 @@ public final class NativeMemoryLimit {
 
     /**
      * Off-heap budget of the fragment path's column cache: the
-     * {@code lance.cache.column_share} fraction of the total limit. The
+     * {@code plugins.lance.cache.column_share} fraction of the total limit. The
      * remainder ({@link #sessionCacheBytes}) goes to the Lance Session.
      */
     public static long columnCacheBytes(long totalBytes, double columnShare) {

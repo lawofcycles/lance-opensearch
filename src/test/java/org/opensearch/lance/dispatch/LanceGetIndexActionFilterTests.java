@@ -16,7 +16,7 @@ import org.opensearch.test.OpenSearchTestCase;
 
 /**
  * {@link LanceGetIndexActionFilter} withholds the credential entries of
- * {@code index.lance.storage_options.*} from a get index response and
+ * {@code index.plugins.lance.storage_options.*} from a get index response and
  * leaves every other setting, and every index that is not Lance backed,
  * as it was.
  */

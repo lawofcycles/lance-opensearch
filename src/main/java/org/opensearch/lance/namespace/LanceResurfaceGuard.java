@@ -30,7 +30,7 @@ final class LanceResurfaceGuard {
      * Deleted-index tombstones. Maps a Lance-backed index name to the
      * millisecond timestamp at which the {@code DELETE /{index}} was
      * observed on the cluster state. Entries only get added for
-     * indexes carrying {@code index.lance.table} so plain OpenSearch
+     * indexes carrying {@code index.plugins.lance.table} so plain OpenSearch
      * indexes never accumulate here.
      */
     private final Map<String, Long> tombstones = new ConcurrentHashMap<>();

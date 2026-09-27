@@ -464,7 +464,7 @@ public final class LanceWarmCache implements Closeable {
      * @param columnLimitBytes   off-heap budget of the column store
      * @param maxSnapshots       how many snapshots to keep before evicting
      *                           the least recently used unreferenced one
-     * @param enabled            initial value of {@code lance.cache.enabled}
+     * @param enabled            initial value of {@code plugins.lance.cache.enabled}
      * @param executor           runs the planner statistics collections
      *                           the {@link #tableStatistics()} cache
      *                           starts on a miss, and the fetch cache
@@ -899,7 +899,7 @@ public final class LanceWarmCache implements Closeable {
     /**
      * Whether a different, open snapshot is filed under {@code snapshot}'s
      * key. That happens when a retired snapshot is still leased (the
-     * shard engine's reader after {@code lance.cache.enabled} went off and
+     * shard engine's reader after {@code plugins.lance.cache.enabled} went off and
      * on again) while a later acquire built a replacement for the same
      * version. The store keys columns by {@code (index uuid, version)},
      * which names the same rows for both, so the columns stay with the
@@ -949,7 +949,7 @@ public final class LanceWarmCache implements Closeable {
     }
 
     /**
-     * Dynamic {@code lance.cache.enabled}. Turning the cache off retires
+     * Dynamic {@code plugins.lance.cache.enabled}. Turning the cache off retires
      * every snapshot; requests from then on build a transient snapshot
      * each and close it when they end.
      */

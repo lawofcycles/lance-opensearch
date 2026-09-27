@@ -220,7 +220,7 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
     }
 
     /**
-     * Requested {@code index.lance.index_placement}, or empty for the
+     * Requested {@code index.plugins.lance.index_placement}, or empty for the
      * default ({@code in_table}).
      */
     public Optional<String> indexPlacement() {

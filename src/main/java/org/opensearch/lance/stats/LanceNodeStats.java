@@ -450,7 +450,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
     /**
      * One node-local shallow clone directory on this node (an index
-     * attached with {@code index.lance.index_placement = node_local}):
+     * attached with {@code index.plugins.lance.index_placement = node_local}):
      * the bytes its files occupy under the node's data path (manifests
      * and search-index files only; data files stay in the source) and
      * the source manifest version the clone was created at.
@@ -1575,7 +1575,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         return admissionRetainedScope;
     }
 
-    /** Value of {@code lance.attach.warm_indexes} on the node. */
+    /** Value of {@code plugins.lance.attach.warm_indexes} on the node. */
     public String warmUpMode() {
         return warmUpMode;
     }

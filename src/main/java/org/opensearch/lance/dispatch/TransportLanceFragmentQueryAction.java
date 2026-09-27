@@ -435,14 +435,14 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
             throw new IllegalStateException("Fragment path cannot resolve OpenSearch index [" + request.indexName() + "] on this node");
         }
         Index index = indexMetadata.getIndex();
-        String pkField = indexMetadata.getSettings().get("index.lance.primary_key_field", "");
+        String pkField = LancePlugin.PRIMARY_KEY_FIELD_SETTING.get(indexMetadata.getSettings());
         // Parse the type setting through the same fromSetting helper the
         // engine uses so unknown values fall back to LONG. Empty pkField
         // overrides whatever the type says (see the schema derivation
         // for the canonicalisation).
         LancePrimaryKeyType pkType = pkField.isEmpty()
             ? LancePrimaryKeyType.NONE
-            : LancePrimaryKeyType.fromSetting(indexMetadata.getSettings().get("index.lance.primary_key_type", "long"));
+            : LancePrimaryKeyType.fromSetting(LancePlugin.PRIMARY_KEY_TYPE_SETTING.get(indexMetadata.getSettings()));
         // Per-column mapping overrides are persisted as JSON in a single
         // setting (with a fallback to the legacy multi_fields setting for
         // indexes created before it existed). Empty leaves the reader
@@ -665,7 +665,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
 
         // The scans of this request that run per fragment or per leaf
         // (the column loads of the reader, the row takes behind the
-        // page) run in up to lance.fragment_path.parallelism groups on
+        // page) run in up to plugins.lance.fragment_path.parallelism groups on
         // the index_searcher pool under the request's cancellation.
         FragmentGroupScan groupScan = new FragmentGroupScan(
             intraRequestExecutor,
@@ -735,7 +735,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 ).withCancellation(cancellation)
             ) {
                 // The searcher cuts the node's fragment leaves into up
-                // to lance.fragment_path.slices slices and collects
+                // to plugins.lance.fragment_path.slices slices and collects
                 // them side by side on the index_searcher pool; the
                 // aggregators read the same count through the context
                 // to decide how they apply their shard thresholds.
@@ -1122,7 +1122,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 );
                 if (LOGGER.isDebugEnabled()) {
                     LOGGER.debug(
-                        "lance.dispatch: fragment path slices for [{}]: {} leaves in {} slices (lance.fragment_path.slices {})",
+                        "lance.dispatch: fragment path slices for [{}]: {} leaves in {} slices (plugins.lance.fragment_path.slices {})",
                         request.indexName(),
                         searcher.getIndexReader().leaves().size(),
                         searcher.getSlices().length,

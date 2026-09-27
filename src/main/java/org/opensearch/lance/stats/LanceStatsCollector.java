@@ -31,7 +31,7 @@ import org.opensearch.lance.query.LanceFtsQuery;
  *
  * <p>{@code native_memory.estimated_bytes} is what the {@code lance_native}
  * breaker currently accounts for, which the plugin's sampler last pushed
- * in ({@code lance.native_memory.circuit_breaker.poll_interval} ago at
+ * in ({@code plugins.lance.native_memory.circuit_breaker.poll_interval} ago at
  * most), while {@code session_bytes} and {@code column_store_bytes} are
  * read live, so the sum of the two can differ from the estimate by up to
  * one sampling interval of growth. The index cache capacity, shard count

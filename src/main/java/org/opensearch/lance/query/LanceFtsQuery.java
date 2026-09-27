@@ -85,16 +85,16 @@ public final class LanceFtsQuery extends Query {
      * Runtime parameter, not query identity: two queries that differ
      * only in the probe limit in force return the same rows, so it is
      * not part of {@link #equals}. Written by the plugin from the
-     * {@code lance.fts.subset_probe_limit} cluster setting, read by
+     * {@code plugins.lance.fts.subset_probe_limit} cluster setting, read by
      * every scan. The two companions below come from
-     * {@code lance.fts.subset_probe_ratio} and
-     * {@code lance.fts.subset_probe_min_rows} the same way.
+     * {@code plugins.lance.fts.subset_probe_ratio} and
+     * {@code plugins.lance.fts.subset_probe_min_rows} the same way.
      */
     private static volatile int subsetProbeLimit = DEFAULT_SUBSET_PROBE_LIMIT;
     private static volatile double subsetProbeRatio = DEFAULT_SUBSET_PROBE_RATIO;
     private static volatile int subsetProbeMinRows = DEFAULT_SUBSET_PROBE_MIN_ROWS;
 
-    /** Current value of the {@code lance.fts.subset_probe_limit} setting. */
+    /** Current value of the {@code plugins.lance.fts.subset_probe_limit} setting. */
     public static int subsetProbeLimit() {
         return subsetProbeLimit;
     }
@@ -107,7 +107,7 @@ public final class LanceFtsQuery extends Query {
         subsetProbeLimit = limit;
     }
 
-    /** Current value of the {@code lance.fts.subset_probe_ratio} setting. */
+    /** Current value of the {@code plugins.lance.fts.subset_probe_ratio} setting. */
     public static double subsetProbeRatio() {
         return subsetProbeRatio;
     }
@@ -120,7 +120,7 @@ public final class LanceFtsQuery extends Query {
         subsetProbeRatio = ratio;
     }
 
-    /** Current value of the {@code lance.fts.subset_probe_min_rows} setting. */
+    /** Current value of the {@code plugins.lance.fts.subset_probe_min_rows} setting. */
     public static int subsetProbeMinRows() {
         return subsetProbeMinRows;
     }

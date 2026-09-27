@@ -19,9 +19,9 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.lance.LanceRegistry;
+import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.dispatch.LanceStatisticsPrefetchNodeResponse.Outcome;
-import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.plan.metadata.TableStatisticsCache;
 import org.opensearch.threadpool.ThreadPool;
@@ -94,7 +94,7 @@ public final class TransportLanceStatisticsPrefetchAction extends TransportNodes
             throw new IndexNotFoundException(request.indexName());
         }
         Settings settings = index.getSettings();
-        String table = settings.get(LanceEngineFactory.TABLE_SETTING, "");
+        String table = LancePlugin.TABLE_SETTING.get(settings);
         if (table.isEmpty()) {
             throw new IllegalArgumentException("index [" + request.indexName() + "] is not backed by a Lance table");
         }

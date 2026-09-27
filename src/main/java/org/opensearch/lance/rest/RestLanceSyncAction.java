@@ -18,7 +18,7 @@ import org.opensearch.transport.client.node.NodeClient;
  * POST /_plugins/_lance/sync/{index}
  *
  * Runs the freshness check of one Lance backed index now instead of at
- * the next {@code lance.namespace.poll_cadence} tick. The handler only
+ * the next {@code plugins.lance.namespace.poll_cadence} tick. The handler only
  * builds a {@link LanceIndexSyncRequest} and hands it to
  * {@link LanceIndexSyncAction}, which routes it to the node holding the
  * index's shard; the table open and the mapping update happen there,

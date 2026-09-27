@@ -37,6 +37,7 @@ import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
 import org.opensearch.common.lucene.uid.VersionsAndSeqNoResolver.DocIdAndVersion;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.core.indices.breaker.CircuitBreakerService;
@@ -49,6 +50,7 @@ import org.opensearch.index.engine.Segment;
 import org.opensearch.index.engine.SegmentsStats;
 import org.opensearch.index.shard.DocsStats;
 import org.opensearch.lance.LanceOverrides;
+import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 
@@ -120,7 +122,7 @@ public final class LanceEngineFactory implements EngineFactory {
      *                         reader
      * @param maxDocsPerReader read at every reader open: the most physical
      *                         rows a shard reader may hold, the current
-     *                         value of {@code lance.test.max_docs_per_reader}
+     *                         value of {@code plugins.lance.test.max_docs_per_reader}
      *                         ({@code IndexWriter.MAX_DOCS} unless a test
      *                         lowered it)
      */
@@ -140,8 +142,17 @@ public final class LanceEngineFactory implements EngineFactory {
         this.servedVersions = servedVersions;
     }
 
-    public static final String TABLE_SETTING = "index.lance.table";
-    public static final String PRIMARY_KEY_FIELD_SETTING = "index.lance.primary_key_field";
+    /**
+     * Keys of the index settings of a Lance backed index. Attach and the
+     * namespace poll write these keys; the plugin registers them as
+     * {@code Setting} objects in {@code LancePlugin} with the deprecated
+     * {@code index.lance.*} keys of the first preview releases as their
+     * fallbacks, so the code reads the settings through those objects
+     * ({@link org.opensearch.lance.LancePlugin#TABLE_SETTING} and its
+     * siblings) and an index created under the old keys keeps opening.
+     */
+    public static final String TABLE_SETTING = "index.plugins.lance.table";
+    public static final String PRIMARY_KEY_FIELD_SETTING = "index.plugins.lance.primary_key_field";
     /**
      * Arrow type of the declared primary key column. {@code "long"} covers
      * signed integer PKs (default when the setting is missing);
@@ -151,7 +162,7 @@ public final class LanceEngineFactory implements EngineFactory {
      * numeric ones. Ignored when {@link #PRIMARY_KEY_FIELD_SETTING} is empty
      * because there is no PK to type in that case.
      */
-    public static final String PRIMARY_KEY_TYPE_SETTING = "index.lance.primary_key_type";
+    public static final String PRIMARY_KEY_TYPE_SETTING = "index.plugins.lance.primary_key_type";
     /**
      * Pin the Lance manifest version an index reads. Non-negative values pin
      * the dataset to that version; the default {@code -1L} means "follow the
@@ -159,7 +170,7 @@ public final class LanceEngineFactory implements EngineFactory {
      * {@link org.opensearch.lance.namespace.LanceIndexFreshnessService}
      * advance the reader as new fragments land.
      */
-    public static final String VERSION_SETTING = "index.lance.version";
+    public static final String VERSION_SETTING = "index.plugins.lance.version";
     /**
      * Follow a Lance tag instead of the latest manifest version. Unlike
      * {@link #VERSION_SETTING}, which is an immutable pin, a tag can be
@@ -172,7 +183,7 @@ public final class LanceEngineFactory implements EngineFactory {
      * tag. Attach refuses a body that sets both this and
      * {@link #VERSION_SETTING}.
      */
-    public static final String TAG_SETTING = "index.lance.tag";
+    public static final String TAG_SETTING = "index.plugins.lance.tag";
 
     /**
      * Compact JSON stringified form of the multi-fields spec captured at
@@ -184,7 +195,7 @@ public final class LanceEngineFactory implements EngineFactory {
      * {@link org.opensearch.lance.rest.RestAttachAction#serialiseMultiFields}
      * / {@link org.opensearch.lance.rest.RestAttachAction#deserialiseMultiFields}.
      */
-    public static final String MULTI_FIELDS_SETTING = "index.lance.multi_fields";
+    public static final String MULTI_FIELDS_SETTING = "index.plugins.lance.multi_fields";
 
     /**
      * Compact JSON stringified form of the per-column mapping overrides
@@ -196,7 +207,7 @@ public final class LanceEngineFactory implements EngineFactory {
      * {@link #MULTI_FIELDS_SETTING} for indexes created before this
      * setting existed.
      */
-    public static final String OVERRIDES_SETTING = "index.lance.overrides";
+    public static final String OVERRIDES_SETTING = "index.plugins.lance.overrides";
 
     /**
      * Where the search structures of the index live: {@code in_table}
@@ -206,7 +217,57 @@ public final class LanceEngineFactory implements EngineFactory {
      * {@link LanceLocalClones}) that receives the builds and serves the
      * node's reads. Registered and validated in {@code LancePlugin}.
      */
-    public static final String INDEX_PLACEMENT_SETTING = "index.lance.index_placement";
+    public static final String INDEX_PLACEMENT_SETTING = "index.plugins.lance.index_placement";
+
+    /**
+     * What the shard does with a fragment no data node covers yet after
+     * the table moved to a new version: {@code immediate} (default) serves
+     * the new version at once, {@code wait} holds the reader until every
+     * fragment is covered. Registered and validated in {@code LancePlugin}.
+     */
+    public static final String UNCOVERED_FRAGMENT_POLICY_SETTING = "index.plugins.lance.uncovered_fragment_policy";
+
+    /**
+     * Whether the settings describe a Lance backed index: a table is set
+     * under the current key or under the deprecated one.
+     */
+    public static boolean isLanceIndex(Settings settings) {
+        return LancePlugin.TABLE_SETTING.existsOrFallbackExists(settings);
+    }
+
+    /**
+     * The table of a Lance backed index, or {@code null} when the settings
+     * set no table under the current key or the deprecated one.
+     */
+    public static String tableOf(Settings settings) {
+        return isLanceIndex(settings) ? LancePlugin.TABLE_SETTING.get(settings) : null;
+    }
+
+    /**
+     * Copy the plugin's index settings of {@code from} into {@code to}
+     * under the current keys. An index created under the deprecated
+     * {@code index.lance.*} keys is rewritten to the current keys; a
+     * current key wins over the deprecated one when both are present.
+     * Used where the plugin recreates an index from the settings of an
+     * existing one, so the recreated index carries the current keys only.
+     */
+    public static void copyLanceIndexSettings(Settings from, Settings.Builder to) {
+        for (String key : from.keySet()) {
+            if (key.startsWith(DEPRECATED_INDEX_SETTING_PREFIX)) {
+                to.put(INDEX_SETTING_PREFIX + key.substring(DEPRECATED_INDEX_SETTING_PREFIX.length()), from.get(key));
+            }
+        }
+        for (String key : from.keySet()) {
+            if (key.startsWith(INDEX_SETTING_PREFIX)) {
+                to.put(key, from.get(key));
+            }
+        }
+    }
+
+    /** Prefix of every current index setting of the plugin. */
+    public static final String INDEX_SETTING_PREFIX = "index.plugins.lance.";
+    /** Prefix of every deprecated index setting of the plugin. */
+    private static final String DEPRECATED_INDEX_SETTING_PREFIX = "index.lance.";
 
     /**
      * Arrow type kinds a Lance primary key column can take. Kept small on
@@ -259,8 +320,8 @@ public final class LanceEngineFactory implements EngineFactory {
 
     @Override
     public Engine newReadWriteEngine(EngineConfig config) {
-        String table = config.getIndexSettings().getSettings().get(TABLE_SETTING);
-        String field = config.getIndexSettings().getSettings().get(PRIMARY_KEY_FIELD_SETTING, "");
+        String table = LancePlugin.TABLE_SETTING.get(config.getIndexSettings().getSettings());
+        String field = LancePlugin.PRIMARY_KEY_FIELD_SETTING.get(config.getIndexSettings().getSettings());
         // Empty field name overrides whatever the type setting says: no PK
         // means no lookup, no _id materialisation from a column, and the
         // reader will synthesise "<fragment>-<offset>" instead. Callers that
@@ -269,11 +330,11 @@ public final class LanceEngineFactory implements EngineFactory {
         // and another the type.
         LancePrimaryKeyType pkType = field.isEmpty()
             ? LancePrimaryKeyType.NONE
-            : LancePrimaryKeyType.fromSetting(config.getIndexSettings().getSettings().get(PRIMARY_KEY_TYPE_SETTING, "long"));
+            : LancePrimaryKeyType.fromSetting(LancePlugin.PRIMARY_KEY_TYPE_SETTING.get(config.getIndexSettings().getSettings()));
         int shardId = config.getShardId().id();
-        long versionSetting = config.getIndexSettings().getSettings().getAsLong(VERSION_SETTING, -1L);
+        long versionSetting = LancePlugin.VERSION_SETTING.get(config.getIndexSettings().getSettings());
         Optional<Long> pinnedVersion = versionSetting >= 0 ? Optional.of(versionSetting) : Optional.empty();
-        String tagSetting = config.getIndexSettings().getSettings().get(TAG_SETTING, "");
+        String tagSetting = LancePlugin.TAG_SETTING.get(config.getIndexSettings().getSettings());
         String tag = tagSetting.isEmpty() ? null : tagSetting;
         StorageOptions storageOptions = StorageOptions.fromIndexSettings(config.getIndexSettings().getSettings());
         String indexUuid = config.getIndexSettings().getIndex().getUUID();
@@ -332,7 +393,7 @@ public final class LanceEngineFactory implements EngineFactory {
         /** Bound on the physical rows a reader of this shard may hold; see {@link LanceEngineFactory#LanceEngineFactory(LanceWarmCache, LongSupplier)}. */
         final LongSupplier maxDocsPerReader;
         /**
-         * True when {@code index.lance.index_placement} is
+         * True when {@code index.plugins.lance.index_placement} is
          * {@code node_local}: reads open this node's shallow clone (see
          * {@link LanceLocalClones}) and the refresh probe compares the
          * source's version against the clone's recorded base version.
@@ -519,7 +580,7 @@ public final class LanceEngineFactory implements EngineFactory {
          * value captured at engine open.
          */
         String currentTag() {
-            String tagSetting = config().getIndexSettings().getSettings().get(TAG_SETTING, "");
+            String tagSetting = LancePlugin.TAG_SETTING.get(config().getIndexSettings().getSettings());
             return tagSetting.isEmpty() ? null : tagSetting;
         }
 
@@ -641,7 +702,7 @@ public final class LanceEngineFactory implements EngineFactory {
          * The per-column mapping overrides as the index settings carry
          * them now (base type overrides and keyword sub-fields). Read
          * per reader open instead of captured at engine construction:
-         * the freshness check rewrites {@code index.lance.overrides} when
+         * the freshness check rewrites {@code index.plugins.lance.overrides} when
          * the Lance table renames an overridden column, and the reader
          * opened for the new manifest version must classify columns and
          * resolve sub-field paths through the rewritten keys.

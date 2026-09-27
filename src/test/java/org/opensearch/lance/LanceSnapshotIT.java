@@ -29,7 +29,7 @@ import org.opensearch.core.xcontent.XContentParser;
  * index metadata (settings and mapping) plus the shard's empty Lucene
  * commit; the rows and the Lance-side indexes stay in the Lance table.
  * Restore therefore re-creates the index pointing at the same
- * {@code index.lance.table}, and the outcome depends on whether that table
+ * {@code index.plugins.lance.table}, and the outcome depends on whether that table
  * is still reachable. The reopen case reaches the same engine failure
  * through close and open, where no restore decider stands between a
  * retried allocation and the shard, so it shows what the allocation
@@ -121,7 +121,7 @@ public class LanceSnapshotIT extends LanceRestTestCase {
 
                 // The delete dropped the index from the poll's tracking and
                 // the restore put it back into cluster state, so the poll
-                // adopts it again from index.lance.table. A later manifest
+                // adopts it again from index.plugins.lance.table. A later manifest
                 // advance therefore reaches the shard engine behind _stats
                 // on the next poll cycle, not only _search and _count
                 // (whose fragment path opens the latest version per query).
@@ -167,7 +167,7 @@ public class LanceSnapshotIT extends LanceRestTestCase {
         // An index created through attach (no pin, no storage_options) is
         // deleted and restored from a snapshot. The delete dropped it from
         // the attach bookkeeping and nothing calls attach again, so the
-        // only way the poll can pick it up is from index.lance.table in
+        // only way the poll can pick it up is from index.plugins.lance.table in
         // cluster state. After restore, an append and a delete on the
         // table must reach _count and _stats on the poll cadence without
         // a manual _refresh.

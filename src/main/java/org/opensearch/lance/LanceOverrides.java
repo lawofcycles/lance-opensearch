@@ -19,7 +19,6 @@ import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
-import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.rest.RestAttachAction;
 
 /**
@@ -31,7 +30,7 @@ import org.opensearch.lance.rest.RestAttachAction;
  * a {@code format} (with {@code type: date} only) and keyword
  * sub-field declarations ({@code fields}).
  *
- * <p>The canonical JSON persisted in the {@code index.lance.overrides}
+ * <p>The canonical JSON persisted in the {@code index.plugins.lance.overrides}
  * setting uses the attach-body shape:
  *
  * <pre>
@@ -40,8 +39,8 @@ import org.opensearch.lance.rest.RestAttachAction;
  * </pre>
  *
  * <p>{@link #of(Settings)} is the one accessor every setting reader
- * goes through: it reads {@code index.lance.overrides} first and falls
- * back to the legacy {@code index.lance.multi_fields} setting when the
+ * goes through: it reads {@code index.plugins.lance.overrides} first and falls
+ * back to the legacy {@code index.plugins.lance.multi_fields} setting when the
  * new one is empty, so indexes attached before the overrides framework
  * existed keep resolving their sub-fields.
  *
@@ -130,7 +129,7 @@ public final class LanceOverrides {
     );
 
     /**
-     * Key the persisted {@code index.lance.overrides} JSON stores the
+     * Key the persisted {@code index.plugins.lance.overrides} JSON stores the
      * index type preferences under, next to the per-column mapping
      * override objects. Reserved: a mapping override cannot target a
      * column with this name (see {@link #parseAttachClauses}).
@@ -327,16 +326,16 @@ public final class LanceOverrides {
 
     /**
      * Resolve the overrides of an index from its settings:
-     * {@code index.lance.overrides} when present, else the legacy
-     * {@code index.lance.multi_fields} setting folded into sub-field
+     * {@code index.plugins.lance.overrides} when present, else the legacy
+     * {@code index.plugins.lance.multi_fields} setting folded into sub-field
      * only overrides, else {@link #EMPTY}.
      */
     public static LanceOverrides of(Settings settings) {
-        String json = settings.get(LanceEngineFactory.OVERRIDES_SETTING, "");
+        String json = LancePlugin.OVERRIDES_SETTING.get(settings);
         if (!json.isEmpty()) {
             return parse(json);
         }
-        String legacy = settings.get(LanceEngineFactory.MULTI_FIELDS_SETTING, "");
+        String legacy = LancePlugin.MULTI_FIELDS_SETTING.get(settings);
         if (!legacy.isEmpty()) {
             return fromSubFields(RestAttachAction.deserialiseMultiFields(legacy));
         }
@@ -431,7 +430,7 @@ public final class LanceOverrides {
     }
 
     /**
-     * Compact canonical JSON for the {@code index.lance.overrides}
+     * Compact canonical JSON for the {@code index.plugins.lance.overrides}
      * setting; empty string on empty overrides so the caller can skip
      * writing the setting at all.
      */
@@ -553,7 +552,7 @@ public final class LanceOverrides {
         } catch (IllegalArgumentException e) {
             throw e;
         } catch (Exception e) {
-            throw new IllegalArgumentException("failed to parse index.lance.overrides JSON: " + e.getMessage(), e);
+            throw new IllegalArgumentException("failed to parse index.plugins.lance.overrides JSON: " + e.getMessage(), e);
         }
     }
 
@@ -590,7 +589,7 @@ public final class LanceOverrides {
      * body's {@code indexes} clause: per-column Lance index type
      * preferences ({@code scalar} / {@code vector} / {@code params}),
      * parsed through {@link #parseIndexesClause}. Because the
-     * preferences persist inside the same {@code index.lance.overrides}
+     * preferences persist inside the same {@code index.plugins.lance.overrides}
      * JSON under a top-level {@code indexes} key, a mapping override
      * cannot target a column literally named {@code indexes}; declaring
      * one is rejected here.

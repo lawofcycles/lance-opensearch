@@ -81,7 +81,7 @@ import org.opensearch.transport.client.Client;
  *       and centroids relearn) rather than merging.</li>
  * </ul>
  *
- * <p>Skips the {@code lance.builder.max_rows} check so operators can force
+ * <p>Skips the {@code plugins.lance.builder.max_rows} check so operators can force
  * a build on tables the automatic path passed over.
  *
  * <p>Outcome reporting: the response carries, per index kind, the names
@@ -126,7 +126,7 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
             listener.onFailure(new IndexNotFoundException(indexName));
             return;
         }
-        String tableUri = metadata.getSettings().get(LanceEngineFactory.TABLE_SETTING);
+        String tableUri = LanceEngineFactory.tableOf(metadata.getSettings());
         if (tableUri == null) {
             listener.onFailure(new IllegalArgumentException("index " + indexName + " is not a Lance index"));
             return;
@@ -317,11 +317,7 @@ public final class TransportLanceBuildIndexesAction extends HandledTransportActi
         }
         Settings old = metadata.getSettings();
         Settings.Builder settings = Settings.builder().put("index.number_of_shards", 1).put("index.number_of_replicas", 0);
-        for (String key : old.keySet()) {
-            if (key.startsWith("index.lance.")) {
-                settings.copy(key, old);
-            }
-        }
+        LanceEngineFactory.copyLanceIndexSettings(old, settings);
         LOGGER.warn(
             "node_local build on {} flipped a column between keyword and lance_text; rebuilding the OpenSearch index "
                 + "(the Lance source and the node-local clones are untouched)",

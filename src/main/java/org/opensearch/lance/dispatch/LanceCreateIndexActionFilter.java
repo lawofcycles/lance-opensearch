@@ -20,9 +20,9 @@ import org.opensearch.threadpool.ThreadPool;
 
 /**
  * ActionFilter that rejects {@code indices:admin/create} requests
- * carrying {@code index.lance.table} in their settings unless the
+ * carrying {@code index.plugins.lance.table} in their settings unless the
  * request originates inside the plugin (attach or namespace
- * surface). A bare {@code PUT /{index} {settings:{index.lance.table:...}}}
+ * surface). A bare {@code PUT /{index} {settings:{index.plugins.lance.table:...}}}
  * would wire up the engine without the derive step, leaving the mapping
  * empty so every typed query fails with "No mapping found" while
  * {@code _count} returns the Lance metadata count. Rejecting up front
@@ -76,7 +76,7 @@ public final class LanceCreateIndexActionFilter implements ActionFilter {
             chain.proceed(task, action, request, listener);
             return;
         }
-        String lanceTable = createRequest.settings().get(LanceEngineFactory.TABLE_SETTING);
+        String lanceTable = LanceEngineFactory.tableOf(createRequest.settings());
         if (lanceTable == null || lanceTable.isEmpty()) {
             chain.proceed(task, action, request, listener);
             return;

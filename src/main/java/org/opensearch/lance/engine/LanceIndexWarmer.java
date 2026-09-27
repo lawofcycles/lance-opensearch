@@ -39,6 +39,7 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.lance.LanceCircuitBreaker;
+import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.NativeMemoryLimit;
@@ -119,7 +120,7 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
      */
     static final double ALL_MODE_CACHE_SHARE = 0.5d;
 
-    /** Value of {@code lance.attach.warm_indexes}. */
+    /** Value of {@code plugins.lance.attach.warm_indexes}. */
     public enum Mode {
         /** Do nothing. */
         NONE,
@@ -138,7 +139,7 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
 
         public static Mode parse(String value) {
             if (value == null) {
-                throw new IllegalArgumentException("lance.attach.warm_indexes must be one of none, metadata, all");
+                throw new IllegalArgumentException("plugins.lance.attach.warm_indexes must be one of none, metadata, all");
             }
             switch (value.trim().toLowerCase(Locale.ROOT)) {
                 case "none":
@@ -148,7 +149,9 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
                 case "all":
                     return ALL;
                 default:
-                    throw new IllegalArgumentException("lance.attach.warm_indexes must be one of none, metadata, all, got [" + value + "]");
+                    throw new IllegalArgumentException(
+                        "plugins.lance.attach.warm_indexes must be one of none, metadata, all, got [" + value + "]"
+                    );
             }
         }
 
@@ -211,16 +214,16 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
             Settings settings = metadata.getSettings();
             this.indexName = metadata.getIndex().getName();
             this.indexUuid = metadata.getIndexUUID();
-            this.table = settings.get(LanceEngineFactory.TABLE_SETTING);
+            this.table = LanceEngineFactory.tableOf(settings);
             this.storageOptions = StorageOptions.fromIndexSettings(settings);
-            long versionSetting = settings.getAsLong(LanceEngineFactory.VERSION_SETTING, -1L);
+            long versionSetting = LancePlugin.VERSION_SETTING.get(settings);
             this.pinnedVersion = versionSetting >= 0 ? Optional.of(versionSetting) : Optional.empty();
-            String tagSetting = settings.get(LanceEngineFactory.TAG_SETTING, "");
+            String tagSetting = LancePlugin.TAG_SETTING.get(settings);
             this.tag = tagSetting.isEmpty() ? null : tagSetting;
-            this.pkField = settings.get(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, "");
+            this.pkField = LancePlugin.PRIMARY_KEY_FIELD_SETTING.get(settings);
             this.pkType = pkField.isEmpty()
                 ? LancePrimaryKeyType.NONE
-                : LancePrimaryKeyType.fromSetting(settings.get(LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING, "long"));
+                : LancePrimaryKeyType.fromSetting(LancePlugin.PRIMARY_KEY_TYPE_SETTING.get(settings));
             this.overrides = LanceOverrides.of(settings);
             this.mode = mode;
         }
@@ -268,7 +271,7 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
      *                  table through
      * @param executor  where the warm-ups run; the plugin passes the
      *                  {@link #THREAD_POOL} pool
-     * @param mode      initial value of {@code lance.attach.warm_indexes}
+     * @param mode      initial value of {@code plugins.lance.attach.warm_indexes}
      */
     public LanceIndexWarmer(LanceWarmCache warmCache, ExecutorService executor, Mode mode) {
         this.warmCache = warmCache;
@@ -276,7 +279,7 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
         this.mode = mode;
     }
 
-    /** Dynamic {@code lance.attach.warm_indexes}; applies to warm-ups started after the change. */
+    /** Dynamic {@code plugins.lance.attach.warm_indexes}; applies to warm-ups started after the change. */
     public void setMode(Mode mode) {
         this.mode = mode;
     }
@@ -333,7 +336,7 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
                 continue;
             }
             IndexMetadata metadata = current.index(name);
-            String table = metadata.getSettings().get(LanceEngineFactory.TABLE_SETTING);
+            String table = LanceEngineFactory.tableOf(metadata.getSettings());
             if (table == null || table.isEmpty()) {
                 continue;
             }

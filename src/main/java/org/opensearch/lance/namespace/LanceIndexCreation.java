@@ -32,7 +32,7 @@ final class LanceIndexCreation {
      * A single shard, no replica index over {@code table} whose settings
      * persist what the derivation needs to run again later: the table
      * URI, the primary key column and type, the overrides and the storage
-     * options. {@code carried} are further {@code index.lance.*} settings
+     * options. {@code carried} are further {@code index.plugins.lance.*} settings
      * of a previous incarnation of the index (the tag it follows, the
      * uncovered fragment policy) that a rebuild keeps; the settings the
      * derivation recomputes win over it.
@@ -47,12 +47,9 @@ final class LanceIndexCreation {
         Settings.Builder settings = Settings.builder();
         // Copied key by key: the previous settings may be the shard's
         // merged node and index settings, and the node's secure settings
-        // must not travel into a CreateIndex request.
-        for (String key : carried.keySet()) {
-            if (key.startsWith("index.lance.")) {
-                settings.put(key, carried.get(key));
-            }
-        }
+        // must not travel into a CreateIndex request. An index created
+        // under the deprecated keys comes back under the current ones.
+        LanceEngineFactory.copyLanceIndexSettings(carried, settings);
         settings.put("index.number_of_shards", 1)
             .put("index.number_of_replicas", 0)
             .put(LanceEngineFactory.TABLE_SETTING, table)
@@ -70,7 +67,7 @@ final class LanceIndexCreation {
     /**
      * Send {@code request} with the internal create index header set, so
      * the filter that blocks user {@code PUT /{index}} with
-     * {@code index.lance.table} lets it through. The caller's context is
+     * {@code index.plugins.lance.table} lets it through. The caller's context is
      * stashed for the call and restored afterwards.
      */
     static void create(Client client, ThreadPool threadPool, CreateIndexRequest request, ActionListener<CreateIndexResponse> listener) {
