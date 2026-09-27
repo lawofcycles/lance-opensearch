@@ -249,7 +249,7 @@ rows. The coefficients live in `plan/cost/CostCoefficients.java`; they were fitt
 least squares to the warm latencies measured on the 20M, 100M and 1B row benchmark tables across
 one to six node clusters, including both paths of `terms` over a ten million value key, of a
 filtered `terms`, of `terms` with a metric under it and of `cardinality` over a low cardinality
-key on four and six nodes at 1B rows and on one node at 20M rows. `scripts/fit-cost-coefficients.py`
+key on four and six nodes at 1B rows and on one node at 20M rows. `dev-tools/fit-cost-coefficients.py`
 reproduces the fit from `src/test/resources/cost/measurements.csv`, and `CostModelTests` holds the
 model to the measured choices. Below a million rows, and for every hits tree at every size (sorted
 pages, full text, vector), the operators keep placeholder costs: the scan charges its estimated

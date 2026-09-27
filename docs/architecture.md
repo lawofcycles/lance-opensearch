@@ -460,7 +460,7 @@ documented placeholder penalty below) rather than being refused by the rule. The
 its own group bound as a guard on the estimate it builds from the request shape
 (`shard_size`, range and filter counts), counted as `aggregate_resolution` when it fires. The coefficients in `CostCoefficients` were fitted by non negative least squares
 to the warm latencies measured on the 20M, 100M and 1B row benchmark tables across 1 to 6 node
-clusters with the pushdown on and off; `scripts/fit-cost-coefficients.py` reproduces the fit from
+clusters with the pushdown on and off; `dev-tools/fit-cost-coefficients.py` reproduces the fit from
 `src/test/resources/cost/measurements.csv`, and `CostModelTests` holds the model to the measured
 choices. What the model does not see: the state of the
 Lance index cache, and concurrent requests (the coefficients are single request latencies).

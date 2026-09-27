@@ -204,7 +204,7 @@ Whichever JVM you attach to, the node logs under `build/testclusters/integTest-0
 
 ## Repository layout
 
-All production code lives under `src/main/java/org/opensearch/lance/`, one subpackage per concern (attach, dispatch, engine, namespace, the Calcite planner under `plan/`, the `lance_*` queries, REST handlers, and so on). The subpackage tree with the role of each package is in the [Directory layout](docs/architecture.md#directory-layout) section of `docs/architecture.md`, which also explains the request paths and the design behind them. Tests mirror the main tree under `src/test/java/`. The user facing reference is `docs/features.md` and the known gaps are in `docs/limitations.md`.
+All production code lives under `src/main/java/org/opensearch/lance/`, one subpackage per concern (attach, dispatch, engine, namespace, the Calcite planner under `plan/`, the `lance_*` queries, REST handlers, and so on). The subpackage tree with the role of each package is in the [Directory layout](docs/architecture.md#directory-layout) section of `docs/architecture.md`, which also explains the request paths and the design behind them. Tests mirror the main tree under `src/test/java/`. The user facing reference is `docs/features.md` and the known gaps are in `docs/limitations.md`. `dev-tools/` holds the scripts a developer runs by hand and nothing the build needs: today `fit-cost-coefficients.py`, which refits the planner's cost coefficients from `src/test/resources/cost/measurements.csv` and writes `fit-report.md` next to it (see the cost model section of `docs/query-plan.md`).
 
 ## Submitting changes
 

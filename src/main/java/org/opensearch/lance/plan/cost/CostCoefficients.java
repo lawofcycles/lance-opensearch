@@ -12,7 +12,7 @@ import java.util.Map;
  * The coefficients of {@link CostModel}, fitted to the measured warm
  * latencies of the aggregation shapes on the 20M, 100M and 1B row
  * tables ({@code src/test/resources/cost/measurements.csv}) by
- * {@code scripts/fit-cost-coefficients.py} and rounded to two
+ * {@code dev-tools/fit-cost-coefficients.py} and rounded to two
  * significant digits; the fit and its residuals are in
  * {@code src/test/resources/cost/fit-report.md}. Every name ends in its
  * unit. "Per Mrow thread" means per million rows one thread processes:

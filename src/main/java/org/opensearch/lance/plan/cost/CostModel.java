@@ -52,7 +52,7 @@ import java.util.Map;
  * run's {@link CostInputs}. Every term is a coefficient of
  * {@link CostCoefficients} times a quantity; the coefficients were
  * fitted to the measured warm latencies of the aggregation shapes and
- * {@code scripts/fit-cost-coefficients.py} computes exactly these
+ * {@code dev-tools/fit-cost-coefficients.py} computes exactly these
  * formulas, so the fit report and this class agree by construction.
  * {@link #pushedAggregateTerms} and {@link #luceneAggregateTerms} hand
  * out the terms one by one for the tests that pin a term's weight.
