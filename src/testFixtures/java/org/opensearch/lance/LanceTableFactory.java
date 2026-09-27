@@ -117,7 +117,7 @@ public final class LanceTableFactory {
      * step.
      *
      * @return absolute URI of the table (usable as-is for
-     *         {@code /_lance/attach} or namespace register).
+     *         {@code /_plugins/_lance/attach} or namespace register).
      */
     static String writeTable(Path parent, String name, int rowCount) throws Exception {
         return withLocaleRoot(() -> writeTableOnce(parent, name, rowCount, 0));
@@ -791,7 +791,7 @@ public final class LanceTableFactory {
      * {@code keyword} rather than {@code lance_text}.
      *
      * @return absolute URI of the table, usable as-is for
-     *         {@code /_lance/attach} or namespace register.
+     *         {@code /_plugins/_lance/attach} or namespace register.
      */
     static String writeKeywordOnlyTable(Path parent, String name, int rowCount) throws Exception {
         return withLocaleRoot(() -> writeKeywordOnlyTableOnce(parent, name, rowCount));
@@ -1001,13 +1001,13 @@ public final class LanceTableFactory {
      * Writes a two-column Lance table ({@code id} int32, {@code text} Utf8)
      * holding the five Japanese sentences in {@link #JAPANESE_SENTENCES},
      * without an FTS index. The ITs build the index afterwards through
-     * {@code POST /_lance/build_indexes/{index}} with a chosen tokenizer,
+     * {@code POST /_plugins/_lance/build_indexes/{index}} with a chosen tokenizer,
      * so the attach derivation first maps {@code text} as {@code keyword}
      * and the namespace poll flips it to {@code lance_text} once the
      * build lands.
      *
      * @return absolute URI of the table, usable as-is for
-     *         {@code /_lance/attach} or namespace register.
+     *         {@code /_plugins/_lance/attach} or namespace register.
      */
     static String writeJapaneseTable(Path parent, String name) throws Exception {
         return withLocaleRoot(() -> writeJapaneseTableOnce(parent, name));
@@ -1036,7 +1036,7 @@ public final class LanceTableFactory {
      * ITs share it.
      *
      * @return absolute URI of the table, usable as-is for
-     *         {@code /_lance/attach} or namespace register.
+     *         {@code /_plugins/_lance/attach} or namespace register.
      */
     public static String writeEnglishTextTable(Path parent, String name) throws Exception {
         return withLocaleRoot(() -> {
@@ -1063,7 +1063,7 @@ public final class LanceTableFactory {
      * text column a {@code text_analyzer} override is put on.
      *
      * @return absolute URI of the table, usable as-is for
-     *         {@code /_lance/attach} or namespace register.
+     *         {@code /_plugins/_lance/attach} or namespace register.
      */
     public static String writeEnglishTextTableWithInvertedIndex(Path parent, String name) throws Exception {
         String uri = writeEnglishTextTable(parent, name);
@@ -1207,7 +1207,7 @@ public final class LanceTableFactory {
      * Public because the query package's unit tests read it directly.
      *
      * @return absolute URI of the table, usable as-is for
-     *         {@code /_lance/attach} or namespace register.
+     *         {@code /_plugins/_lance/attach} or namespace register.
      */
     public static String writeDatedTable(Path parent, String name) throws Exception {
         return withLocaleRoot(() -> writeDatedTableOnce(parent, name));

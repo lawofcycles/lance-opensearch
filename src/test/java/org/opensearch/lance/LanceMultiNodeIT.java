@@ -80,7 +80,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             String body = readAll(postJson("/" + indexName + "/_search", "{\"query\":{\"match_all\":{}}}"));
@@ -111,7 +111,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(3, extractIntPath(readAll(attach), "fragments"));
 
@@ -147,7 +147,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(3, extractIntPath(readAll(attach), "fragments"));
 
@@ -181,13 +181,13 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             Set<String> answers = new HashSet<>();
             for (HttpHost host : getClusterHosts()) {
                 try (var pinned = buildClient(restClientSettings(), new HttpHost[] { host })) {
-                    Request explain = new Request("GET", "/" + indexName + "/_lance/explain");
+                    Request explain = new Request("GET", "/_plugins/_lance/explain/" + indexName);
                     explain.setJsonEntity("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}");
                     Response response = pinned.performRequest(explain);
                     assertEquals(RestStatus.OK.getStatus(), response.getStatusLine().getStatusCode());
@@ -240,7 +240,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String indexName = tableName;
         String body = "{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}";
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             // The host list carries every bound address of every node
             // (an IPv6 and an IPv4 one per node), so the two clients are
@@ -358,13 +358,14 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         try {
             assertEquals(
                 RestStatus.OK.getStatus(),
-                postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}").getStatusLine().getStatusCode()
+                postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}").getStatusLine().getStatusCode()
             );
             assertEquals(
                 RestStatus.OK.getStatus(),
-                postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"name\":\"" + pinnedIndex + "\",\"version\":" + version + "}")
-                    .getStatusLine()
-                    .getStatusCode()
+                postJson(
+                    "/_plugins/_lance/attach",
+                    "{\"table\":\"" + tableUri + "\",\"name\":\"" + pinnedIndex + "\",\"version\":" + version + "}"
+                ).getStatusLine().getStatusCode()
             );
             HttpHost host = getClusterHosts().get(0);
             try (RestClient pinned = buildClient(restClientSettings(), new HttpHost[] { host })) {
@@ -433,19 +434,19 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         return nodes.keySet().iterator().next();
     }
 
-    /** The {@code request_cache} object of {@code nodeId} in {@code GET /_lance/stats}. */
+    /** The {@code request_cache} object of {@code nodeId} in {@code GET /_plugins/_lance/stats}. */
     private static Map<String, Object> requestCacheOf(String nodeId) throws IOException {
         return statsBlockOf(nodeId, "request_cache");
     }
 
-    /** The {@code snapshots} object of {@code nodeId} in {@code GET /_lance/stats}. */
+    /** The {@code snapshots} object of {@code nodeId} in {@code GET /_plugins/_lance/stats}. */
     private static Map<String, Object> snapshotsOf(String nodeId) throws IOException {
         return statsBlockOf(nodeId, "snapshots");
     }
 
     @SuppressWarnings("unchecked")
     private static Map<String, Object> statsBlockOf(String nodeId, String block) throws IOException {
-        Map<String, Object> parsed = parse(readAll(client().performRequest(new Request("GET", "/_lance/stats/" + nodeId))));
+        Map<String, Object> parsed = parse(readAll(client().performRequest(new Request("GET", "/_plugins/_lance/" + nodeId + "/stats"))));
         Map<String, Object> nodes = (Map<String, Object>) parsed.get("nodes");
         Map<String, Object> node = (Map<String, Object>) nodes.get(nodeId);
         assertNotNull("stats of " + nodeId + ": " + parsed, node);
@@ -473,7 +474,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String tableUri = LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, 12, 4);
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             Map<String, Long> beforeAggregate = planExecutedByNode("pushed_scan");
@@ -535,7 +536,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 );
             }
 
-            Map<String, Object> stats = parse(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+            Map<String, Object> stats = parse(readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats"))));
             @SuppressWarnings("unchecked")
             Map<String, Object> nodes = (Map<String, Object>) stats.get("nodes");
             assertEquals("every node reports: " + stats, 3, nodes.size());
@@ -568,7 +569,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     /** {@code plan.executed.<key>} of every node, keyed by node id. */
     @SuppressWarnings("unchecked")
     private static Map<String, Long> planExecutedByNode(String key) throws IOException {
-        Map<String, Object> stats = parse(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> stats = parse(readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats"))));
         Map<String, Object> nodes = (Map<String, Object>) stats.get("nodes");
         Map<String, Long> counts = new HashMap<>();
         for (Map.Entry<String, Object> node : nodes.entrySet()) {
@@ -583,19 +584,19 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         // node_local placement: the build fans out to all three data
         // nodes, each answers under its node id, every node can serve the
         // FTS query, and deleting the index removes the clone directory
-        // on every node (observed through GET /_lance/stats).
+        // on every node (observed through GET /_plugins/_lance/stats).
         String suffix = "mn-placement-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String indexName = "demo-" + suffix;
         String tableUri = LanceTableFactory.writeKeywordOnlyTable(scratchDir, indexName, 6);
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"name\":\"" + indexName + "\",\"index_placement\":\"node_local\"}"
             );
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
-            String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"]}"));
+            String build = readAll(postJson("/_plugins/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"]}"));
             assertTrue(
                 "merged fts built list must carry label: " + build,
                 build.contains("\"fts\":[{\"column\":\"label\",\"type\":\"INVERTED\"}]")
@@ -625,7 +626,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 }
             }
 
-            String stats = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+            String stats = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
             assertEquals(
                 "every data node must report the clone under local_clones: " + stats,
                 3,
@@ -634,7 +635,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
 
             client().performRequest(new Request("DELETE", "/" + indexName));
             assertBusy(() -> {
-                String after = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+                String after = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
                 assertEquals(
                     "the clone directories must be gone on every node: " + after,
                     0,
@@ -659,7 +660,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String tableUri = LanceTableFactory.writeKeywordOnlyTable(scratchDir, indexName, 6);
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\""
                     + tableUri
                     + "\",\"name\":\""
@@ -669,7 +670,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             ensureGreen(indexName);
 
-            String build = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"columns\":[\"label\"]}"));
+            String build = readAll(postJson("/_plugins/_lance/build_indexes/" + indexName, "{\"columns\":[\"label\"]}"));
             assertTrue(
                 "merged scalar built list must carry the bitmap on label: " + build,
                 build.contains("{\"column\":\"label\",\"type\":\"BITMAP\"}")
@@ -712,7 +713,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(3, extractIntPath(readAll(attach), "fragments"));
 
@@ -797,7 +798,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String indexName = tableName;
         String sorted = "{\"size\":10,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"sort\":[{\"id\":\"desc\"}]}";
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(3, extractIntPath(readAll(attach), "fragments"));
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
@@ -841,7 +842,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String indexName = tableName;
         String sorted = "{\"size\":10,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}},\"sort\":[{\"id\":\"desc\"}]}";
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
 
@@ -902,7 +903,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             // the cluster log so the cost of the temporary IndexService
             // can be read from build/testclusters/*/logs.
             updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", "DEBUG");
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
@@ -1017,7 +1018,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals("fixture assumes one fragment per data node", fragments, dataNodeCount());
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
@@ -1135,7 +1136,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         assertNotNull("a three-node cluster has at least one node that is not the cluster manager [" + managerName + "]", follower);
         try (var followerClient = buildClient(restClientSettings(), new HttpHost[] { follower })) {
             updateClusterSetting("logger.org.opensearch.lance.attach.TransportLanceAttachAction", "DEBUG");
-            Request attach = new Request("POST", "/_lance/attach");
+            Request attach = new Request("POST", "/_plugins/_lance/attach");
             attach.setJsonEntity("{\"table\":\"" + tableUri + "\"}");
             Response first = followerClient.performRequest(attach);
             assertEquals(RestStatus.OK.getStatus(), first.getStatusLine().getStatusCode());
@@ -1228,7 +1229,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             "\"size\":10," + bound + ",\"query\":" + oneHit
         );
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
@@ -1350,7 +1351,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             "\"from\":7,\"size\":10,\"query\":" + tied + byCategoryThenScore
         );
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
@@ -1453,7 +1454,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String rangeFiltered = "{\"bool\":{\"must\":[" + match + "],\"filter\":[{\"range\":{\"id\":{\"gte\":250}}}]}}";
         String termFiltered = "{\"bool\":{\"must\":[" + match + "],\"filter\":[{\"term\":{\"category\":\"c1\"}}]}}";
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
@@ -1544,7 +1545,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String exactOneHit = "{\"size\":10,\"profile\":true,\"track_total_hits\":true,\"query\":" + oneHit + "}";
         String exactCountOnly = "{\"size\":0,\"profile\":true,\"track_total_hits\":true,\"query\":" + manyHits + "}";
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
@@ -1673,7 +1674,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             "\"size\":0,\"query\":{\"wildcard\":{\"category\":{\"value\":\"c*\"}}}"
         );
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
@@ -1779,7 +1780,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         // shard keeps: compared with the aggregators only.
         Set<Integer> partialsLoseGroups = Set.of(1, 2, 9);
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
@@ -1877,7 +1878,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             "\"size\":0,\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"u\":{\"cardinality\":{\"field\":\"id\"}},\"p\":{\"percentiles\":{\"field\":\"id\",\"percents\":[50,90]}}}}}"
         );
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
             assertEquals("fixture assumes one fragment per data node", fragments, dataNodeCount());
@@ -2035,7 +2036,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         try {
             updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", "DEBUG");
             updateClusterSetting("lance.aggregation.pushdown_parallelism", "4");
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
@@ -2145,7 +2146,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             "\"size\":0,\"aggs\":{\"c\":{\"composite\":{\"size\":7,\"sources\":[{\"cat\":{\"terms\":{\"field\":\"category\"}}},{\"i\":{\"terms\":{\"field\":\"id\"}}}]}}}";
         try {
             updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", "DEBUG");
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
@@ -2302,7 +2303,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 + "\"script\":\"params.s >= 6600\"}}}}}" };
         try {
             for (String uri : List.of(tableUri, otherUri)) {
-                Response attach = postJson("/_lance/attach", "{\"table\":\"" + uri + "\"}");
+                Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + uri + "\"}");
                 assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             }
             client().performRequest(
@@ -2362,7 +2363,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}}",
             "\"size\":0,\"aggs\":{\"w\":{\"weighted_avg\":{\"value\":{\"field\":\"id\"},\"weight\":{\"field\":\"bucket\"}}}}" };
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
@@ -2429,7 +2430,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             updateClusterSetting("logger.org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction", "DEBUG");
             updateClusterSetting("lance.aggregation.pushdown", "false");
             updateClusterSetting("lance.fragment_path.slices", "2");
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
@@ -2543,7 +2544,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
      * slice so that the two fragment node builds one aggregator tree, not
      * one per slice. The coordinator forwards
      * the executor's {@code CircuitBreakingException} with its status,
-     * and {@code _lance/stats} shows the refusal on exactly one node.
+     * and {@code _plugins/_lance/stats} shows the refusal on exactly one node.
      */
     public void testHeapColumnRefusedOnOneExecutorIs429AtTheCoordinator() throws Exception {
         String suffix = "mn-heap-breaker-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
@@ -2559,7 +2560,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         updateClusterSetting("lance.cache.enabled", "false");
         updateClusterSetting("lance.fragment_path.slices", "1");
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
@@ -2616,7 +2617,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
     /** {@code column_store.heap_fallback_rejections} of every node, keyed by node id. */
     @SuppressWarnings("unchecked")
     private static Map<String, Long> heapFallbackRejectionsByNode() throws IOException {
-        Map<String, Object> stats = parse(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> stats = parse(readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats"))));
         Map<String, Object> nodes = (Map<String, Object>) stats.get("nodes");
         Map<String, Long> rejections = new HashMap<>();
         for (Map.Entry<String, Object> node : nodes.entrySet()) {
@@ -2752,7 +2753,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         try {
             updateClusterSetting("logger.org.opensearch.lance.engine.LanceStoredFields", "DEBUG");
             updateClusterSetting("lance.fragment_path.parallelism", "4");
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
             assertEquals("fixture assumes several fragments per data node", 3, dataNodeCount());
@@ -2864,7 +2865,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String tableUri = LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, rows, rows / fragments);
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals("fixture assumes several fragments per data node", 3, dataNodeCount());
             Map<String, Map<String, Object>> before = fetchCacheByNode();
@@ -2971,7 +2972,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             }, 60, TimeUnit.SECONDS);
             Map<String, Map<String, Long>> before = planStatisticsByNode();
 
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=30s"));
             String holder = readAll(client().performRequest(new Request("GET", "/_cat/shards/" + indexName + "?h=node"))).trim();
@@ -3066,7 +3067,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             }, 60, TimeUnit.SECONDS);
             Map<String, Map<String, Long>> beforeAttach = planStatisticsByNode();
 
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=30s"));
             String holder = readAll(client().performRequest(new Request("GET", "/_cat/shards/" + indexName + "?h=node"))).trim();
@@ -3141,10 +3142,10 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
-    /** The {@code plan.statistics} counters of every node in {@code GET /_lance/stats}, keyed by node name. */
+    /** The {@code plan.statistics} counters of every node in {@code GET /_plugins/_lance/stats}, keyed by node name. */
     @SuppressWarnings("unchecked")
     private static Map<String, Map<String, Long>> planStatisticsByNode() throws IOException {
-        Map<String, Object> parsed = parse(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> parsed = parse(readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats"))));
         Map<String, Object> nodes = (Map<String, Object>) parsed.get("nodes");
         Map<String, Map<String, Long>> byNode = new HashMap<>();
         for (Object value : nodes.values()) {
@@ -3170,10 +3171,10 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         return (String) node.get("name");
     }
 
-    /** The {@code fetch_cache} object of every node in {@code GET /_lance/stats}, keyed by node id. */
+    /** The {@code fetch_cache} object of every node in {@code GET /_plugins/_lance/stats}, keyed by node id. */
     @SuppressWarnings("unchecked")
     private static Map<String, Map<String, Object>> fetchCacheByNode() throws IOException {
-        Map<String, Object> parsed = parse(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> parsed = parse(readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats"))));
         Map<String, Object> nodes = (Map<String, Object>) parsed.get("nodes");
         Map<String, Map<String, Object>> byNode = new HashMap<>();
         for (Map.Entry<String, Object> node : nodes.entrySet()) {
@@ -3228,7 +3229,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
      * cluster manager. The manager is kept from holding the shard with an
      * allocation exclusion set before the attach, so the index lands on a
      * follower; an append and a new column are then picked up through
-     * {@code POST /{index}/_lance/sync}, which the single shard routing
+     * {@code POST /_plugins/_lance/sync/{index}}, which the single shard routing
      * sends to that follower: the mapping gains the column, the holder's
      * {@code freshness.checks} counter moves by more than the manager's.
      * The counters are cumulative since node start and other tests in this
@@ -3246,7 +3247,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String managerName = clusterManagerNodeName();
         try {
             updateClusterSetting("cluster.routing.allocation.exclude._name", managerName);
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=30s"));
             String holder = readAll(client().performRequest(new Request("GET", "/_cat/shards/" + indexName + "?h=node"))).trim();
@@ -3259,7 +3260,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
 
             LanceTableFactory.appendRows(tableUri, 6, 4);
             LanceTableFactory.addColumn(tableUri, "score", new ArrowType.Int(64, true));
-            Response sync = postJson("/" + indexName + "/_lance/sync", "");
+            Response sync = postJson("/_plugins/_lance/sync/" + indexName, "");
             assertEquals(RestStatus.OK.getStatus(), sync.getStatusLine().getStatusCode());
             String syncBody = readAll(sync);
             assertTrue("the check ran: " + syncBody, syncBody.contains("\"checked\":true"));
@@ -3296,12 +3297,12 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             String keywordTable = "kw-" + suffix;
             LanceTableFactory.writeKeywordOnlyTable(scratchDir, keywordTable, 5);
             String keywordUri = scratchDir.resolve(keywordTable + ".lance").toString();
-            Response attachKeyword = postJson("/_lance/attach", "{\"table\":\"" + keywordUri + "\"}");
+            Response attachKeyword = postJson("/_plugins/_lance/attach", "{\"table\":\"" + keywordUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attachKeyword.getStatusLine().getStatusCode());
             client().performRequest(new Request("GET", "/_cluster/health/" + keywordTable + "?wait_for_status=green&timeout=30s"));
             String keywordHolder = readAll(client().performRequest(new Request("GET", "/_cat/shards/" + keywordTable + "?h=node"))).trim();
             assertNotEquals(managerName, keywordHolder);
-            String build = readAll(postJson("/_lance/build_indexes/" + keywordTable, "{\"fts_columns\":[\"label\"]}"));
+            String build = readAll(postJson("/_plugins/_lance/build_indexes/" + keywordTable, "{\"fts_columns\":[\"label\"]}"));
             assertTrue("the FTS index is built: " + build, build.contains("\"fts\":[{\"column\":\"label\",\"type\":\"INVERTED\"}]"));
             assertBusy(() -> {
                 try {
@@ -3329,10 +3330,10 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         }
     }
 
-    /** {@code freshness.checks} of every node in {@code GET /_lance/stats}, keyed by node name. */
+    /** {@code freshness.checks} of every node in {@code GET /_plugins/_lance/stats}, keyed by node name. */
     @SuppressWarnings("unchecked")
     private static Map<String, Long> freshnessChecksByNode() throws IOException {
-        Map<String, Object> parsed = parse(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> parsed = parse(readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats"))));
         Map<String, Object> nodes = (Map<String, Object>) parsed.get("nodes");
         Map<String, Long> checks = new HashMap<>();
         for (Object value : nodes.values()) {
@@ -3349,26 +3350,26 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-mn-register-" + randomAlphaOfLength(8)));
         String path = scratchDir.toString();
         try {
-            Response register = postJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
+            Response register = postJson("/_plugins/_lance/namespace", "{\"path\":\"" + path + "\"}");
             assertEquals(RestStatus.OK.getStatus(), register.getStatusLine().getStatusCode());
 
-            Response listing = client().performRequest(new Request("GET", "/_lance/namespace"));
+            Response listing = client().performRequest(new Request("GET", "/_plugins/_lance/namespace"));
             String body = readAll(listing);
             assertTrue("expected namespace " + path + " in listing: " + body, body.contains(path));
 
-            Response unregister = deleteJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
+            Response unregister = deleteJson("/_plugins/_lance/namespace", "{\"path\":\"" + path + "\"}");
             assertEquals(RestStatus.OK.getStatus(), unregister.getStatusLine().getStatusCode());
             String unregisterBody = readAll(unregister);
             assertTrue("expected unregistered:true, saw: " + unregisterBody, unregisterBody.contains("\"unregistered\":true"));
 
-            Response after = client().performRequest(new Request("GET", "/_lance/namespace"));
+            Response after = client().performRequest(new Request("GET", "/_plugins/_lance/namespace"));
             String afterBody = readAll(after);
             assertFalse("expected namespace " + path + " to be gone: " + afterBody, afterBody.contains(path));
         } finally {
             // Best-effort cleanup in case an earlier assertion left
             // the namespace registered.
             try {
-                deleteJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
+                deleteJson("/_plugins/_lance/namespace", "{\"path\":\"" + path + "\"}");
             } catch (Exception ignored) {}
         }
     }
@@ -3406,7 +3407,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                         continue;
                     }
                     try {
-                        postJson("/_lance/namespace/tables", body);
+                        postJson("/_plugins/_lance/namespace/tables", body);
                         listed.incrementAndGet();
                     } catch (ResponseException e) {
                         // A preview that came after the unregister answers
@@ -3433,13 +3434,13 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-mn-churn-" + randomAlphaOfLength(8)));
                 String body = "{\"path\":\"" + scratchDir + "\"}";
                 lastBody = body;
-                Response register = postJson("/_lance/namespace", body);
+                Response register = postJson("/_plugins/_lance/namespace", body);
                 assertEquals(RestStatus.OK.getStatus(), register.getStatusLine().getStatusCode());
                 currentBody.set(body);
                 // Let the previews reach the handle on every node, then
                 // pull the registration out from under them.
                 Thread.sleep(150);
-                Response unregister = deleteJson("/_lance/namespace", body);
+                Response unregister = deleteJson("/_plugins/_lance/namespace", body);
                 assertEquals(RestStatus.OK.getStatus(), unregister.getStatusLine().getStatusCode());
                 Thread.sleep(50);
                 assertTrue("round " + round + ": previews failed: " + failures, failures.isEmpty());
@@ -3451,7 +3452,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             }
             if (lastBody != null) {
                 try {
-                    deleteJson("/_lance/namespace", lastBody);
+                    deleteJson("/_plugins/_lance/namespace", lastBody);
                 } catch (Exception ignored) {}
             }
         }
@@ -3483,7 +3484,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(6, extractIntPath(readAll(attach), "fragments"));
 
@@ -3569,7 +3570,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             assertEquals(3, extractIntPath(readAll(attach), "fragments"));
             assertEquals(3, dataNodeCount());
@@ -3624,7 +3625,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             String body = readAll(
@@ -3679,7 +3680,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         try {
             assertEquals("fixture assumes two fragments per data node", 3, dataNodeCount());
             updateClusterSetting("lance.test.max_docs_per_reader", "20");
-            String attach = readAll(postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}"));
+            String attach = readAll(postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}"));
             assertEquals(attach, 6, extractIntPath(attach, "fragments"));
             assertTrue(attach, attach.contains("\"lucene_bound_exceeded\":true"));
             client().performRequest(new Request("GET", "/_cluster/health/" + tableName + "?wait_for_status=green&timeout=60s"));
@@ -3687,7 +3688,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             assertEquals(20, extractIntPath(docStats, "indices", tableName, "primaries", "docs", "count"));
             // The node that hosts the shard reports the table's rows next
             // to the reader's.
-            Map<String, Object> lanceStats = parse(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+            Map<String, Object> lanceStats = parse(readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats"))));
             Map<String, Object> indexStats = null;
             for (Object node : ((Map<String, Object>) lanceStats.get("nodes")).values()) {
                 Map<String, Object> indices = (Map<String, Object>) ((Map<String, Object>) node).get("indices");
@@ -3746,7 +3747,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             // shard reader; a body no plan answers (a highlighter) is
             // refused with 400 naming the element.
             updateClusterSetting("lance.test.max_docs_per_reader", "4");
-            String pkAttach = readAll(postJson("/_lance/attach", "{\"table\":\"" + pkTableUri + "\"}"));
+            String pkAttach = readAll(postJson("/_plugins/_lance/attach", "{\"table\":\"" + pkTableUri + "\"}"));
             assertTrue(pkAttach, pkAttach.contains("\"lucene_bound_exceeded\":true"));
             client().performRequest(new Request("GET", "/_cluster/health/" + pkTable + "?wait_for_status=green&timeout=60s"));
             for (String key : List.of("alpha-0", "alpha-5", "alpha-11")) {

@@ -39,7 +39,7 @@ public class LanceOverridesIT extends LanceRestTestCase {
         String tableUri = LanceTableFactory.writeEpochMillisTable(scratchDir, tableName);
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"," + OVERRIDES_CLAUSE + "}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"," + OVERRIDES_CLAUSE + "}");
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             assertOverriddenMapping(indexName);
@@ -179,7 +179,7 @@ public class LanceOverridesIT extends LanceRestTestCase {
         String indexName = tableName;
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"multi_fields\":{\"body\":{\"raw\":{\"type\":\"keyword\"}}}}"
             );
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
@@ -206,7 +206,7 @@ public class LanceOverridesIT extends LanceRestTestCase {
         LanceTableFactory.writeTable(scratchDir, withoutTs, 4);
         try {
             Response register = postJson(
-                "/_lance/namespace",
+                "/_plugins/_lance/namespace",
                 "{\"path\":\"" + scratchDir.toString() + "\",\"overrides\":{\"ts\":{\"type\":\"date\"}}}"
             );
             assertEquals("register failed: " + readAll(register), RestStatus.OK.getStatus(), register.getStatusLine().getStatusCode());
@@ -230,7 +230,7 @@ public class LanceOverridesIT extends LanceRestTestCase {
                 } catch (Exception ignored) {}
             }
             try {
-                deleteJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+                deleteJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             } catch (Exception ignored) {}
         }
     }
@@ -244,7 +244,7 @@ public class LanceOverridesIT extends LanceRestTestCase {
         // Unknown type value: refused at parse time, naming the accepted set.
         ResponseException badType = expectThrows(
             ResponseException.class,
-            () -> postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"overrides\":{\"label\":{\"type\":\"text\"}}}")
+            () -> postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\",\"overrides\":{\"label\":{\"type\":\"text\"}}}")
         );
         assertEquals(400, badType.getResponse().getStatusLine().getStatusCode());
         assertTrue(readAll(badType.getResponse()).contains("[date], [keyword], [ip], [wildcard], [geo_point]"));
@@ -252,7 +252,7 @@ public class LanceOverridesIT extends LanceRestTestCase {
         // Arrow type outside the accepted set: refused at derive time.
         ResponseException dateOnUtf8 = expectThrows(
             ResponseException.class,
-            () -> postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"overrides\":{\"label\":{\"type\":\"date\"}}}")
+            () -> postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\",\"overrides\":{\"label\":{\"type\":\"date\"}}}")
         );
         assertEquals(400, dateOnUtf8.getResponse().getStatusLine().getStatusCode());
         assertTrue(readAll(dateOnUtf8.getResponse()).contains("signed 32 or 64 bit integer"));
@@ -261,7 +261,7 @@ public class LanceOverridesIT extends LanceRestTestCase {
         // missing column is an error rather than a skip.
         ResponseException unknownColumn = expectThrows(
             ResponseException.class,
-            () -> postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"overrides\":{\"nope\":{\"type\":\"date\"}}}")
+            () -> postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\",\"overrides\":{\"nope\":{\"type\":\"date\"}}}")
         );
         assertEquals(400, unknownColumn.getResponse().getStatusLine().getStatusCode());
         assertTrue(readAll(unknownColumn.getResponse()).contains("unknown column"));

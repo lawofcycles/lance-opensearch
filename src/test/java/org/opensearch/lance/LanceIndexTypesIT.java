@@ -21,7 +21,7 @@ import org.opensearch.core.rest.RestStatus;
 /**
  * The attach body's {@code indexes} clause end to end: the build creates
  * the requested Lance index types instead of the defaults, {@code none}
- * leaves a column without an index, {@code GET /_lance/stats} reports
+ * leaves a column without an index, {@code GET /_plugins/_lance/stats} reports
  * the types present per column, queries through the chosen types return
  * the same hits as an oracle index over the same table attached without
  * a preference, and the one-shot {@code indexes} object on
@@ -58,14 +58,14 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
         String oracleIndex = tableName + "-oracle";
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\"" + tableUri + "\",\"name\":\"" + prefIndex + "\"," + INDEXES_CLAUSE + "}"
             );
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             ensureGreen(prefIndex);
 
             // Oracle: the same table under another name, no preference.
-            Response oracle = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"name\":\"" + oracleIndex + "\"}");
+            Response oracle = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\",\"name\":\"" + oracleIndex + "\"}");
             assertEquals("attach failed: " + readAll(oracle), RestStatus.OK.getStatus(), oracle.getStatusLine().getStatusCode());
             ensureGreen(oracleIndex);
 
@@ -79,7 +79,7 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
             // keeps the untargeted columns (id, tags, body) out of this
             // build so only the preference-driven types are created.
             String build = readAll(
-                postJson("/_lance/build_indexes/" + prefIndex, "{\"columns\":[\"rating\",\"category\",\"flag\",\"embedding\"]}")
+                postJson("/_plugins/_lance/build_indexes/" + prefIndex, "{\"columns\":[\"rating\",\"category\",\"flag\",\"embedding\"]}")
             );
             assertTrue("expected zonemap on rating: " + build, build.contains("{\"column\":\"rating\",\"type\":\"ZONEMAP\"}"));
             assertTrue("expected bitmap on category: " + build, build.contains("{\"column\":\"category\",\"type\":\"BITMAP\"}"));
@@ -95,7 +95,7 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
             // The stats surface reports the types present per column, and
             // flag stays without an index.
             assertBusy(() -> {
-                String stats = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+                String stats = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
                 Map<String, Object> indexTypes = statsIndexTypes(stats, prefIndex);
                 assertNotNull("stats must report index_types for " + prefIndex + ": " + stats, indexTypes);
                 assertEquals("ZONEMAP", normalisedType(indexTypes, "rating"));
@@ -120,7 +120,10 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
             // writing any preference. Runs against the oracle index,
             // whose settings carry no overrides at all.
             String oneShot = readAll(
-                postJson("/_lance/build_indexes/" + oracleIndex, "{\"columns\":[\"flag\"],\"indexes\":{\"flag\":{\"scalar\":\"bitmap\"}}}")
+                postJson(
+                    "/_plugins/_lance/build_indexes/" + oracleIndex,
+                    "{\"columns\":[\"flag\"],\"indexes\":{\"flag\":{\"scalar\":\"bitmap\"}}}"
+                )
             );
             assertTrue("expected the one-shot bitmap on flag: " + oneShot, oneShot.contains("{\"column\":\"flag\",\"type\":\"BITMAP\"}"));
             String oracleSettings = readAll(client().performRequest(new Request("GET", "/" + oracleIndex + "/_settings")));
@@ -147,16 +150,16 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
         String tableUri = LanceTableFactory.writeHintFixtureTable(scratchDir, tableName, 4, 100);
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"name\":\"" + indexName + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\",\"name\":\"" + indexName + "\"}");
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             ensureGreen(indexName);
 
             // The default BTree on id, as a table writer would have left it.
-            String btree = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"columns\":[\"id\"]}"));
+            String btree = readAll(postJson("/_plugins/_lance/build_indexes/" + indexName, "{\"columns\":[\"id\"]}"));
             assertTrue("expected the BTree on id: " + btree, btree.contains("\"scalar\":[{\"column\":\"id\",\"type\":\"BTREE\"}]"));
 
             // The same type again is skipped, and the reason names it.
-            String sameType = readAll(postJson("/_lance/build_indexes/" + indexName, "{\"columns\":[\"id\"]}"));
+            String sameType = readAll(postJson("/_plugins/_lance/build_indexes/" + indexName, "{\"columns\":[\"id\"]}"));
             assertTrue("expected nothing built: " + sameType, sameType.contains("\"built\":{\"fts\":[],\"scalar\":[],\"vector\":[]}"));
             assertTrue(
                 "expected id skipped as an existing BTree: " + sameType,
@@ -170,7 +173,7 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
             // the BTree instead of being skipped.
             String zonemap = readAll(
                 postJson(
-                    "/_lance/build_indexes/" + indexName,
+                    "/_plugins/_lance/build_indexes/" + indexName,
                     "{\"columns\":[\"id\"],\"indexes\":{\"id\":{\"scalar\":\"zonemap\",\"params\":{\"rows_per_zone\":50}}}}"
                 )
             );
@@ -183,7 +186,7 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
 
             // The stats surface reports both types on the column.
             assertBusy(() -> {
-                String stats = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+                String stats = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
                 Map<String, Object> indexTypes = statsIndexTypes(stats, indexName);
                 assertNotNull("stats must report index_types for " + indexName + ": " + stats, indexTypes);
                 assertEquals(Set.of("BTREE", "ZONEMAP"), normalisedTypes(indexTypes, "id"));
@@ -192,7 +195,7 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
             // The planner reads the new zone map: id >= 250 cannot hold in
             // fragments 0 (ids 0..99) and 1 (100..199).
             assertBusy(() -> {
-                Request explain = new Request("GET", "/" + indexName + "/_lance/explain");
+                Request explain = new Request("GET", "/_plugins/_lance/explain/" + indexName);
                 explain.setJsonEntity("{\"size\":0,\"query\":{\"range\":{\"id\":{\"gte\":250}}}}");
                 String body;
                 try {
@@ -227,7 +230,7 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
             ResponseException wrongKind = expectThrows(
                 ResponseException.class,
                 () -> postJson(
-                    "/_lance/attach",
+                    "/_plugins/_lance/attach",
                     "{\"table\":\"" + tableUri + "\",\"name\":\"" + tableName + "\",\"indexes\":{\"rating\":{\"vector\":\"ivf_flat\"}}}"
                 )
             );
@@ -239,7 +242,7 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
             ResponseException scalarOnVector = expectThrows(
                 ResponseException.class,
                 () -> postJson(
-                    "/_lance/attach",
+                    "/_plugins/_lance/attach",
                     "{\"table\":\"" + tableUri + "\",\"name\":\"" + tableName + "\",\"indexes\":{\"embedding\":{\"scalar\":\"bitmap\"}}}"
                 )
             );
@@ -251,7 +254,7 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
             ResponseException unknown = expectThrows(
                 ResponseException.class,
                 () -> postJson(
-                    "/_lance/attach",
+                    "/_plugins/_lance/attach",
                     "{\"table\":\"" + tableUri + "\",\"name\":\"" + tableName + "\",\"indexes\":{\"nope\":{\"scalar\":\"btree\"}}}"
                 )
             );
@@ -262,7 +265,7 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
             ResponseException unknownType = expectThrows(
                 ResponseException.class,
                 () -> postJson(
-                    "/_lance/attach",
+                    "/_plugins/_lance/attach",
                     "{\"table\":\"" + tableUri + "\",\"name\":\"" + tableName + "\",\"indexes\":{\"rating\":{\"scalar\":\"hash\"}}}"
                 )
             );
@@ -314,7 +317,7 @@ public class LanceIndexTypesIT extends LanceRestTestCase {
 
     /**
      * The {@code index_types} object of {@code index} from a
-     * {@code GET /_lance/stats} body, searched across the per-node
+     * {@code GET /_plugins/_lance/stats} body, searched across the per-node
      * {@code indices} blocks (only the shard-hosting node reports the
      * index). {@code null} when no node reports it.
      */

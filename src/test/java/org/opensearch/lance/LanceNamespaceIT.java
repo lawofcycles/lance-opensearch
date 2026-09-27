@@ -19,7 +19,7 @@ import org.opensearch.core.rest.RestStatus;
 
 /**
  * Namespace registration, listing and unregistration through {@code
- * /_lance/namespace}, the polling loop that surfaces tables as indices, the
+ * /_plugins/_lance/namespace}, the polling loop that surfaces tables as indices, the
  * resurface guard, and storage option propagation to auto-surfaced indices.
  */
 public class LanceNamespaceIT extends LanceRestTestCase {
@@ -27,10 +27,10 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     public void testRegisterNamespace() throws IOException {
         String path = scratchPathString("register");
         java.nio.file.Files.createDirectories(java.nio.file.Path.of(path));
-        Response post = postJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
+        Response post = postJson("/_plugins/_lance/namespace", "{\"path\":\"" + path + "\"}");
         assertEquals(RestStatus.OK.getStatus(), post.getStatusLine().getStatusCode());
 
-        Response listing = client().performRequest(new Request("GET", "/_lance/namespace"));
+        Response listing = client().performRequest(new Request("GET", "/_plugins/_lance/namespace"));
         String body = readAll(listing);
         assertTrue("expected namespace " + path + " in listing, saw: " + body, body.contains(path));
     }
@@ -40,10 +40,10 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         // would make the poll loop scan the catalog twice per cycle.
         String path = scratchPathString("idempotent");
         java.nio.file.Files.createDirectories(java.nio.file.Path.of(path));
-        postJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
-        postJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
+        postJson("/_plugins/_lance/namespace", "{\"path\":\"" + path + "\"}");
+        postJson("/_plugins/_lance/namespace", "{\"path\":\"" + path + "\"}");
 
-        Response listing = client().performRequest(new Request("GET", "/_lance/namespace"));
+        Response listing = client().performRequest(new Request("GET", "/_plugins/_lance/namespace"));
         String body = readAll(listing);
         // A directory entry emits the path as both its name and its path
         // field, so count registrations by the name field.
@@ -52,7 +52,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     }
 
     public void testRegisterNamespaceRejectsMissingPath() throws IOException {
-        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/namespace", "{}"));
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_plugins/_lance/namespace", "{}"));
         int status = failure.getResponse().getStatusLine().getStatusCode();
         assertEquals("expected 400 for missing path, saw " + status, 400, status);
         String body = readAll(failure.getResponse());
@@ -60,7 +60,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     }
 
     public void testRegisterNamespaceRejectsNonStringPath() throws IOException {
-        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/namespace", "{\"path\":42}"));
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_plugins/_lance/namespace", "{\"path\":42}"));
         int status = failure.getResponse().getStatusLine().getStatusCode();
         assertEquals("expected 400 for non-string path, saw " + status, 400, status);
         String body = readAll(failure.getResponse());
@@ -71,7 +71,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         String phantom = sharedRoot().resolve("does-not-exist-" + randomAlphaOfLength(8)).toString();
         ResponseException failure = expectThrows(
             ResponseException.class,
-            () -> postJson("/_lance/namespace", "{\"path\":\"" + phantom + "\"}")
+            () -> postJson("/_plugins/_lance/namespace", "{\"path\":\"" + phantom + "\"}")
         );
         int status = failure.getResponse().getStatusLine().getStatusCode();
         assertEquals("expected 400 for non-existent path, saw " + status, 400, status);
@@ -87,7 +87,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         try {
             ResponseException failure = expectThrows(
                 ResponseException.class,
-                () -> postJson("/_lance/namespace", "{\"path\":\"" + file.toString() + "\"}")
+                () -> postJson("/_plugins/_lance/namespace", "{\"path\":\"" + file.toString() + "\"}")
             );
             int status = failure.getResponse().getStatusLine().getStatusCode();
             assertEquals("expected 400 for file path, saw " + status, 400, status);
@@ -101,15 +101,15 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     public void testUnregisterNamespace() throws IOException {
         String path = scratchPathString("unregister");
         java.nio.file.Files.createDirectories(java.nio.file.Path.of(path));
-        Response register = postJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
+        Response register = postJson("/_plugins/_lance/namespace", "{\"path\":\"" + path + "\"}");
         assertEquals(RestStatus.OK.getStatus(), register.getStatusLine().getStatusCode());
 
-        Response unregister = deleteJson("/_lance/namespace", "{\"path\":\"" + path + "\"}");
+        Response unregister = deleteJson("/_plugins/_lance/namespace", "{\"path\":\"" + path + "\"}");
         assertEquals(RestStatus.OK.getStatus(), unregister.getStatusLine().getStatusCode());
         String unregBody = readAll(unregister);
         assertTrue("expected unregistered:true, saw: " + unregBody, unregBody.contains("\"unregistered\":true"));
 
-        Response listing = client().performRequest(new Request("GET", "/_lance/namespace"));
+        Response listing = client().performRequest(new Request("GET", "/_plugins/_lance/namespace"));
         String body = readAll(listing);
         assertFalse("expected namespace " + path + " to be gone, saw: " + body, body.contains(path));
     }
@@ -118,24 +118,24 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         String path = scratchPathString("neverreg") + "-x";
         ResponseException failure = expectThrows(
             ResponseException.class,
-            () -> deleteJson("/_lance/namespace", "{\"path\":\"" + path + "\"}")
+            () -> deleteJson("/_plugins/_lance/namespace", "{\"path\":\"" + path + "\"}")
         );
         int status = failure.getResponse().getStatusLine().getStatusCode();
         assertEquals("expected 404 for unregister of unknown path, saw " + status, 404, status);
     }
 
     public void testListTablesReturnsSurfacedNames() throws Exception {
-        // POST /_lance/namespace/tables previews what the poll would
+        // POST /_plugins/_lance/namespace/tables previews what the poll would
         // surface without waiting for a poll cycle.
         String suffix = "listtables-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         LanceTableFactory.writeTable(scratchDir, "alpha", 4);
         LanceTableFactory.writeTable(scratchDir, "bravo", 4);
         try {
-            Response register = postJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+            Response register = postJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             assertEquals(RestStatus.OK.getStatus(), register.getStatusLine().getStatusCode());
 
-            Response listing = postJson("/_lance/namespace/tables", "{\"path\":\"" + scratchDir.toString() + "\"}");
+            Response listing = postJson("/_plugins/_lance/namespace/tables", "{\"path\":\"" + scratchDir.toString() + "\"}");
             assertEquals(RestStatus.OK.getStatus(), listing.getStatusLine().getStatusCode());
             String body = readAll(listing);
             assertTrue("expected name echo: " + body, body.contains("\"name\":\"" + scratchDir.toString() + "\""));
@@ -143,13 +143,13 @@ public class LanceNamespaceIT extends LanceRestTestCase {
             assertTrue("expected table bravo in list: " + body, body.contains("\"bravo\""));
         } finally {
             try {
-                deleteJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+                deleteJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             } catch (Exception ignored) {}
         }
     }
 
     public void testPollTriggerSurfacesATableDroppedIntoTheDirectory() throws Exception {
-        // POST /_lance/namespace/_poll runs the listing cycle now: a table
+        // POST /_plugins/_lance/namespace/_poll runs the listing cycle now: a table
         // written into a registered directory gets its index without
         // waiting for the cadence, and the answer names it. The scheduled
         // cycle (1s here) may surface it first; the trigger then finds the
@@ -160,12 +160,12 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         String second = "second-" + suffix;
         LanceTableFactory.writeTable(scratchDir, first, 4);
         try {
-            Response register = postJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+            Response register = postJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             assertEquals(RestStatus.OK.getStatus(), register.getStatusLine().getStatusCode());
             client().performRequest(new Request("GET", "/_cluster/health/" + first + "?wait_for_status=yellow&timeout=30s"));
 
             LanceTableFactory.writeTable(scratchDir, second, 4);
-            Response poll = postJson("/_lance/namespace/_poll?name=" + scratchDir.toString(), "");
+            Response poll = postJson("/_plugins/_lance/namespace/_poll?name=" + scratchDir.toString(), "");
             assertEquals(RestStatus.OK.getStatus(), poll.getStatusLine().getStatusCode());
             String body = readAll(poll);
             java.util.Map<String, Object> parsed = parseJson(body);
@@ -180,7 +180,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
             assertEquals("the new table has its index after the trigger: " + readAll(health), 200, health.getStatusLine().getStatusCode());
 
             // A registration nobody knows: nothing to list, nothing done.
-            String unknown = readAll(postJson("/_lance/namespace/_poll?name=/no-such-registration-" + suffix, ""));
+            String unknown = readAll(postJson("/_plugins/_lance/namespace/_poll?name=/no-such-registration-" + suffix, ""));
             assertEquals("{\"surfaced\":[],\"skipped\":[],\"unavailable\":{},\"partial\":{}}", unknown);
         } finally {
             for (String index : List.of(first, second)) {
@@ -189,7 +189,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
                 } catch (Exception ignored) {}
             }
             try {
-                deleteJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+                deleteJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             } catch (Exception ignored) {}
         }
     }
@@ -205,10 +205,10 @@ public class LanceNamespaceIT extends LanceRestTestCase {
             Request plain = new Request("PUT", "/" + clashing);
             plain.setJsonEntity("{\"settings\":{\"index.number_of_shards\":1,\"index.number_of_replicas\":0}}");
             client().performRequest(plain);
-            Response register = postJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+            Response register = postJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             assertEquals(RestStatus.OK.getStatus(), register.getStatusLine().getStatusCode());
 
-            String body = readAll(postJson("/_lance/namespace/_poll", ""));
+            String body = readAll(postJson("/_plugins/_lance/namespace/_poll", ""));
             assertTrue("the clashing table is skipped: " + body, body.contains("\"index\":\"" + clashing + "\""));
             assertTrue("with the collision as the reason: " + body, body.contains("name collision"));
             assertTrue("the plain index is untouched: " + body, body.contains("\"surfaced\":[]"));
@@ -219,7 +219,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
                 client().performRequest(new Request("DELETE", "/" + clashing));
             } catch (Exception ignored) {}
             try {
-                deleteJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+                deleteJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             } catch (Exception ignored) {}
         }
     }
@@ -230,7 +230,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         String phantom = scratchPathString("phantom-list") + "-nope";
         ResponseException failure = expectThrows(
             ResponseException.class,
-            () -> postJson("/_lance/namespace/tables", "{\"path\":\"" + phantom + "\"}")
+            () -> postJson("/_plugins/_lance/namespace/tables", "{\"path\":\"" + phantom + "\"}")
         );
         int status = failure.getResponse().getStatusLine().getStatusCode();
         assertEquals("expected 404 for list_tables on unknown path, saw " + status, 404, status);
@@ -239,7 +239,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     }
 
     public void testListTablesRejectsMissingPath() throws IOException {
-        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_lance/namespace/tables", "{}"));
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_plugins/_lance/namespace/tables", "{}"));
         assertEquals(400, failure.getResponse().getStatusLine().getStatusCode());
         String body = readAll(failure.getResponse());
         assertTrue("expected [name] required message: " + body, body.contains("[name]"));
@@ -256,14 +256,14 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         String indexName = tableName;
         updateClusterSetting("lance.namespace.resurface_guard_grace", "3s");
         try {
-            Response register = postJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+            Response register = postJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             assertEquals(RestStatus.OK.getStatus(), register.getStatusLine().getStatusCode());
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=yellow&timeout=30s"));
 
             client().performRequest(new Request("DELETE", "/" + indexName));
 
             // A poll cycle inside the grace skips the table and says why.
-            String polled = readAll(postJson("/_lance/namespace/_poll?name=" + scratchDir.toString(), ""));
+            String polled = readAll(postJson("/_plugins/_lance/namespace/_poll?name=" + scratchDir.toString(), ""));
             assertTrue("expected the table skipped within the grace: " + polled, polled.contains("\"index\":\"" + indexName + "\""));
             assertTrue(polled, polled.contains("deleted within lance.namespace.resurface_guard_grace"));
             ResponseException stillGone = expectThrows(
@@ -300,7 +300,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
             try {
-                deleteJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+                deleteJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             } catch (Exception ignored) {}
             updateClusterSetting("lance.namespace.resurface_guard_grace", "1h");
         }
@@ -316,7 +316,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         String indexName = tableName;
         updateClusterSetting("lance.namespace.resurface_guard_grace", "0");
         try {
-            postJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+            postJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=yellow&timeout=30s"));
             client().performRequest(new Request("DELETE", "/" + indexName));
             // A poll cycle right after the delete recreates the index; the
@@ -324,7 +324,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
             // The scheduled cycle (1s here) may recreate it first, in which
             // case the trigger finds the index and reports nothing; either
             // way the index exists when the trigger returns.
-            String polled = readAll(postJson("/_lance/namespace/_poll?name=" + scratchDir.toString(), ""));
+            String polled = readAll(postJson("/_plugins/_lance/namespace/_poll?name=" + scratchDir.toString(), ""));
             assertFalse("grace=0 disables the guard: " + polled, polled.contains("deleted within lance.namespace.resurface_guard_grace"));
             Response recovered = client().performRequest(
                 new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=yellow&timeout=30s")
@@ -339,7 +339,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
             try {
-                deleteJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+                deleteJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             } catch (Exception ignored) {}
             updateClusterSetting("lance.namespace.resurface_guard_grace", "1h");
         }
@@ -356,7 +356,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         String indexName = tableName;
         try {
             Response register = postJson(
-                "/_lance/namespace",
+                "/_plugins/_lance/namespace",
                 "{\"path\":\"" + scratchDir.toString() + "\",\"storage_options\":{\"aws_region\":\"eu-west-1\"}}"
             );
             assertEquals(
@@ -385,7 +385,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
                 client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
             try {
-                deleteJson("/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
+                deleteJson("/_plugins/_lance/namespace", "{\"path\":\"" + scratchDir.toString() + "\"}");
             } catch (Exception ignored) {}
         }
     }
@@ -393,7 +393,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     public void testRegisterNamespaceRejectsUnknownType() throws IOException {
         ResponseException failure = expectThrows(
             ResponseException.class,
-            () -> postJson("/_lance/namespace", "{\"type\":\"hive\",\"name\":\"h\"}")
+            () -> postJson("/_plugins/_lance/namespace", "{\"type\":\"hive\",\"name\":\"h\"}")
         );
         assertEquals(400, failure.getResponse().getStatusLine().getStatusCode());
         String body = readAll(failure.getResponse());
@@ -412,7 +412,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         for (String type : List.of("iceberg", "polaris")) {
             ResponseException noEndpoint = expectThrows(
                 ResponseException.class,
-                () -> postJson("/_lance/namespace", "{\"type\":\"" + type + "\",\"name\":\"c\",\"config\":{\"warehouse\":\"wh\"}}")
+                () -> postJson("/_plugins/_lance/namespace", "{\"type\":\"" + type + "\",\"name\":\"c\",\"config\":{\"warehouse\":\"wh\"}}")
             );
             assertEquals(400, noEndpoint.getResponse().getStatusLine().getStatusCode());
             assertTrue(readAll(noEndpoint.getResponse()).contains("[config.endpoint]"));
@@ -420,7 +420,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
             ResponseException noWarehouse = expectThrows(
                 ResponseException.class,
                 () -> postJson(
-                    "/_lance/namespace",
+                    "/_plugins/_lance/namespace",
                     "{\"type\":\"" + type + "\",\"name\":\"c\",\"config\":{\"endpoint\":\"http://127.0.0.1:1\"}}"
                 )
             );
@@ -429,7 +429,10 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         }
         ResponseException noCatalog = expectThrows(
             ResponseException.class,
-            () -> postJson("/_lance/namespace", "{\"type\":\"unity\",\"name\":\"c\",\"config\":{\"endpoint\":\"http://127.0.0.1:1\"}}")
+            () -> postJson(
+                "/_plugins/_lance/namespace",
+                "{\"type\":\"unity\",\"name\":\"c\",\"config\":{\"endpoint\":\"http://127.0.0.1:1\"}}"
+            )
         );
         assertEquals(400, noCatalog.getResponse().getStatusLine().getStatusCode());
         assertTrue(readAll(noCatalog.getResponse()).contains("[config.catalog]"));
@@ -438,14 +441,14 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     public void testRegisterRestNamespaceRequiresNameAndUri() throws IOException {
         ResponseException noName = expectThrows(
             ResponseException.class,
-            () -> postJson("/_lance/namespace", "{\"type\":\"rest\",\"config\":{\"uri\":\"http://127.0.0.1:1\"}}")
+            () -> postJson("/_plugins/_lance/namespace", "{\"type\":\"rest\",\"config\":{\"uri\":\"http://127.0.0.1:1\"}}")
         );
         assertEquals(400, noName.getResponse().getStatusLine().getStatusCode());
         assertTrue(readAll(noName.getResponse()).contains("[name]"));
 
         ResponseException noUri = expectThrows(
             ResponseException.class,
-            () -> postJson("/_lance/namespace", "{\"type\":\"rest\",\"name\":\"cat\"}")
+            () -> postJson("/_plugins/_lance/namespace", "{\"type\":\"rest\",\"name\":\"cat\"}")
         );
         assertEquals(400, noUri.getResponse().getStatusLine().getStatusCode());
         assertTrue(readAll(noUri.getResponse()).contains("[config.uri]"));
@@ -453,7 +456,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         ResponseException withPath = expectThrows(
             ResponseException.class,
             () -> postJson(
-                "/_lance/namespace",
+                "/_plugins/_lance/namespace",
                 "{\"type\":\"rest\",\"name\":\"cat\",\"path\":\"/tmp\",\"config\":{\"uri\":\"http://127.0.0.1:1\"}}"
             )
         );

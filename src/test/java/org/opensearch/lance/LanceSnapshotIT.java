@@ -100,10 +100,10 @@ public class LanceSnapshotIT extends LanceRestTestCase {
                 // Three poll cycles must not recreate or duplicate the
                 // restored index: the poll sees the name taken by an index
                 // backed by the same table and skips the table without
-                // reporting it. POST /_lance/namespace/_poll runs the same
+                // reporting it. POST /_plugins/_lance/namespace/_poll runs the same
                 // cycle the cadence runs.
                 for (int cycle = 0; cycle < 3; cycle++) {
-                    String polled = readAll(postJson("/_lance/namespace/_poll", ""));
+                    String polled = readAll(postJson("/_plugins/_lance/namespace/_poll", ""));
                     assertFalse(
                         "poll cycle " + cycle + " must neither surface nor skip the restored index: " + polled,
                         polled.contains("\"" + indexName + "\"")
@@ -153,7 +153,10 @@ public class LanceSnapshotIT extends LanceRestTestCase {
                     client().performRequest(new Request("DELETE", "/" + indexName));
                 } catch (Exception ignored) {}
                 try {
-                    deleteJson("/_lance/namespace", "{\"path\":\"" + f.tableUri().substring(0, f.tableUri().lastIndexOf('/')) + "\"}");
+                    deleteJson(
+                        "/_plugins/_lance/namespace",
+                        "{\"path\":\"" + f.tableUri().substring(0, f.tableUri().lastIndexOf('/')) + "\"}"
+                    );
                 } catch (Exception ignored) {}
                 dropFsRepository(repo);
             }
@@ -177,7 +180,7 @@ public class LanceSnapshotIT extends LanceRestTestCase {
         String repo = "repo-" + randomAlphaOfLength(6).toLowerCase(Locale.ROOT);
         String snap = "snap-" + randomAlphaOfLength(6).toLowerCase(Locale.ROOT);
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             ensureGreen(indexName);
 
@@ -251,7 +254,7 @@ public class LanceSnapshotIT extends LanceRestTestCase {
         String snap = "snap-" + randomAlphaOfLength(6).toLowerCase(Locale.ROOT);
         try {
             Response attach = postJson(
-                "/_lance/attach",
+                "/_plugins/_lance/attach",
                 "{\"table\":\""
                     + tableUri
                     + "\",\"version\":1,\"storage_options\":{\"aws_region\":\"us-east-1\",\"aws_secret_access_key\":\"SECRETFILTERME\"}}"
@@ -315,7 +318,7 @@ public class LanceSnapshotIT extends LanceRestTestCase {
         String repo = "repo-" + randomAlphaOfLength(6).toLowerCase(Locale.ROOT);
         String snap = "snap-" + randomAlphaOfLength(6).toLowerCase(Locale.ROOT);
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tablePath + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tablePath + "\"}");
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
 
             putFsRepository(repo);
@@ -441,7 +444,7 @@ public class LanceSnapshotIT extends LanceRestTestCase {
         Path movedPath = scratchDir.resolve(tableName + ".moved");
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tablePath + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tablePath + "\"}");
             assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             ensureGreen(indexName);
             Request retries = new Request("PUT", "/" + indexName + "/_settings");

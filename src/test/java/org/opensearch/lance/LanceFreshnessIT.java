@@ -18,10 +18,10 @@ import org.opensearch.core.rest.RestStatus;
 
 /**
  * The freshness check on the node holding the shard, driven through
- * {@code POST /{index}/_lance/sync}: an append is a move that advances
+ * {@code POST /_plugins/_lance/sync/{index}}: an append is a move that advances
  * the engine reader without a mapping update, a new column is a move
  * that updates the mapping, a check at the table's version does nothing,
- * a pinned index is never checked, and {@code GET /_lance/stats} counts
+ * a pinned index is never checked, and {@code GET /_plugins/_lance/stats} counts
  * all of it under {@code freshness}.
  */
 public class LanceFreshnessIT extends LanceRestTestCase {
@@ -34,7 +34,7 @@ public class LanceFreshnessIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             ensureGreen(indexName);
             long attachedVersion = LanceTableFactory.currentVersion(tableUri);
@@ -102,7 +102,7 @@ public class LanceFreshnessIT extends LanceRestTestCase {
         long version = LanceTableFactory.currentVersion(tableUri);
         String indexName = tableName;
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\",\"version\":" + version + "}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\",\"version\":" + version + "}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             ensureGreen(indexName);
             LanceTableFactory.appendRows(tableUri, 6, 4);
@@ -137,14 +137,14 @@ public class LanceFreshnessIT extends LanceRestTestCase {
     }
 
     private static Map<String, Object> sync(String indexName) throws IOException {
-        Response response = client().performRequest(new Request("POST", "/" + indexName + "/_lance/sync"));
+        Response response = client().performRequest(new Request("POST", "/_plugins/_lance/sync/" + indexName));
         assertEquals(RestStatus.OK.getStatus(), response.getStatusLine().getStatusCode());
         return parseJson(readAll(response));
     }
 
     @SuppressWarnings("unchecked")
     private static Map<String, Object> freshness() throws IOException {
-        Map<String, Object> parsed = parseJson(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> parsed = parseJson(readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats"))));
         Map<String, Object> nodes = (Map<String, Object>) parsed.get("nodes");
         assertEquals("single node cluster", 1, nodes.size());
         Map<String, Object> node = (Map<String, Object>) nodes.values().iterator().next();

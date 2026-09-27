@@ -39,10 +39,73 @@ public class LancePluginIT extends LanceRestTestCase {
     }
 
     public void testNamespaceEndpointIsRegistered() throws IOException {
-        Response response = client().performRequest(new Request("GET", "/_lance/namespace"));
+        Response response = client().performRequest(new Request("GET", "/_plugins/_lance/namespace"));
         assertEquals(RestStatus.OK.getStatus(), response.getStatusLine().getStatusCode());
         String body = readAll(response);
         assertTrue("expected namespaces JSON, saw: " + body, body.contains("namespaces"));
+    }
+
+    public void testOldPathsAnswerWithDeprecationWarning() throws IOException {
+        // The test client runs in strict deprecation mode, so a Warning
+        // header fails the request unless the options expect it. The
+        // node logs one "deprecated_route" message per X-Opaque-Id and
+        // only a logged message becomes a Warning header, so every old
+        // path request carries its own opaque id to be sure the header
+        // is there even after another request already tripped the
+        // deprecation on the same node.
+        assertDeprecatedPath("GET", "/_lance/stats", "/_lance/stats", "/_plugins/_lance/stats");
+        assertDeprecatedPath("GET", "/_lance/namespace", "/_lance/namespace", "/_plugins/_lance/namespace");
+
+        Response stats = client().performRequest(new Request("GET", "/_plugins/_lance/stats"));
+        assertEquals(RestStatus.OK.getStatus(), stats.getStatusLine().getStatusCode());
+        assertEquals("unexpected warnings on the new path: " + stats.getWarnings(), List.of(), stats.getWarnings());
+
+        Response namespaces = client().performRequest(new Request("GET", "/_plugins/_lance/namespace"));
+        assertEquals(RestStatus.OK.getStatus(), namespaces.getStatusLine().getStatusCode());
+        assertEquals("unexpected warnings on the new path: " + namespaces.getWarnings(), List.of(), namespaces.getWarnings());
+    }
+
+    public void testOldStatsPathReadsNodeIdOnBothTemplates() throws IOException {
+        // The old template /_lance/stats/{node_id} shares its parameter
+        // name with the new /_plugins/_lance/{node_id}/stats, so a node id
+        // on the old path still selects that node.
+        String nodesBody = readAll(client().performRequest(new Request("GET", "/_nodes/_local")));
+        Map<String, Object> nodes = parseJson(nodesBody);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> nodeMap = (Map<String, Object>) nodes.get("nodes");
+        String nodeId = nodeMap.keySet().iterator().next();
+
+        Response oldPath = assertDeprecatedPath(
+            "GET",
+            "/_lance/stats/" + nodeId,
+            "/_lance/stats/{node_id}",
+            "/_plugins/_lance/{node_id}/stats"
+        );
+        String oldBody = readAll(oldPath);
+        assertEquals("expected exactly one node in " + oldBody, 1, extractIntPath(oldBody, "_nodes", "total"));
+        assertTrue("expected node " + nodeId + " in " + oldBody, oldBody.contains("\"" + nodeId + "\""));
+
+        Response newPath = client().performRequest(new Request("GET", "/_plugins/_lance/" + nodeId + "/stats"));
+        String newBody = readAll(newPath);
+        assertEquals("expected exactly one node in " + newBody, 1, extractIntPath(newBody, "_nodes", "total"));
+        assertTrue("expected node " + nodeId + " in " + newBody, newBody.contains("\"" + nodeId + "\""));
+    }
+
+    /**
+     * Sends {@code method oldPath} and asserts it answers 200 with exactly
+     * the deprecation warning OpenSearch's {@code RestController} builds for
+     * a replaced route. The templates are the paths as registered, with
+     * their {@code {param}} placeholders, because the warning quotes the
+     * templates, not the resolved request path.
+     */
+    private static Response assertDeprecatedPath(String method, String oldPath, String oldTemplate, String newTemplate) throws IOException {
+        String warning = "[" + method + " " + oldTemplate + "] is deprecated! Use [" + method + " " + newTemplate + "] instead.";
+        Request request = new Request(method, oldPath);
+        request.setOptions(expectWarnings(warning).toBuilder().addHeader("X-Opaque-Id", "lance-deprecated-" + randomAlphaOfLength(12)));
+        Response response = client().performRequest(request);
+        assertEquals(RestStatus.OK.getStatus(), response.getStatusLine().getStatusCode());
+        assertEquals("expected the deprecation warning on " + oldPath, List.of(warning), response.getWarnings());
+        return response;
     }
 
     public void testStatsAPIsSucceedForLanceIndex() throws Exception {

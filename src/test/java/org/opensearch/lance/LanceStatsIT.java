@@ -21,7 +21,7 @@ import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
 
 /**
- * {@code GET /_lance/stats} against the single node test cluster: the
+ * {@code GET /_plugins/_lance/stats} against the single node test cluster: the
  * envelope, the counters moving with fragment path requests, and the shard
  * path (GET, {@code _stats}) sharing the fragment path's snapshot.
  */
@@ -151,7 +151,7 @@ public class LanceStatsIT extends LanceRestTestCase {
         LanceTableFactory.writeStringPkTable(scratchDir, tableName, 4);
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(readAll(attach), 200, attach.getStatusLine().getStatusCode());
             ensureGreen(tableName);
 
@@ -198,7 +198,7 @@ public class LanceStatsIT extends LanceRestTestCase {
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         try {
             long sessionBytesBefore = ((Number) nativeMemory(nodeStats()).get("session_bytes")).longValue();
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(readAll(attach), 200, attach.getStatusLine().getStatusCode());
             ensureGreen(tableName);
 
@@ -422,7 +422,7 @@ public class LanceStatsIT extends LanceRestTestCase {
     }
 
     public void testStatsEnvelopeAndNodeFilter() throws Exception {
-        String body = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+        String body = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
         Map<String, Object> parsed = parse(body);
         assertEquals(1, extractIntPath(body, "_nodes", "total"));
         assertEquals(1, extractIntPath(body, "_nodes", "successful"));
@@ -433,20 +433,20 @@ public class LanceStatsIT extends LanceRestTestCase {
         assertEquals(1, nodes.size());
         String nodeId = nodes.keySet().iterator().next();
 
-        String filtered = readAll(client().performRequest(new Request("GET", "/_lance/stats/" + nodeId)));
+        String filtered = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/" + nodeId + "/stats")));
         assertEquals(1, extractIntPath(filtered, "_nodes", "total"));
         @SuppressWarnings("unchecked")
         Map<String, Object> filteredNodes = (Map<String, Object>) parse(filtered).get("nodes");
         assertTrue(filtered, filteredNodes.containsKey(nodeId));
 
-        String none = readAll(client().performRequest(new Request("GET", "/_lance/stats/no-such-node")));
+        String none = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/no-such-node/stats")));
         assertEquals(0, extractIntPath(none, "_nodes", "total"));
     }
 
     /** The single node's stats object. */
     @SuppressWarnings("unchecked")
     private static Map<String, Object> nodeStats() throws IOException {
-        Map<String, Object> parsed = parse(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> parsed = parse(readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats"))));
         Map<String, Object> nodes = (Map<String, Object>) parsed.get("nodes");
         assertEquals("single node cluster", 1, nodes.size());
         return (Map<String, Object>) nodes.values().iterator().next();

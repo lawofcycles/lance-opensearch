@@ -320,7 +320,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
     /** The single node's {@code admission} stats block. */
     @SuppressWarnings("unchecked")
     private static Map<String, Object> admissionStats() throws IOException {
-        String stats = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+        String stats = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
         Map<String, Object> nodes = (Map<String, Object>) parseJson(stats).get("nodes");
         assertEquals("single node cluster: " + stats, 1, nodes.size());
         Map<String, Object> node = (Map<String, Object>) nodes.values().iterator().next();
@@ -368,7 +368,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
         LanceTableFactory.writeIndexedFixtureTable(scratchDir, tableName, 2, 150);
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(readAll(attach), 200, attach.getStatusLine().getStatusCode());
             ensureGreen(tableName);
 
@@ -642,7 +642,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
         LanceTableFactory.writeIndexedFixtureTable(scratchDir, tableName, 2, 150);
         String tableUri = scratchDir.resolve(tableName + ".lance").toString();
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(readAll(attach), 200, attach.getStatusLine().getStatusCode());
             ensureGreen(tableName);
             assertBusy(() -> {
@@ -682,7 +682,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
     /** The single node's {@code warm_up.tables} entry of {@code indexName}, or {@code null} when the node has not seen it. */
     @SuppressWarnings("unchecked")
     private static Map<String, Object> warmUpStatus(String indexName) throws IOException {
-        String stats = readAll(client().performRequest(new Request("GET", "/_lance/stats")));
+        String stats = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
         Map<String, Object> nodes = (Map<String, Object>) parseJson(stats).get("nodes");
         assertEquals("single node cluster: " + stats, 1, nodes.size());
         Map<String, Object> node = (Map<String, Object>) nodes.values().iterator().next();

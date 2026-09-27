@@ -24,7 +24,7 @@ import org.opensearch.core.rest.RestStatus;
  * count, a page in score order, a page ordered by a column, and an
  * aggregation) and must answer what the stock search action answers for
  * the same body against the target of {@link #withStockOracle}, while
- * {@code GET /<index>/_lance/explain} must report the route the matrix
+ * {@code GET /_plugins/_lance/explain/<index>} must report the route the matrix
  * in {@code docs/features.md} promises: a predicate the Lance scan
  * evaluates, the Lance inverted index, or the Lucene composition of the
  * request's own builder over the fragment leaves. The score shaping
@@ -194,7 +194,7 @@ public class LanceQueryDSLIT extends LanceRestTestCase {
     );
 
     private static String explainOk(String indexName, String body) throws IOException {
-        Request request = new Request("GET", "/" + indexName + "/_lance/explain");
+        Request request = new Request("GET", "/_plugins/_lance/explain/" + indexName);
         request.setJsonEntity(body);
         Response response = client().performRequest(request);
         assertEquals(RestStatus.OK.getStatus(), response.getStatusLine().getStatusCode());
@@ -440,7 +440,7 @@ public class LanceQueryDSLIT extends LanceRestTestCase {
         String indexName = "demo-" + suffix;
         String tableUri = LanceTableFactory.writeStringPkTable(scratchDir, indexName, 12, 4);
         try {
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             String ids = "{\"ids\":{\"values\":[\"alpha-2\",\"alpha-9\",\"alpha-99\"]}}";
             String count = "{\"size\":0,\"track_total_hits\":true,\"query\":" + ids + "}";

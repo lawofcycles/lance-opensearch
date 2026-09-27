@@ -178,7 +178,7 @@ public class LanceProfileIT extends LanceRestTestCase {
             Request off = new Request("PUT", "/_cluster/settings");
             off.setJsonEntity("{\"transient\":{\"lance.fetch_cache.enabled\":false}}");
             client().performRequest(off);
-            Response attach = postJson("/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             String nodeId = localNodeId();
 

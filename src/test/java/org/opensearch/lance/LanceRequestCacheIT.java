@@ -17,7 +17,7 @@ import org.opensearch.client.ResponseException;
  * The coordinator result cache against the single node test cluster:
  * a repeated {@code size: 0} aggregation body is served from the cache
  * with the same answer, the {@code request_cache} counters of
- * {@code GET /_lance/stats} move with hits, misses, skips and
+ * {@code GET /_plugins/_lance/stats} move with hits, misses, skips and
  * invalidations, an append to the table advances the version and
  * misses, {@code POST /<index>/_cache/clear} and {@code DELETE /<index>}
  * drop the entries, and the explain endpoint says which bodies qualify.
@@ -203,7 +203,7 @@ public class LanceRequestCacheIT extends LanceRestTestCase {
     /** The {@code request_cache} object of the single node's stats. */
     @SuppressWarnings("unchecked")
     static Map<String, Object> requestCache() throws IOException {
-        Map<String, Object> parsed = parseJson(readAll(client().performRequest(new Request("GET", "/_lance/stats"))));
+        Map<String, Object> parsed = parseJson(readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats"))));
         Map<String, Object> nodes = (Map<String, Object>) parsed.get("nodes");
         assertEquals("single node cluster", 1, nodes.size());
         Map<String, Object> node = (Map<String, Object>) nodes.values().iterator().next();
@@ -217,7 +217,7 @@ public class LanceRequestCacheIT extends LanceRestTestCase {
     }
 
     private static Map<String, Object> explain(String index, String body) throws IOException {
-        Request explain = new Request("GET", "/" + index + "/_lance/explain");
+        Request explain = new Request("GET", "/_plugins/_lance/explain/" + index);
         explain.setJsonEntity(body);
         return parseJson(readAll(client().performRequest(explain)));
     }
