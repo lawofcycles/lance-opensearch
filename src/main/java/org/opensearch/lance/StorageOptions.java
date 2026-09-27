@@ -14,11 +14,16 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.lance.ReadOptions;
+import org.opensearch.ExceptionsHelper;
+import org.opensearch.OpenSearchStatusException;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.core.rest.RestStatus;
 
 /**
  * Immutable wrapper around a Lance object-store storage options map, the
@@ -100,6 +105,223 @@ public final class StorageOptions {
             }
         }
         return false;
+    }
+
+    /** What {@link #redactCredentials(String)} puts in place of a credential shaped value. */
+    public static final String REDACTED = "***";
+
+    /**
+     * An AWS access key id: the {@code AKIA} (long lived) or {@code ASIA}
+     * (temporary) prefix and 16 upper case alphanumerics, not embedded
+     * in a longer run of the same alphabet. S3 echoes it in the
+     * {@code InvalidAccessKeyId} error body and it also appears in
+     * {@code X-Amz-Credential} of a presigned URL and in the
+     * {@code Credential=} part of a SigV4 {@code Authorization} header.
+     */
+    private static final Pattern ACCESS_KEY_ID = Pattern.compile("(?<![0-9A-Z])(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Z])");
+
+    /**
+     * The {@code <AWSAccessKeyId>} element of an S3 error body (and the
+     * {@code <AccessKeyId>} element STS answers with), whatever its
+     * value; MinIO and other S3 compatible stores echo key ids that
+     * are not in the AWS format.
+     */
+    private static final Pattern XML_ACCESS_KEY_ID = Pattern.compile("(<(?:AWS)?AccessKeyId>)[^<]*(</(?:AWS)?AccessKeyId>)");
+
+    /**
+     * A {@code Bearer} or {@code Basic} authorization value, the shapes
+     * a catalog client puts in an {@code Authorization} header.
+     */
+    private static final Pattern AUTHORIZATION_VALUE = Pattern.compile("(?i)\\b((?:Bearer|Basic)\\s+)[A-Za-z0-9\\-._~+/]+=*");
+
+    /** The {@code sig} parameter of an Azure SAS URL. */
+    private static final Pattern SAS_SIGNATURE = Pattern.compile("([?&]sig=)[^&\\s]+");
+
+    /**
+     * A {@code key=value}, {@code key: value} or {@code "key": "value"}
+     * pair. Group 1 is the key, group 2 the separator, group 3 the
+     * value (quoted or up to the next delimiter). Whether the pair is
+     * redacted is decided per match by {@link #hasSensitiveSegment} on
+     * the key; the value alone says nothing.
+     */
+    private static final Pattern KEY_VALUE = Pattern.compile("([A-Za-z0-9_.\\-]+)(\"?\\s*[=:]\\s*)(\"[^\"]*\"|'[^']*'|[^\\s,;&)}\\]\"']+)");
+
+    /**
+     * Replace the credential shaped parts of {@code message} with
+     * {@link #REDACTED}, for a message that is about to leave the node
+     * in a client response or a log line. Covers the value of any
+     * {@code key=value} / {@code key: value} / {@code "key": "value"}
+     * pair whose key names a credential (see {@link #hasSensitiveSegment}),
+     * an AWS access key id wherever it appears, the
+     * {@code <AWSAccessKeyId>} element of an S3 error body, a
+     * {@code Bearer} or {@code Basic} authorization value, and the
+     * {@code sig} parameter of an Azure SAS URL. Region, endpoint,
+     * bucket and table path are left as they are. Returns
+     * {@code message} itself (not a copy) when nothing matches, so a
+     * caller can compare by identity; {@code null} in gives
+     * {@code null} out.
+     *
+     * <p>The patterns follow what S3, GCS and Azure put in their error
+     * bodies today and what a storage option or catalog config looks
+     * like when a message quotes one. A new shape needs a new pattern;
+     * the exception messages themselves are not changed, only what is
+     * reported, so the unredacted text stays available for debugging
+     * through the exception's own chain.
+     */
+    public static String redactCredentials(String message) {
+        if (message == null || message.isEmpty()) {
+            return message;
+        }
+        String out = message;
+        out = XML_ACCESS_KEY_ID.matcher(out).replaceAll("$1" + REDACTED + "$2");
+        out = ACCESS_KEY_ID.matcher(out).replaceAll(REDACTED);
+        out = AUTHORIZATION_VALUE.matcher(out).replaceAll("$1" + REDACTED);
+        out = SAS_SIGNATURE.matcher(out).replaceAll("$1" + REDACTED);
+        out = redactKeyValuePairs(out);
+        return out.equals(message) ? message : out;
+    }
+
+    private static String redactKeyValuePairs(String text) {
+        Matcher matcher = KEY_VALUE.matcher(text);
+        StringBuilder out = null;
+        int last = 0;
+        while (matcher.find()) {
+            if (!hasSensitiveSegment(matcher.group(1))) {
+                continue;
+            }
+            if (out == null) {
+                out = new StringBuilder(text.length());
+            }
+            String value = matcher.group(3);
+            char quote = value.charAt(0);
+            String replacement = (quote == '"' || quote == '\'') && value.length() >= 2 && value.charAt(value.length() - 1) == quote
+                ? quote + REDACTED + quote
+                : REDACTED;
+            out.append(text, last, matcher.start(3)).append(replacement);
+            last = matcher.end(3);
+        }
+        if (out == null) {
+            return text;
+        }
+        out.append(text, last, text.length());
+        return out.toString();
+    }
+
+    /**
+     * Whether a key quoted in free text names a credential: one of its
+     * segments, split on {@code _}, {@code .}, {@code -} and camel case
+     * humps, is one of {@link #SENSITIVE_KEY_WORDS} or its plural
+     * ({@code aws_access_key_id}, {@code AWS_SECRET_ACCESS_KEY},
+     * {@code header.Authorization}, {@code sessionToken},
+     * {@code x-amz-security-token}, {@code credentials}). Stricter than
+     * {@link #isSensitiveKey}, which matches the words as substrings:
+     * in free text a substring match would take the value after
+     * {@code tokenizer:} or {@code keyword:} for a credential, while a
+     * storage option key is only ever compared whole.
+     */
+    static boolean hasSensitiveSegment(String key) {
+        int start = 0;
+        for (int i = 0; i <= key.length(); i++) {
+            boolean end = i == key.length();
+            char c = end ? 0 : key.charAt(i);
+            boolean delimiter = !end && (c == '_' || c == '.' || c == '-');
+            boolean hump = !end && i > start && Character.isUpperCase(c) && Character.isLowerCase(key.charAt(i - 1));
+            if (!(end || delimiter || hump)) {
+                continue;
+            }
+            if (i > start) {
+                String segment = key.substring(start, i).toLowerCase(Locale.ROOT);
+                for (String word : SENSITIVE_KEY_WORDS) {
+                    if (segment.equals(word) || segment.equals(word + "s")) {
+                        return true;
+                    }
+                }
+            }
+            start = delimiter ? i + 1 : i;
+        }
+        return false;
+    }
+
+    /** Bound on the cause chain walk of {@link #redactCredentials(Exception)}, in case a chain is cyclic. */
+    private static final int MAX_CAUSE_DEPTH = 10;
+
+    /**
+     * The exception to hand to a client response or a log line for
+     * {@code failure}: {@code failure} itself when no message in its
+     * cause chain changes under {@link #redactCredentials(String)},
+     * otherwise a copy whose messages are redacted. The copy keeps
+     * what the REST layer and the log need from the original: the
+     * HTTP status {@code ExceptionsHelper.status} assigns it, the
+     * {@link IllegalArgumentException} class when the original (after
+     * unwrapping a transport wrapper) is one, so a Lance invalid input
+     * stays a 400 of the same type, the stack frames, and one cause per
+     * cause of the original, each naming the original's class in its
+     * redacted message. Everything else becomes an
+     * {@link OpenSearchStatusException} of the same status. The
+     * original is not modified.
+     */
+    public static Exception redactCredentials(Exception failure) {
+        if (failure == null || !needsRedaction(failure)) {
+            return failure;
+        }
+        return redactedCopy(failure);
+    }
+
+    /** {@link #redactCredentials(Exception)} for a {@link RuntimeException}; the copy is always one. */
+    public static RuntimeException redactCredentials(RuntimeException failure) {
+        if (failure == null || !needsRedaction(failure)) {
+            return failure;
+        }
+        return redactedCopy(failure);
+    }
+
+    private static boolean needsRedaction(Throwable failure) {
+        Throwable current = failure;
+        for (int depth = 0; current != null && depth < MAX_CAUSE_DEPTH; depth++) {
+            String message = current.getMessage();
+            if (message != null && redactCredentials(message) != message) {
+                return true;
+            }
+            Throwable cause = current.getCause();
+            current = cause == current ? null : cause;
+        }
+        return false;
+    }
+
+    private static RuntimeException redactedCopy(Exception failure) {
+        RestStatus status = ExceptionsHelper.status(failure);
+        Throwable unwrapped = ExceptionsHelper.unwrapCause(failure);
+        String message = redactCredentials(unwrapped.getMessage() == null ? unwrapped.toString() : unwrapped.getMessage());
+        Throwable cause = unwrapped.getCause() == unwrapped ? null : redactedCause(unwrapped.getCause(), 1);
+        RuntimeException copy = unwrapped instanceof IllegalArgumentException
+            ? new IllegalArgumentException(message, cause)
+            : new OpenSearchStatusException(message, status, cause);
+        copy.setStackTrace(unwrapped.getStackTrace());
+        return copy;
+    }
+
+    private static Throwable redactedCause(Throwable original, int depth) {
+        if (original == null || depth >= MAX_CAUSE_DEPTH) {
+            return null;
+        }
+        Throwable next = original.getCause() == original ? null : original.getCause();
+        return new RedactedCause(original, redactedCause(next, depth + 1));
+    }
+
+    /**
+     * One link of the cause chain of a redacted copy: the original's
+     * class name and redacted message, and the original's frames.
+     */
+    private static final class RedactedCause extends RuntimeException {
+        RedactedCause(Throwable original, Throwable cause) {
+            super(
+                original.getMessage() == null
+                    ? original.getClass().getName()
+                    : original.getClass().getName() + ": " + redactCredentials(original.getMessage()),
+                cause
+            );
+            setStackTrace(original.getStackTrace());
+        }
     }
 
     private static final StorageOptions EMPTY = new StorageOptions(Collections.emptyMap());
