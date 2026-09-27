@@ -9,6 +9,7 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -307,6 +308,50 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
             service.poll();
             assertNull(service.namespaceInfos().get(0).error());
             assertEquals(2, recording.initializeCalls.size());
+        } finally {
+            LanceNamespaceFactory.resetInstantiatorForTests();
+        }
+    }
+
+    /**
+     * An initialise failure whose message quotes the store refusing the
+     * registration's credentials (the S3 body of {@code InvalidAccessKeyId},
+     * which echoes the key id) is listed as such: the status names the
+     * refusal and the S3 code, and carries neither the key id nor the
+     * bearer token of the config.
+     */
+    public void testInitializeFailureFromARefusedCredentialIsListedAsTheStoreRejectingIt() throws Exception {
+        String keyId = "AKIA" + randomAlphaOfLength(16).toUpperCase(Locale.ROOT);
+        RecordingLanceNamespace recording = new RecordingLanceNamespace();
+        recording.initializeFailure = new IllegalStateException(
+            "LanceError(IO): Generic S3 error: Server returned non-2xx status code: 403 Forbidden: <Error><Code>InvalidAccessKeyId</Code>"
+                + "<Message>The AWS Access Key Id you provided does not exist in our records.</Message><AWSAccessKeyId>"
+                + keyId
+                + "</AWSAccessKeyId></Error>, /rust/lance-io/src/object_store.rs:1490:92"
+        );
+        LanceNamespaceFactory.setInstantiatorForTests(type -> recording);
+        try {
+            LanceNamespaceMetadata metadata = LanceNamespaceMetadata.EMPTY.withRegistered(
+                new LanceNamespaceMetadata.Entry(
+                    "cat",
+                    LanceNamespaceMetadata.Entry.TYPE_REST,
+                    null,
+                    StorageOptions.empty(),
+                    Map.of("uri", "http://catalog.example:8080", "header.Authorization", "Bearer hunter2")
+                )
+            );
+            ClusterState state = ClusterState.builder(clusterService.state())
+                .metadata(Metadata.builder(clusterService.state().metadata()).putCustom(LanceNamespaceMetadata.TYPE, metadata))
+                .build();
+            ClusterServiceUtils.setState(clusterService, state);
+            LanceNamespaceService.PollReport report = service.pollNow(null);
+            String error = report.unavailable().get("cat");
+            assertNotNull(report.toString(), error);
+            assertTrue(error, error.startsWith("object store rejected the credentials of [cat]: LanceError(IO)"));
+            assertTrue(error, error.contains("InvalidAccessKeyId"));
+            assertFalse("the status must not carry the key id: " + error, error.contains(keyId));
+            assertFalse("the status must not carry the token: " + error, error.contains("hunter2"));
+            assertEquals(error, service.namespaceInfos().get(0).error());
         } finally {
             LanceNamespaceFactory.resetInstantiatorForTests();
         }

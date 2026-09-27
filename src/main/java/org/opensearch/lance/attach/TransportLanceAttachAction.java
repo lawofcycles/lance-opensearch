@@ -58,6 +58,7 @@ import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.namespace.AllowedTableRoots;
+import org.opensearch.lance.query.LanceInvalidInput;
 import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.tasks.CancellableTask;
 import org.opensearch.tasks.Task;
@@ -187,8 +188,11 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
             // access key id in it. The exception goes to the client as
             // the response and to the REST layer's WARN line, so hand
             // out a copy with the credential shaped values redacted;
-            // the copy keeps the status and the frames.
-            throw StorageOptions.redactCredentials(e);
+            // the copy keeps the status and the frames. A body whose
+            // error code says the store refused the credentials the
+            // request carried is reported as a 400 instead, since the
+            // caller's input is what failed.
+            throw LanceInvalidInput.openFailure(e, request.table());
         }
     }
 

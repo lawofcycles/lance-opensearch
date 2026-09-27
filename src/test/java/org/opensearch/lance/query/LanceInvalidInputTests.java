@@ -229,4 +229,169 @@ public class LanceInvalidInputTests extends OpenSearchTestCase {
         assertEquals("illegal_argument_exception", OpenSearchException.getExceptionName(unwrapped));
         assertEquals(LANCE_MESSAGE, unwrapped.getMessage());
     }
+
+    private static final String TABLE = "s3://redaction-bucket/attach.lance";
+
+    /** The AWS documentation example key id, assembled so the source carries no scanner matching literal. */
+    private static final String KEY_ID = "AKIA" + "IOSFODNN7EXAMPLE";
+
+    /** Lance's message for an S3 request the store answered with {@code code}, the way lance-io quotes the response. */
+    private static String s3Failure(String code) {
+        return "LanceError(IO): Generic S3 error: Error performing list request: Error performing GET "
+            + "https://s3.us-east-1.amazonaws.com/redaction-bucket?list-type=2&prefix=attach.lance%2F_versions%2F in 5.9ms - "
+            + "Server returned non-2xx status code: 403 Forbidden: <?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>"
+            + code
+            + "</Code><Message>The request was refused.</Message><AWSAccessKeyId>"
+            + KEY_ID
+            + "</AWSAccessKeyId><RequestId>7A9E3F0C2B1D4E5F</RequestId><HostId>fixture</HostId></Error>, "
+            + "/rust/lance-io/src/object_store.rs:1490:92";
+    }
+
+    private static String gcsFailure(String reason) {
+        return "LanceError(IO): Generic GCS error: Error performing list request: Error performing GET "
+            + "https://storage.googleapis.com/storage/v1/b/redaction-bucket/o?prefix=attach.lance%2F_versions%2F in 4.1ms - "
+            + "Server returned non-2xx status code: 403 Forbidden: {\"error\": {\"code\": 403, \"message\": \"Caller does not have "
+            + "storage.objects.list access to the Google Cloud Storage bucket.\", \"errors\": [{\"message\": \"Caller does not have "
+            + "storage.objects.list access to the Google Cloud Storage bucket.\", \"domain\": \"global\", \"reason\": \""
+            + reason
+            + "\"}]}}, /rust/lance-io/src/object_store.rs:1490:92";
+    }
+
+    private static String azureFailure(String code) {
+        return "LanceError(IO): Generic MicrosoftAzure error: Error performing list request: Error performing GET "
+            + "https://redaction.blob.core.windows.net/tables?restype=container&comp=list&prefix=attach.lance%2F_versions%2F in 3.2ms - "
+            + "Server returned non-2xx status code: 403 Forbidden: <?xml version=\"1.0\" encoding=\"utf-8\"?><Error><Code>"
+            + code
+            + "</Code><Message>Server failed to authenticate the request. Make sure the value of Authorization header is formed "
+            + "correctly including the signature.\nRequestId:0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0\nTime:2026-09-27T04:00:00.0000000Z"
+            + "</Message></Error>, /rust/lance-io/src/object_store.rs:1490:92";
+    }
+
+    /**
+     * The codes the criterion recognises are the contract with the
+     * documentation and the operators reading a 400; a change to either
+     * list is deliberate and updates this test with it.
+     */
+    public void testCredentialErrorCodesArePinned() {
+        assertArrayEquals(
+            new String[] { "InvalidAccessKeyId", "SignatureDoesNotMatch", "AccessDenied", "ExpiredToken", "InvalidToken" },
+            LanceInvalidInput.S3_CREDENTIAL_ERROR_CODES
+        );
+        assertArrayEquals(
+            new String[] { "authError", "forbidden", "insufficientPermissions" },
+            LanceInvalidInput.GCS_CREDENTIAL_ERROR_REASONS
+        );
+        assertArrayEquals(
+            new String[] { "AuthenticationFailed", "AuthorizationFailure", "AuthorizationPermissionMismatch", "InvalidAuthenticationInfo" },
+            LanceInvalidInput.AZURE_CREDENTIAL_ERROR_CODES
+        );
+    }
+
+    /**
+     * Every listed code, in the body shape of its store and inside the
+     * {@code Error::IO} Lance raises for it, is reported as a 400 whose
+     * message names the subject and keeps the store's code but not the
+     * access key id the S3 body echoes.
+     */
+    public void testOpenFailureMapsEachStoreCodeToBadRequest() {
+        for (String code : LanceInvalidInput.S3_CREDENTIAL_ERROR_CODES) {
+            assertCredentialRejection(code, new IOException(s3Failure(code)));
+        }
+        for (String reason : LanceInvalidInput.GCS_CREDENTIAL_ERROR_REASONS) {
+            assertCredentialRejection(reason, new IOException(gcsFailure(reason)));
+        }
+        for (String code : LanceInvalidInput.AZURE_CREDENTIAL_ERROR_CODES) {
+            assertCredentialRejection(code, new IOException(azureFailure(code)));
+        }
+    }
+
+    private static void assertCredentialRejection(String code, Exception failure) {
+        assertEquals(code, LanceInvalidInput.credentialErrorCode(failure));
+        Exception reported = LanceInvalidInput.openFailure(failure, TABLE);
+        assertTrue(code + ": " + reported, reported instanceof IllegalArgumentException);
+        assertEquals(code, RestStatus.BAD_REQUEST, ExceptionsHelper.status(reported));
+        String message = reported.getMessage();
+        assertTrue(code + ": " + message, message.startsWith(LanceInvalidInput.CREDENTIALS_REJECTED_PREFIX + TABLE + "]: LanceError(IO)"));
+        assertTrue(code + ": " + message, message.contains(code));
+        assertFalse(code + ": the key id must not be reported: " + message, message.contains(KEY_ID));
+        // The cause keeps the store's message for the log, redacted the same way.
+        Throwable cause = reported.getCause();
+        assertNotNull(code + ": the cause is kept", cause);
+        assertTrue(code + ": " + cause.getMessage(), cause.getMessage().contains(code));
+        assertFalse(code + ": the cause must not carry the key id: " + cause.getMessage(), cause.getMessage().contains(KEY_ID));
+        // The original is left as it was.
+        assertTrue(failure.getMessage().contains(code));
+    }
+
+    /**
+     * The code is looked for down the cause chain: a namespace
+     * initialise runs inside {@code doPrivileged}, which hands the
+     * store's failure back wrapped. The message reported is the one of
+     * the exception that quotes the code, not the wrapper's.
+     */
+    public void testCredentialErrorCodeIsFoundBehindAWrapper() {
+        IOException store = new IOException(s3Failure("SignatureDoesNotMatch"));
+        Exception wrapped = new RuntimeException("namespace initialise failed", new IllegalStateException("privileged call failed", store));
+        assertEquals("SignatureDoesNotMatch", LanceInvalidInput.credentialErrorCode(wrapped));
+        Exception reported = LanceInvalidInput.openFailure(wrapped, "cat");
+        assertEquals(RestStatus.BAD_REQUEST, ExceptionsHelper.status(reported));
+        assertTrue(
+            reported.getMessage(),
+            reported.getMessage().startsWith(LanceInvalidInput.CREDENTIALS_REJECTED_PREFIX + "cat]: LanceError(IO)")
+        );
+        assertNull(LanceInvalidInput.credentialErrorCode(null));
+    }
+
+    /**
+     * A failure that is not the store refusing the credentials keeps
+     * its status: another S3 error code, the code's word outside the
+     * body's element, a local filesystem refusal, a plain runtime
+     * failure. The redaction of the message still applies.
+     */
+    public void testOpenFailureLeavesOtherFailuresAtTheirStatus() {
+        IOException noSuchBucket = new IOException(s3Failure("NoSuchBucket"));
+        assertNull(LanceInvalidInput.credentialErrorCode(noSuchBucket));
+        Exception reportedBucket = LanceInvalidInput.openFailure(noSuchBucket, TABLE);
+        assertEquals(RestStatus.INTERNAL_SERVER_ERROR, ExceptionsHelper.status(reportedBucket));
+        assertFalse(reportedBucket.getMessage(), reportedBucket.getMessage().contains(KEY_ID));
+        assertTrue(reportedBucket.getMessage(), reportedBucket.getMessage().contains("NoSuchBucket"));
+
+        IOException wordOnly = new IOException("LanceError(IO): AccessDenied while reading /tables/attach.lance");
+        assertNull(LanceInvalidInput.credentialErrorCode(wordOnly));
+        assertSame(wordOnly, LanceInvalidInput.openFailure(wordOnly, TABLE));
+
+        RuntimeException local = new RuntimeException("LanceError(IO): Permission denied (os error 13)");
+        assertNull(LanceInvalidInput.credentialErrorCode(local));
+        assertSame(local, LanceInvalidInput.openFailure(local, TABLE));
+        assertEquals(RestStatus.INTERNAL_SERVER_ERROR, ExceptionsHelper.status(local));
+
+        RuntimeException a = new RuntimeException("a");
+        RuntimeException b = new RuntimeException("b", a);
+        a.initCause(b);
+        assertNull(LanceInvalidInput.credentialErrorCode(a));
+
+        expectThrows(NullPointerException.class, () -> LanceInvalidInput.openFailure(null, TABLE));
+    }
+
+    /**
+     * The attach action runs on the cluster manager, so on a multi node
+     * cluster the rejection crosses the wire before the REST layer
+     * reads its status.
+     */
+    public void testCredentialRejectionSurvivesTheWire() throws IOException {
+        Exception reported = LanceInvalidInput.openFailure(new IOException(s3Failure("InvalidAccessKeyId")), TABLE);
+        Exception transported;
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            out.writeException(reported);
+            try (StreamInput in = out.bytes().streamInput()) {
+                transported = in.readException();
+            }
+        }
+        RemoteTransportException remote = new RemoteTransportException("lance attach", transported);
+        assertEquals(RestStatus.BAD_REQUEST, ExceptionsHelper.status(remote));
+        Throwable unwrapped = ExceptionsHelper.unwrapCause(remote);
+        assertEquals("illegal_argument_exception", OpenSearchException.getExceptionName(unwrapped));
+        assertEquals(reported.getMessage(), unwrapped.getMessage());
+        assertFalse(ExceptionsHelper.stackTrace(unwrapped), ExceptionsHelper.stackTrace(unwrapped).contains(KEY_ID));
+    }
 }
