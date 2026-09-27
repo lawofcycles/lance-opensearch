@@ -64,9 +64,9 @@ The manager's in memory served version table, and the adoption scan that rebuilt
 restart or a failover, are gone; the index settings and the shard's reader carry everything the
 check needs.
 
-Two manual triggers remove the wait on the cadence. `POST /_lance/namespace/_poll` runs one
+Two manual triggers remove the wait on the cadence. `POST /_plugins/_lance/namespace/_poll` runs one
 catalog listing cycle on the manager and answers what it surfaced and what it skipped with the
-reason. `POST /{index}/_lance/sync` runs the freshness check of one index on the node holding its
+reason. `POST /_plugins/_lance/sync/{index}` runs the freshness check of one index on the node holding its
 shard and answers whether the version moved, the served and the target version, and whether the
 mapping changed.
 

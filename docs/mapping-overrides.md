@@ -19,7 +19,7 @@ The attach body and the namespace register body take two optional clauses next t
 The attach body accepts an `overrides` clause with per-column mapping rules. Seven kinds are supported: a `date` type override, a `keyword` type override, an `ip` type override, a `wildcard` type override, a `geo_point` type override, a `text_analyzer` type override, and keyword sub-fields (`fields`). `type` and `fields` may appear together on one column:
 
 ```json
-POST /_lance/attach
+POST /_plugins/_lance/attach
 {
   "table": "s3://bucket/tables/demo.lance",
   "overrides": {
@@ -83,7 +83,7 @@ POST /_lance/attach
 `type: text_analyzer` on a Utf8 column selects the OpenSearch analyzer mode (the RFC's second text mode): the attach adds a derived tokens column to the Lance table, backfills it with the column's values run through the declared `analyzer`, builds an inverted index over it, and every full text query on the base field analyzes its text the same way and runs against the derived column. The stemming, stop words and language handling of the OpenSearch analyzer then apply to a Lance-backed column:
 
 ```json
-POST /_lance/attach
+POST /_plugins/_lance/attach
 {
   "table": "s3://bucket/tables/articles.lance",
   "overrides": { "body": { "type": "text_analyzer", "analyzer": "english" } }
@@ -110,7 +110,7 @@ How queries run:
 - `match_phrase` keeps phrase order over the analyzed tokens (the derived column's index stores positions).
 - `wildcard`, `regexp` and `prefix` keep running over the raw stored string of the base column.
 - `lance_multi_match` combines analyzer-mode fields only when they share one analyzer, and refuses a mix of analyzer-mode and native-tokenizer fields. Fields on Lance's native tokenizer and analyzer-mode fields cannot combine in one `multi_match` / `lance_multi_match`.
-- `GET /<index>/_lance/explain` shows which column a pushed full text scan reads (`columns=[body__lance_tokens]` once the field is in the analyzer mode).
+- `GET /_plugins/_lance/explain/<index>` shows which column a pushed full text scan reads (`columns=[body__lance_tokens]` once the field is in the analyzer mode).
 
 How the backfill runs:
 
@@ -128,7 +128,7 @@ How the mapping flips:
 
 - The backfill is two Lance commits, the derived column and then its inverted index, and the mapping flips at the second one. A derived column without its index is left out of the mapping (the field keeps its interim mapping and a note in the derivation says why), so no query runs a full text scan over the derived column while the index is still being built.
 - The flip works whether or not the column already carries a Lance inverted index: from the interim `keyword` mapping of a column without one, the check recreates the index through the established type-change rebuild (the Lance data is untouched); from the interim `lance_text` mapping of a column that has one, the check updates the field in place, adding `tokens_column` and `meta.lance_analyzer`.
-- A mapping update the cluster manager refuses leaves the index on its interim mapping. The refusal is reported per index under `freshness.mapping_errors` in `GET /_lance/stats` and as `mapping_error` in the answer of `POST /{index}/_lance/sync`, so an operator who sees no `tokens_column` after the backfill should look there.
+- A mapping update the cluster manager refuses leaves the index on its interim mapping. The refusal is reported per index under `freshness.mapping_errors` in `GET /_plugins/_lance/stats` and as `mapping_error` in the answer of `POST /_plugins/_lance/sync/{index}`, so an operator who sees no `tokens_column` after the backfill should look there.
 
 ### `fields`
 
@@ -159,7 +159,7 @@ Validation answers 400 naming the column and the reason:
 
 ### Persistence
 
-- `POST /_lance/namespace` accepts the same `overrides` object and applies it to every table it surfaces under the root. A column a table lacks is skipped for that table (logged at debug) while the full list is persisted, so the override applies once a later manifest adds the column.
+- `POST /_plugins/_lance/namespace` accepts the same `overrides` object and applies it to every table it surfaces under the root. A column a table lacks is skipped for that table (logged at debug) while the full list is persisted, so the override applies once a later manifest adds the column.
 - Overrides are persisted as canonical JSON in the `index.lance.overrides` index setting. The freshness check's re-derivation reads the setting back and re-applies it on every manifest version advance, so overrides survive schema changes; an override whose column disappears is kept in the setting and skipped until the column returns.
 - Indexes created before this setting existed keep resolving their sub-fields from the legacy `index.lance.multi_fields` setting.
 - The setting is dynamic because the check itself rewrites it when the table renames an overridden column (the override follows the column, see [Schema drift](features.md#schema-drift)) or resets one to a type the override no longer fits. An operator can also edit it with `PUT /{index}/_settings`, but a manual edit only takes effect at the next mapping re-derivation and reader reopen, so re-attaching is the predictable way to change overrides by hand.
@@ -169,7 +169,7 @@ Validation answers 400 naming the column and the reason:
 The attach body and the namespace register body accept an `indexes` clause next to `overrides`, selecting the Lance index type the build creates per column. Without it a scalar column gets a BTree index and a vector column an IVF_PQ index:
 
 ```json
-POST /_lance/attach
+POST /_plugins/_lance/attach
 {
   "table": "s3://bucket/tables/demo.lance",
   "indexes": {
@@ -213,5 +213,5 @@ Vector defaults and minimums:
 Where the preference lives:
 
 - The preference persists inside the `index.lance.overrides` setting (under a top-level `indexes` key), so the re-derivation on manifest version advance carries it like the mapping overrides, and the namespace register applies it leniently per table (a table without the column skips it).
-- `POST /_lance/build_indexes/{index}` accepts the same `indexes` object in its body as a one-shot override of the persisted preference for that build only; nothing is persisted. `optimize: true` merges whatever index exists regardless of its type.
-- `GET /_lance/stats` reports, per index, the Lance index types present per column under `indices.<index>.index_types` (`{"rating": ["ZoneMap"], "embedding": ["IVF_FLAT"]}`, read from `describeIndices` once per stats call), so an operator can verify the preference took effect. When the index has a reader wrapper installed (a security plugin's DLS/FLS wrapper), `index_types`, `renamed_fields`, `rows`, `shard_reader_rows` and `nested_docs` are omitted and the entry carries `lucene_bound_exceeded` alone: Lance's index metadata, the mapping's rename entries and the row counts do not pass through the wrapper, and the report must not reveal column names or rows the wrapper hides.
+- `POST /_plugins/_lance/build_indexes/{index}` accepts the same `indexes` object in its body as a one-shot override of the persisted preference for that build only; nothing is persisted. `optimize: true` merges whatever index exists regardless of its type.
+- `GET /_plugins/_lance/stats` reports, per index, the Lance index types present per column under `indices.<index>.index_types` (`{"rating": ["ZoneMap"], "embedding": ["IVF_FLAT"]}`, read from `describeIndices` once per stats call), so an operator can verify the preference took effect. When the index has a reader wrapper installed (a security plugin's DLS/FLS wrapper), `index_types`, `renamed_fields`, `rows`, `shard_reader_rows` and `nested_docs` are omitted and the entry carries `lucene_bound_exceeded` alone: Lance's index metadata, the mapping's rename entries and the row counts do not pass through the wrapper, and the report must not reveal column names or rows the wrapper hides.

@@ -8,7 +8,7 @@ OpenSearch plugin that surfaces [Lance](https://github.com/lancedb/lance) tables
 
 Lance is an open columnar table format with multimodal columns, concurrent writers, manifest versioned snapshots, and its own full text and vector indexes. One copy of a Lance table can serve vector search, full text search and analytical aggregation at once.
 
-This plugin makes such a table addressable through OpenSearch's APIs. An operator attaches one table (`POST /_lance/attach`) or a catalog of tables (`POST /_lance/namespace`); the plugin derives a mapping from the table's Arrow schema and creates a read only index. `_search`, `_count` and `GET /<index>/_doc/<id>` then read the Lance table directly; nothing is ingested and nothing is copied.
+This plugin makes such a table addressable through OpenSearch's APIs. An operator attaches one table (`POST /_plugins/_lance/attach`) or a catalog of tables (`POST /_plugins/_lance/namespace`); the plugin derives a mapping from the table's Arrow schema and creates a read only index. `_search`, `_count` and `GET /<index>/_doc/<id>` then read the Lance table directly; nothing is ingested and nothing is copied.
 
 Every request fans the table's fragments out over the data nodes. A cost based planner decides per request what Lance runs natively (filters, full text, nearest neighbour, Substrait aggregations) and what OpenSearch's stock collectors and aggregators run. New table versions need no reindex. The design is discussed in [RFC #22643](https://github.com/opensearch-project/OpenSearch/issues/22643).
 
@@ -35,7 +35,7 @@ Add the two JVM options Arrow needs to `config/jvm.options` (or set them via `OP
 Attach a Lance table and search it ([docs/getting-started.md](docs/getting-started.md#2a-docker-single-node) does the same in Docker and prepares a sample table):
 
 ```
-curl -X POST http://localhost:9200/_lance/attach -H 'Content-Type: application/json' \
+curl -X POST http://localhost:9200/_plugins/_lance/attach -H 'Content-Type: application/json' \
   -d '{"table":"/tables/demo.lance"}'
 curl -s -X POST 'http://localhost:9200/demo/_search?size=3' -H 'Content-Type: application/json' \
   -d '{"query":{"match":{"body":"hello"}}}'

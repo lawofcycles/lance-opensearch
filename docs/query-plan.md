@@ -1,7 +1,7 @@
 # Query plan
 
 This page is the reference for the plan the plugin builds for a search body: how the coordinator
-plans it, how a data node refines what it receives, how to read the `_lance/explain` answer, how
+plans it, how a data node refines what it receives, how to read the `_plugins/_lance/explain` answer, how
 the cost the planner compares is computed, what the two traits mean, and the wire format the plan
 travels in. [architecture.md](architecture.md#planner-design) explains why the planner exists and
 how it is put together; [features.md](features.md#query-plan-preview) lists the endpoint next to
@@ -27,7 +27,7 @@ the Lucene alternative for the same tree; the planner keeps the candidate with t
 that declares the traits the request demands. The winning per node subtree is written down as a
 `FragmentPlan` and shipped with every per node request. The data nodes run no planner: each
 applies four node local guards (`FragmentPlanRefiner`) that can move a pushed operation back to
-Lucene, then executes. `GET /<index>/_lance/explain` runs exactly the coordinator's planning
+Lucene, then executes. `GET /_plugins/_lance/explain/<index>` runs exactly the coordinator's planning
 entry with the same inputs and renders what it produced, without executing anything.
 
 Two vocabularies appear throughout. The Calcite one: a logical tree (what the translator built),
@@ -35,12 +35,12 @@ a physical tree (what the planner chose), operators, traits and costs. The plugi
 route (the coordinator fans the request out to the data nodes) and the unsupported route (no
 plan answers the body, which holds `suggest` or `highlight`; a search refuses it), the pushed scan, the
 Lucene operators, the refinements, the fragment pruning and the three stats counters
-`plan.refinements`, `plan.executed` and `plan.pruned` under `GET /_lance/stats`.
+`plan.refinements`, `plan.executed` and `plan.pruned` under `GET /_plugins/_lance/stats`.
 
 ## The explain endpoint
 
 ```
-GET /<index>/_lance/explain
+GET /_plugins/_lance/explain/<index>
 { ...a search body... }
 ```
 
@@ -157,7 +157,7 @@ pruning proved empty of rows matching the query predicate (see
 request. It is absent when nothing was pruned: no scalar predicate, no zone map on a predicate
 column, or every fragment may hold a match.
 Compare it with the node's `lance.plan:` line or with `plan.refinements`, `plan.executed` and
-`plan.pruned` in `GET /_lance/stats` to see whether a data node executed the shipped plan,
+`plan.pruned` in `GET /_plugins/_lance/stats` to see whether a data node executed the shipped plan,
 downgraded it, and how many fragments it skipped. The field is absent when the plan failed
 (below).
 
@@ -263,7 +263,7 @@ carries the whole charge.
 The quantities come from the tree and from the table statistics the planner collects once per
 manifest version from Lance metadata (rows, deleted rows, the bitmap distinct count of a terms
 key, the value range of a BTree over an integer column, the Arrow type widths of the columns read;
-`GET /_lance/stats` reports the cache under `plan.statistics`). The group count of a tree is the
+`GET /_plugins/_lance/stats` reports the cache under `plan.statistics`). The group count of a tree is the
 product of its levels' domains capped at the row count: a `terms` key's domain is the tightest
 bound its column's indexes give, the distinct count of a bitmap index or, for an integer column
 with a BTree, the number of integers between the index's smallest and largest value (five for a
@@ -338,7 +338,7 @@ of its distinct count, its column at 16 bytes per row instead of 2, and both sid
 table term above a million groups, which prices the pushed scan below the aggregators
 (`terms(category)` on four nodes at 1B rows explains as `LanceTableScan` at 5000 ms and
 `LuceneAggregateExec` at 24000 ms in that window, against 780 ms and 350 ms once the statistics are
-in). `plan.statistics.planned_without` in `GET /_lance/stats` counts these requests; a cost printed
+in). `plan.statistics.planned_without` in `GET /_plugins/_lance/stats` counts these requests; a cost printed
 while it is rising is the window's figure, not the table's.
 
 ## Refinements
@@ -372,7 +372,7 @@ the previous guards left it.
    run with `lance.aggregation.pushdown: false`), the node answers later pushed eligible
    aggregations over the same table from the store instead of scanning the object store again.
 
-Each guard that fires increments its counter under `plan.refinements` in `GET /_lance/stats`, and
+Each guard that fires increments its counter under `plan.refinements` in `GET /_plugins/_lance/stats`, and
 `plan.executed` next to it counts, per node, the requests the Lance scan answered (`pushed_scan`:
 an ordered, limited page or a Substrait aggregate) and the ones Lucene's collector and aggregators
 answered (`lucene`, which includes a pushed page cut in the scan's own order and every full text
@@ -429,7 +429,7 @@ read and prunes nothing.
 
 Each data node's executor removes the excluded fragments from the list the coordinator sent it
 before it opens the fragment reader and issues any Lance scan, and counts the fragments it
-skipped under `plan.pruned.fragments` in `GET /_lance/stats`. A node whose every fragment is
+skipped under `plan.pruned.fragments` in `GET /_plugins/_lance/stats`. A node whose every fragment is
 excluded still answers the request, over a reader with no leaves, so the aggregations block and
 the count the coordinator merges have the shape an empty table produces. The Lance side counts
 (`hits.total` of a scalar filter or a full text prefilter) read the same reduced list.

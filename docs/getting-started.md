@@ -213,7 +213,7 @@ There is no directory to mount into the container and nothing for the namespace 
 Register the directory once per namespace path. The plugin polls the directory every ten seconds (configurable via `lance.namespace.poll_cadence`) and auto-surfaces every `*.lance` directory found underneath as an OpenSearch index.
 
 ```
-curl -X POST http://localhost:9200/_lance/namespace \
+curl -X POST http://localhost:9200/_plugins/_lance/namespace \
   -H 'Content-Type: application/json' \
   -d '{"path":"/tables"}'
 ```
@@ -221,7 +221,7 @@ curl -X POST http://localhost:9200/_lance/namespace \
 List registered namespaces:
 
 ```
-curl -s http://localhost:9200/_lance/namespace
+curl -s http://localhost:9200/_plugins/_lance/namespace
 ```
 
 Wait for the poll cycle to fire (up to ten seconds), then confirm the index appeared:
@@ -235,19 +235,21 @@ The index is named after the `*.lance` directory (in this walkthrough `demo` for
 If you would rather bypass the namespace poll (for a table not under a registered path, or to override the derived index name), attach a single table by URI:
 
 ```
-curl -X POST http://localhost:9200/_lance/attach \
+curl -X POST http://localhost:9200/_plugins/_lance/attach \
   -H 'Content-Type: application/json' \
   -d '{"table":"/tables/demo.lance"}'
 ```
 
 The call is idempotent; a second attach on the same table returns `already_attached: true`.
 
+Every endpoint of the plugin lives under `/_plugins/_lance/`. In 0.1.0 the previous paths (`/_lance/attach`, `/_lance/namespace`, `/_lance/build_indexes/{index}`, `/_lance/refs/{index}`, `/_lance/stats`, `/_lance/stats/{node_id}`, `/{index}/_lance/explain`, `/{index}/_lance/sync`) still answer, with a deprecation `Warning` header on the response and a line in the node's deprecation log naming the new path. They are removed in the next minor release.
+
 ### Point at S3, GCS, or Azure with storage_options
 
 For tables that live in an object store, add a `storage_options` map on either the attach body or the namespace body. If you created the sample table on S3 with Option C in step 3, this is the path that attaches it: put the script's `s3://` URI in `table` and pass the same credential keys you gave the script. Keys follow Lance's Rust `object_store` names, so what you write is exactly what Lance receives.
 
 ```
-curl -X POST http://localhost:9200/_lance/attach \
+curl -X POST http://localhost:9200/_plugins/_lance/attach \
   -H 'Content-Type: application/json' \
   -d '{
         "table": "s3://my-bucket/tables/demo.lance",
@@ -259,7 +261,7 @@ curl -X POST http://localhost:9200/_lance/attach \
       }'
 ```
 
-The same shape works on `POST /_lance/namespace`; every table auto-surfaced under that namespace inherits the map. Common keys:
+The same shape works on `POST /_plugins/_lance/namespace`; every table auto-surfaced under that namespace inherits the map. Common keys:
 
 | Provider | Keys |
 |---|---|
@@ -278,7 +280,7 @@ Each command below assumes the index name `demo` from step 4.
 Start with the stock OpenSearch syntax (`match`, `match_phrase`, `multi_match`, and `bool` around them). Full text queries come in two forms that answer the same, and each subsection below shows the stock form first and the explicit form under it.
 
 - Stock form: on a `lance_text` field the coordinator rewrites each stock clause into the plugin's `lance_*` clause with the same parameters before it plans the request, so the hits and the BM25 scores come from the Lance inverted index, `operator`, `fuzziness`, phrase order, `slop` and field boosts reach Lance, and a `bool` of several clauses with scalar `filter` / `must_not` companions runs as one Lance scan with the filter as a prefilter. [limitations.md](limitations.md#fts-query-behaviour-on-stock-match--match_phrase--multi_match) has the short list of what the stock form drops.
-- Explicit form (`lance_match`, `lance_match_phrase`, `lance_multi_match`, `lance_fts_bool`, `lance_fts_boost`): the explicit spelling of the same Lance queries. It is what the rewrite produces, what `GET /<index>/_lance/explain` prints under `lance_clause`, and the form to write when a parameter has no stock counterpart (`lance_fts_boost`'s negative clause).
+- Explicit form (`lance_match`, `lance_match_phrase`, `lance_multi_match`, `lance_fts_bool`, `lance_fts_boost`): the explicit spelling of the same Lance queries. It is what the rewrite produces, what `GET /_plugins/_lance/explain/<index>` prints under `lance_clause`, and the form to write when a parameter has no stock counterpart (`lance_fts_boost`'s negative clause).
 
 ### Full-text search (match)
 
@@ -324,7 +326,7 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
 
 Expected `hits.total.value`: 8. Word order is enforced: `{"match_phrase":{"body":"lance hello"}}` returns 0. Non zero `slop` lets tokens sit further apart: `{"match_phrase":{"body":{"query":"quick fox","slop":1}}}` matches every `quick brown fox <i>` because `brown` sits one position between `quick` and `fox`.
 
-A phrase needs an inverted index that stores token positions (the `with_position=True` argument in the step 3 scripts; `"with_position": true` on `POST /_lance/build_indexes/{index}` when the plugin builds the index). On an index built without positions Lance answers 400 with `position is not found but required for phrase queries`.
+A phrase needs an inverted index that stores token positions (the `with_position=True` argument in the step 3 scripts; `"with_position": true` on `POST /_plugins/_lance/build_indexes/{index}` when the plugin builds the index). On an index built without positions Lance answers 400 with `position is not found but required for phrase queries`.
 
 #### Explicit form: lance_match_phrase
 
@@ -539,14 +541,14 @@ For OpenSearch's dedicated `hybrid` query (per-sub-query top-K with a score-norm
 
 ### Where a request runs: the explain endpoint
 
-Send the search body to `GET /{index}/_lance/explain` to see what the coordinator would execute for it, without running the search. The explain endpoint runs the same planning entry a `_search` runs and prints the result, so what it shows is what a search with the same body executes. [query-plan.md](query-plan.md) is the reference for every field, the operators, the cost model, the refinements and the traits; this section shows the two answers the examples above produce.
+Send the search body to `GET /_plugins/_lance/explain/{index}` to see what the coordinator would execute for it, without running the search. The explain endpoint runs the same planning entry a `_search` runs and prints the result, so what it shows is what a search with the same body executes. [query-plan.md](query-plan.md) is the reference for every field, the operators, the cost model, the refinements and the traits; this section shows the two answers the examples above produce.
 
 The plugin plans every `_search` once, on the coordinating node, through a Calcite planner: the body is translated to a logical tree over the table, the planner picks the cheapest physical form that declares the traits the request demands, and the per node part of that form ships to the data nodes with each fragment request.
 
 The `bool` from "Composition with bool" is a shape the translator spells. The stock `match` was rewritten to `lance_match` before planning (the `logical` text and `lance_clause` show the rewritten clause), the `range` becomes the Lance SQL `rating >= 3` and rides on the pushed full text operation as its prefilter, the page is pushed too (`PUSHED_SCAN`), and nothing is `unplanned`. The physical lines carry three terms per operator (`accuracy`, `tie_stability`, `cost`), cut here for width:
 
 ```
-curl -s -X GET 'http://localhost:9200/demo/_lance/explain?pretty' \
+curl -s -X GET 'http://localhost:9200/_plugins/_lance/explain/demo?pretty' \
   -H 'Content-Type: application/json' \
   -d '{"size":3,"query":{"bool":{"must":[{"match":{"body":"hello"}}],"filter":[{"range":{"rating":{"gte":3}}}]}}}'
 ```
@@ -578,7 +580,7 @@ curl -s -X GET 'http://localhost:9200/demo/_lance/explain?pretty' \
 A shape the planner leaves to Lucene carries no query part: the executors run Lucene's collector over the query the field type built (`LUCENE_TOPK`) and `unplanned` names the element that kept the request on the Lucene side. Here the `match` sits in `should` next to a `filter` without a `must`, so it is optional in Lucene and the filter alone selects the rows, which Lance's boolean cannot express:
 
 ```
-curl -s -X GET 'http://localhost:9200/demo/_lance/explain?pretty' \
+curl -s -X GET 'http://localhost:9200/_plugins/_lance/explain/demo?pretty' \
   -H 'Content-Type: application/json' \
   -d '{"size":3,"query":{"bool":{"should":[{"match":{"body":"hello"}}],"filter":[{"range":{"rating":{"gte":3}}}]}}}'
 ```
@@ -611,7 +613,7 @@ How to read the fields:
   - Below a million rows the milliseconds are placeholders (a bare scan charges one per row, which is where the `16` above comes from); at a million rows and above an aggregation is priced by the fitted model described in [query-plan.md](query-plan.md#cost).
 - `fragment_plan` is what every data node receives: `kind` (`PUSHED_SCAN`, `LUCENE_TOPK`, `LUCENE_COUNT`, `LUCENE_AGGREGATE`), the `filter_sql` of the scalar predicate when there is one, the `lance_clause` the executor builds its Lance query from, and the pushed `top_k` page or `aggregate`.
 - `unplanned` is present only when some element kept the request, or the whole query, on the Lucene side, and names it (`query type [match]` for a `match` on a field that is not `lance_text`, `full text clause in [should] next to [filter] without a [must] clause`, `sort type [_geo_distance]`, `aggregation type [multi_terms]`, `size [5] (only 0 with aggregations)`, `pipeline aggregation`). It is absent when the planner's cost model chose the Lucene operator for a tree that did translate; the physical plan shows that choice.
-- `refinements_possible` lists the downgrades a data node could still apply to the shipped plan for what only it knows (`security_wrapper` when a DLS / FLS reader wrapper is installed, `sort_field_type` for a page sorted by an `ip` column). `GET /_lance/stats` counts what the nodes did under `plan.refinements` and `plan.executed`, see step 6.
+- `refinements_possible` lists the downgrades a data node could still apply to the shipped plan for what only it knows (`security_wrapper` when a DLS / FLS reader wrapper is installed, `sort_field_type` for a page sorted by an `ip` column). `GET /_plugins/_lance/stats` counts what the nodes did under `plan.refinements` and `plan.executed`, see step 6.
 - `traits` is what the body demanded of the plan (`requested`) against what the chosen plan declares (`declared`). `enforcer` says whether the planner had to replace the cheapest plan with one meeting the demand.
   - `requested`: an explicit `track_total_hits` demands `EXACT` accuracy, a `search_after` cursor demands a reproducible tie order; `APPROXIMATE` and `NONE` mean no demand.
   - `declared`: the bare scan above returns rows in Lance row address order (`STABLE_ROWADDR`); a page cut in score order out of a full text or knn scan is `UNSTABLE`, which is why `search_after` over a `lance_match` page sorted by `_score` alone is refused.
@@ -622,7 +624,7 @@ The plan text format will change as the planner grows; read it, do not parse it.
 
 If you rewrite the table externally (Python `dataset.append`, `dataset.update`, `merge_insert`, or a Ray / Spark writer), the freshness check on the node holding the index's shard picks up the new manifest version within one cadence period and swaps the shard's reader. Queries reflect the new data after the next check fires. No `_refresh`, `_close`, or shard reallocation is needed.
 
-Force a faster check by lowering `lance.namespace.poll_cadence` (node-level setting, minimum 1s; it is the cadence of both the catalog listing on the cluster manager and the freshness check on the shard's node) in `opensearch.yml`, or run the check now with `POST /demo/_lance/sync`:
+Force a faster check by lowering `lance.namespace.poll_cadence` (node-level setting, minimum 1s; it is the cadence of both the catalog listing on the cluster manager and the freshness check on the shard's node) in `opensearch.yml`, or run the check now with `POST /_plugins/_lance/sync/demo`:
 
 ```
 lance.namespace.poll_cadence: 1s
@@ -632,10 +634,10 @@ lance.namespace.poll_cadence: 1s
 
 Indexes on the Lance table (FTS, scalar, vector) are treated as an external concern. The recommended flow is to build them from the same writer that produced the table, using `dataset.create_index` in Python, the Lance Java SDK, or a Ray / Spark job. The plugin never creates or optimises indexes on its own poll cycle; that principle is what keeps the plugin from writing new versions to the user's Lance table behind their back.
 
-For operators who want to trigger a build from the cluster, `POST /_lance/build_indexes/{index}` is the auxiliary path. It supports two modes.
+For operators who want to trigger a build from the cluster, `POST /_plugins/_lance/build_indexes/{index}` is the auxiliary path. It supports two modes.
 
 ```
-POST /demo/_lance/build_indexes
+POST /_plugins/_lance/build_indexes/demo
 {
   "columns": ["body"]
 }
@@ -644,7 +646,7 @@ POST /demo/_lance/build_indexes
 Runs FTS, scalar, or vector index builds for the requested columns.
 
 ```
-POST /demo/_lance/build_indexes
+POST /_plugins/_lance/build_indexes/demo
 {
   "optimize": true
 }
@@ -654,7 +656,7 @@ Runs `Dataset.optimizeIndices` so every existing index folds in fragments that a
 
 ### Append visibility
 
-When Lance advances to a new version, the plugin exposes it as soon as the next freshness check observes the change. The appended fragments do not have to be covered by every existing index first. Whenever uncovered fragments accumulate to the point that flat-scan latency becomes noticeable, call `POST /_lance/build_indexes/{index}` with `{"optimize": true}` to fold them into the existing indexes.
+When Lance advances to a new version, the plugin exposes it as soon as the next freshness check observes the change. The appended fragments do not have to be covered by every existing index first. Whenever uncovered fragments accumulate to the point that flat-scan latency becomes noticeable, call `POST /_plugins/_lance/build_indexes/{index}` with `{"optimize": true}` to fold them into the existing indexes.
 
 Lance's own scanner produces a mixed execution plan for FTS and knn: covered fragments use the existing index, uncovered fragments run a flat scan, and the results are unioned by the query engine, so an incremental append never slows down queries hitting the previously-covered fragments.
 
@@ -677,7 +679,7 @@ There are two operational answers. Neither needs a plugin setting, and the plugi
 **Copy the table to every data node.** Run `aws s3 sync s3://<bucket>/tables/t.lance /nvme/tables/t.lance` on every data node and attach the local path:
 
 ```
-curl -X POST http://localhost:9200/_lance/attach \
+curl -X POST http://localhost:9200/_plugins/_lance/attach \
   -H 'Content-Type: application/json' \
   -d '{"table":"/nvme/tables/t.lance"}'
 ```
@@ -695,7 +697,7 @@ Keep every data node at the same versions at the same path, and keep the window 
 
 ```
 mount-s3 <bucket> /mnt/tables --cache /nvme/mp-cache --max-cache-size <MiB> --metadata-ttl minimal
-curl -X POST http://localhost:9200/_lance/attach \
+curl -X POST http://localhost:9200/_plugins/_lance/attach \
   -H 'Content-Type: application/json' \
   -d '{"table":"/mnt/tables/tables/t.lance"}'
 ```
@@ -730,7 +732,7 @@ The index cache does not receive its whole 6/7 share, and the log line says why.
 - The shard count is `min(cpus / 2, capacity / 4 GiB)` rounded down to a power of two (at least 1, at most 1024), so the share per shard is not monotonic in the capacity: on 16 CPUs a 19 GiB cache is 4 shards of 4.75 GiB, 16 GiB minus one byte is 2 shards of 8 GiB, and 32 GiB is 8 shards of 4 GiB.
 - An inverted index is kept as one entry per full-text column (about 52 bytes per row, 4.8 GiB at 100M rows), so a cache whose share is below that reloads the index from storage on every full-text query.
 - The candidates the plugin compares are the budget itself and each `k * 4 GiB - 1` for `k = 2, 4, 8, ...`.
-- `GET /_lance/stats` reports the chosen capacity, shard count and share under `native_memory`, and `POST /_lance/attach` logs a warning when a table's estimated inverted index entry is heavier than the share.
+- `GET /_plugins/_lance/stats` reports the chosen capacity, shard count and share under `native_memory`, and `POST /_plugins/_lance/attach` logs a warning when a table's estimated inverted index entry is heavier than the share.
 - To raise the share, raise `lance.native_memory.limit` or lower `lance.cache.column_share`; with the choice above a larger budget never yields a smaller share.
 
 ### Circuit breaker for Lance native memory
@@ -754,10 +756,10 @@ Both are dynamic, so changes take effect without a restart. The byte limit itsel
 
 ### Inspect the snapshot and column cache
 
-`GET /_lance/stats` shows, per node, what the plugin holds in its caches: how many table snapshots (open Lance datasets) it keeps, how the off-heap column store is doing against its budget, and how the two add up to the `lance_native` breaker reading.
+`GET /_plugins/_lance/stats` shows, per node, what the plugin holds in its caches: how many table snapshots (open Lance datasets) it keeps, how the off-heap column store is doing against its budget, and how the two add up to the `lance_native` breaker reading.
 
 ```
-curl -sS localhost:9200/_lance/stats?pretty
+curl -sS localhost:9200/_plugins/_lance/stats?pretty
 ```
 
 ```json
@@ -879,7 +881,7 @@ The endpoint is read only. With the security plugin, grant `cluster:monitor/lanc
 The response also carries a `request_cache` section (not shown above): the coordinator's result cache. It keeps the reduced answer of every `size: 0` request against one Lance backed index and serves the same body again while the table stays at the version the answer was computed from, so a dashboard refreshing the same aggregation scans the table once per table version rather than once per refresh. The settings are `lance.request_cache.enabled`, `size`, `max_entry_size` and `expire`; [features.md](features.md#result-cache) has the key and the rules.
 
 - `hits` and `misses` tell how often that happens on the node you asked; `skipped` counts the requests the cache does not take (a body with hits, a target of several indexes, `request_cache=false`).
-- An append to the table is a new version and a miss, `POST /<index>/_cache/clear?request=true` drops the index's entries on every node, and `GET /<index>/_lance/explain` answers `cacheable` for a body.
+- An append to the table is a new version and a miss, `POST /<index>/_cache/clear?request=true` drops the index's entries on every node, and `GET /_plugins/_lance/explain/<index>` answers `cacheable` for a body.
 
 ### Warm the indexes when a table is attached
 
@@ -888,7 +890,7 @@ Lance opens an index the first time a scan uses it: a BTree reads its page looku
 - On a 20M row table on a local MinIO the first `match` took 9 to 13 s (63 MB of token dictionaries) and the first `lance_knn` 2.1 s, against 0.5 s and 0.1 s warm.
 - On a 1B row table on S3 the first `term` on a BTree column took 200 to 350 s.
 
-The plugin therefore warms the indexes of every Lance-backed index on every data node as soon as the index appears in the cluster state, which is right after `POST /_lance/attach` returns, when the namespace poll surfaces a table, and when a node applies its first cluster state after a restart. The attach response does not wait for it.
+The plugin therefore warms the indexes of every Lance-backed index on every data node as soon as the index appears in the cluster state, which is right after `POST /_plugins/_lance/attach` returns, when the namespace poll surfaces a table, and when a node applies its first cluster state after a restart. The attach response does not wait for it.
 
 - The warm-up runs on the `lance_warm_up` thread pool (one thread, so tables warm one after another and the indexes of a table one after another) and issues, per Lance index, the smallest scan that makes Lance load the part named by the mode; no data column is read.
 - A request that arrives while the warm-up runs does not wait: it loads what it needs on its own and Lance's cache reconciles the two.
@@ -933,7 +935,7 @@ lance.admission.headroom: 8gb              # default; available memory kept out 
 lance.admission.bounded_shapes_gated: true # default; false admits bounded full text pages ungated and judges a bounded filter page on its limit
 ```
 
-The 429 message names the kind of scan (`fts`, `scalar_index`, `vector_index`, `filter_scan`, `aggregate_scan`, `column_load`, `fetch_take`), the estimate, the available memory, the headroom and what to relax. `GET /_lance/stats` reports the decisions under `admission`, with one rejection counter per kind.
+The 429 message names the kind of scan (`fts`, `scalar_index`, `vector_index`, `filter_scan`, `aggregate_scan`, `column_load`, `fetch_take`), the estimate, the available memory, the headroom and what to relax. `GET /_plugins/_lance/stats` reports the decisions under `admission`, with one rejection counter per kind.
 
 The estimates are a model whose coefficients are pinned to the measurements the project has; a 429 on a table whose scan does not fit the node is the intended answer. `_count` without a filter never scans and is never gated; the take that reads the rows of a page (`GET /_doc`, a `match_all` page) is judged as `fetch_take`, at estimate zero for any page whose rows fit the index cache shard share.
 
@@ -958,7 +960,7 @@ When the cost chose the aggregators, explain shows `LuceneAggregateExec` and not
 
 Two settings are inputs to the same cost comparison rather than switches in front of it: `lance.aggregation.pushdown: false` prices every pushed aggregate as infinite, and `lance.aggregation.pushdown_max_groups` (node setting, default `1000000`) does the same for a tree whose group rows, estimated from the table statistics, exceed the bound.
 
-A data node may still move a pushed aggregate (or a pushed page or full text clause) to the Lucene side for what only it can judge. There are four such reasons ([query-plan.md](query-plan.md#refinements)), counted per node under `plan.refinements` in `GET /_lance/stats`, and the two the coordinator can predict from the mapping are listed under `refinements_possible` by the explain endpoint:
+A data node may still move a pushed aggregate (or a pushed page or full text clause) to the Lucene side for what only it can judge. There are four such reasons ([query-plan.md](query-plan.md#refinements)), counted per node under `plan.refinements` in `GET /_plugins/_lance/stats`, and the two the coordinator can predict from the mapping are listed under `refinements_possible` by the explain endpoint:
 
 - `security_wrapper`: a reader wrapper (the security plugin's DLS / FLS) is installed on the index, so a pushed aggregate, a pushed page and a pushed full text clause go to the aggregators, the collector and the Lucene composition of the query, which the wrapper filters. A pushed `lance_knn` and the filter SQL survive the wrapper.
 - `sort_field_type`: the pushed page orders by a column whose Lucene sort field carries a format the scan cannot type its sort values from (an `ip` override column), so the page goes to the collector.
@@ -1038,7 +1040,7 @@ Namespace registrations live in the cluster state and are persisted with it, so 
 To stop surfacing tables from a namespace, unregister it (`path` identifies a directory registration, `name` any other type). The indexes it surfaced stay in place until you delete them:
 
 ```
-curl -X DELETE http://localhost:9200/_lance/namespace \
+curl -X DELETE http://localhost:9200/_plugins/_lance/namespace \
   -H 'Content-Type: application/json' \
   -d '{"path":"/tables"}'
 curl -X DELETE http://localhost:9200/demo
@@ -1052,11 +1054,11 @@ Deleting a Lance-backed index while its namespace is still registered is honoure
 
 **A query on a mapped column returns zero hits when Python `dataset.to_table()` shows data.** Inspect the OpenSearch mapping (`curl -s http://localhost:9200/<index>/_mapping`). If the column is missing there, its Arrow type is not yet covered by the mapping derivation; open an issue with the schema.
 
-**`match` returns hits `operator: and` should have excluded, or `match_phrase` ignores word order.** On a `lance_text` field at the top of the query or inside a `bool` / `dis_max`, both reach Lance (step 5); check the field's mapping type with `GET /<index>/_mapping` (a `keyword` override answers `match` as an exact term) and `GET /<index>/_lance/explain` (`lance_clause` names the rewritten clause). Inside another compound (`function_score`, `nested`, `constant_score`) the `operator` of `match` is not applied; write `lance_match` there.
+**`match` returns hits `operator: and` should have excluded, or `match_phrase` ignores word order.** On a `lance_text` field at the top of the query or inside a `bool` / `dis_max`, both reach Lance (step 5); check the field's mapping type with `GET /<index>/_mapping` (a `keyword` override answers `match` as an exact term) and `GET /_plugins/_lance/explain/<index>` (`lance_clause` names the rewritten clause). Inside another compound (`function_score`, `nested`, `constant_score`) the `operator` of `match` is not applied; write `lance_match` there.
 
-**`lance_match_phrase` answers 400 `position is not found but required for phrase queries`.** The inverted index was built without token positions. Rebuild it with `with_position=True` (pylance) or `"with_position": true` on `POST /_lance/build_indexes/{index}`; positions are fixed when the index is created.
+**`lance_match_phrase` answers 400 `position is not found but required for phrase queries`.** The inverted index was built without token positions. Rebuild it with `with_position=True` (pylance) or `"with_position": true` on `POST /_plugins/_lance/build_indexes/{index}`; positions are fixed when the index is created.
 
-**A request is slower than expected and you want to know where it ran.** `GET /<index>/_lance/explain` with the same body (step 5) prints the plan and names what kept it on the Lucene side under `unplanned`; `GET /_lance/stats` shows under `plan` whether the data nodes executed the shipped plan or downgraded it, and why.
+**A request is slower than expected and you want to know where it ran.** `GET /_plugins/_lance/explain/<index>` with the same body (step 5) prints the plan and names what kept it on the Lucene side under `unplanned`; `GET /_plugins/_lance/stats` shows under `plan` whether the data nodes executed the shipped plan or downgraded it, and why.
 
 ## Next steps
 

@@ -30,4 +30,4 @@ A clear and concise description of what you expected to happen.
 If applicable, add screenshots to help explain your problem.
 
 **Do you have any additional context?**
-Add any other context about the problem, for example the mapping (`GET /<index>/_mapping`) and the plan (`GET /<index>/_lance/explain`).
+Add any other context about the problem, for example the mapping (`GET /<index>/_mapping`) and the plan (`GET /_plugins/_lance/explain/<index>`).
