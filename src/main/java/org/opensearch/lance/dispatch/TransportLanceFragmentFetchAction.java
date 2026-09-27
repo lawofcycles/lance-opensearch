@@ -58,10 +58,13 @@ import org.opensearch.transport.TransportService;
  * over the fragments the addresses name, and renders each row through
  * the same {@link FragmentFetchPhase} the query round renders a page
  * with, under the same per hit projections, so a hit of a two round
- * request is byte for byte the hit of a one round request. The rows go
- * through the leaf's stored fields path, so the fetch cache serves the
- * rows it holds and the take scans are judged by the admission gate and
- * counted under {@code fetch} in the node stats, as on the query round.
+ * request is byte for byte the hit of a one round request. The rows of
+ * the node's share of the page are taken in one {@code _rowaddr IN (...)}
+ * scan over the dataset whatever the number of fragments they sit in
+ * ({@code LanceMultiLeafTake}), then handed to the leaves' stored fields
+ * path, so the fetch cache serves the rows it holds and the take is
+ * judged by the admission gate and counted under {@code fetch} in the
+ * node stats, as on the query round.
  *
  * <p>The reader wrapper the security plugin installs is applied when
  * present, as on the query round; the coordinator does not defer the
@@ -69,9 +72,8 @@ import org.opensearch.transport.TransportService;
  * its page on the query round, so this handler sees a wrapper only when
  * one appeared between the two rounds.
  *
- * <p>Runs on the SEARCH pool like the query round; the intra request
- * work (the takes of the leaves side by side) runs on the
- * {@code index_searcher} pool under
+ * <p>Runs on the SEARCH pool like the query round; the column loads of
+ * the reader run on the {@code index_searcher} pool under
  * {@code plugins.lance.fragment_path.parallelism}.
  */
 public final class TransportLanceFragmentFetchAction extends HandledTransportAction<LanceFragmentFetchRequest, LanceFragmentFetchResponse> {
@@ -251,13 +253,7 @@ public final class TransportLanceFragmentFetchAction extends HandledTransportAct
                     request.projection().fetchFields().isEmpty() ? null : new FetchFieldsContext(request.projection().fetchFields()),
                     false
                 );
-                List<SearchHit> hits = FragmentHitsPages.render(
-                    searchContext,
-                    fetchPhase,
-                    searcher.getIndexReader(),
-                    request.rowAddrs(),
-                    groupScan
-                );
+                List<SearchHit> hits = FragmentHitsPages.render(searchContext, fetchPhase, searcher.getIndexReader(), request.rowAddrs());
                 LanceFragmentQueryResponse.Profile profile = new LanceFragmentQueryResponse.Profile(
                     0L,
                     (System.nanoTime() - fetchStart) / 1_000_000L,
