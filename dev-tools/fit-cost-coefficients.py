@@ -28,7 +28,7 @@ CostCoefficients.java and are not fitted.
 
 Standard library only. Usage:
 
-    python3 scripts/fit-cost-coefficients.py [--csv PATH] [--report PATH]
+    python3 dev-tools/fit-cost-coefficients.py [--csv PATH] [--report PATH]
 
 Without --report the report is written to stdout; the committed report is
 src/test/resources/cost/fit-report.md and must match this script's output.
