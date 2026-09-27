@@ -18,7 +18,7 @@ import java.io.IOException;
 import java.util.List;
 
 /**
- * GET /_plugins/_lance/explain/{index}
+ * GET and POST /_plugins/_lance/explain/{index}
  *
  * Explains the plan the fragment coordinator would execute for a search
  * body against a Lance-backed index without executing anything: the
@@ -46,7 +46,12 @@ public class RestLanceExplainAction extends BaseRestHandler {
 
     @Override
     public List<ReplacedRoute> replacedRoutes() {
-        return List.of(new ReplacedRoute(RestRequest.Method.GET, "/_plugins/_lance/explain/{index}", "/{index}/_lance/explain"));
+        // GET with a body, the shape _search and _validate/query accept, and
+        // POST for the clients that cannot send a body on a GET.
+        return List.of(
+            new ReplacedRoute(RestRequest.Method.GET, "/_plugins/_lance/explain/{index}", "/{index}/_lance/explain"),
+            new ReplacedRoute(RestRequest.Method.POST, "/_plugins/_lance/explain/{index}", "/{index}/_lance/explain")
+        );
     }
 
     @Override
