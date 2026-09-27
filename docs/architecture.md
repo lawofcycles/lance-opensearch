@@ -436,8 +436,8 @@ yet). For an aggregation over a table of a million rows or more, the pushed scan
 aggregator operator are each priced by `plan/cost/CostModel` as a sum of coefficient times
 quantity terms: a fixed cost per request, an object store open latency when the table URI is
 `s3://`, `gs://`, `az://` or the like, the per row work of every thread (the table's rows divided
-by the fan-out node count and by the path's parallelism: `lance.aggregation.pushdown_parallelism`
-for the scan, `lance.fragment_path.slices` for the aggregators) with one coefficient per kind of
+by the fan-out node count and by the path's parallelism: `plugins.lance.aggregation.pushdown_parallelism`
+for the scan, `plugins.lance.fragment_path.slices` for the aggregators) with one coefficient per kind of
 group key and metric, the object store transfer of the columns the scan reads (per node, not per
 thread, because it is bandwidth bound), a hash table penalty above a million groups, and the
 executor's merge of its parallel scans' group rows. The quantities come from the tree and the
@@ -446,8 +446,8 @@ Arrow type widths of the
 columns read); the run's inputs (nodes, storage kind, CPUs, the four settings) come from the caller
 as `plan/cost/CostInputs`, so the coordinator's plan sees the cluster and a data node's plan sees
 one local node. The aggregation routing settings are cost inputs, not gates in front of the
-planner: `lance.aggregation.pushdown: false`, and a statistics based estimate of the group rows
-the executor would hold above `lance.aggregation.pushdown_max_groups`, make the pushed scan's cost
+planner: `plugins.lance.aggregation.pushdown: false`, and a statistics based estimate of the group rows
+the executor would hold above `plugins.lance.aggregation.pushdown_max_groups`, make the pushed scan's cost
 infinite, so the Volcano planner implements the aggregate through the Lucene operator and explain
 shows that as a cost decision with nothing `unplanned`. The estimate is judged only when every key
 domain is known (a bitmap distinct count, a BTree integer range, a date interval, a range or filter
@@ -538,7 +538,7 @@ names, and the node runs the aggregators when its store holds every one of those
 fragment of the request and the resident Lucene cost is below the pushed cost. Over a local table
 the resident cost equals the cost the planner already compared, so the fourth reason cannot fire
 there; over an object store table it fires once a Lucene side request has loaded the columns.
-Nothing warms the store for it (`lance.attach.warm_indexes` warms the Lance index cache, not the
+Nothing warms the store for it (`plugins.lance.attach.warm_indexes` warms the Lance index cache, not the
 column store), and below the fitted model's range the shipped costs are zero. Downgrades go one way,
 from the Lance scan to
 Lucene; nothing is pushed on the data node that the coordinator did not push, so the plan the
@@ -581,13 +581,13 @@ plugin's job is to make sure no request allocates in a pool that nothing bounds.
    `lance_heap_column:<column>`), the per fragment bit sets of a filter and the group state of a
    pushed aggregate (reported by the admission gate and judged against the breaker's room). A
    refusal is a 429; the node keeps running.
-2. **The Lance index cache**, the part of `lance.native_memory.limit` handed to the shared Lance
+2. **The Lance index cache**, the part of `plugins.lance.native_memory.limit` handed to the shared Lance
    `Session` and accounted by the `lance_native` breaker through `Session.sizeBytes()`. BTree
    pages, bitmaps, full text token dictionaries and posting lists, IVF centroids and partitions
    live here once loaded, each as an entry that must fit one cache shard
    (`NativeMemoryLimit.IndexCacheSizing.shardShareBytes`); an entry heavier than a shard is refused
    by the cache without an error and rebuilt on every use, outside this pool.
-3. **The off-heap column store** (`ColumnStore`), the `lance.cache.column_share` fraction of the same
+3. **The off-heap column store** (`ColumnStore`), the `plugins.lance.cache.column_share` fraction of the same
    limit, accounted by the same breaker, holding the doc values columns of the fragment path
    between requests; a load the budget cannot meet falls back to pool 1.
 4. **The native allocator's scan memory**, which nothing accounts: the document set Lance rebuilds
@@ -603,7 +603,7 @@ load starts, the path that owns it (the fragment executor for a full text scan, 
 `LanceScanFilterQuery` and `LanceKnnQuery`, the sorted page of `FragmentHitsPages`, the
 `AggregateScanRunner`) estimates what the scan will make Lance allocate in pool 4, with one
 estimator per kind and the coefficients as named constants, and the gate refuses the request with
-429 (`lance_admission`) when the node's `MemAvailable` minus `lance.admission.headroom`, plus the
+429 (`lance_admission`) when the node's `MemAvailable` minus `plugins.lance.admission.headroom`, plus the
 memory earlier admitted scans retained, cannot hold the estimate. An estimate at or below the
 shard share is zero: what fits the cache is loaded once, and scan buffers smaller than one shard
 of the cache the node dedicates to Lance are within its sizing. The estimates read the planner's
