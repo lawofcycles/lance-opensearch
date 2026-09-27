@@ -6,7 +6,10 @@
 package org.opensearch.lance;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 import org.opensearch.client.Request;
@@ -45,7 +48,7 @@ public class LancePluginIT extends LanceRestTestCase {
         assertTrue("expected namespaces JSON, saw: " + body, body.contains("namespaces"));
     }
 
-    public void testOldPathsAnswerWithDeprecationWarning() throws IOException {
+    public void testOldPathsAnswerWithDeprecationWarning() throws Exception {
         // The test client runs in strict deprecation mode, so a Warning
         // header fails the request unless the options expect it. The
         // node logs one "deprecated_route" message per X-Opaque-Id and
@@ -55,6 +58,31 @@ public class LancePluginIT extends LanceRestTestCase {
         // deprecation on the same node.
         assertDeprecatedPath("GET", "/_lance/stats", "/_lance/stats", "/_plugins/_lance/stats");
         assertDeprecatedPath("GET", "/_lance/namespace", "/_lance/namespace", "/_plugins/_lance/namespace");
+
+        // Attach answers from the callback of a create it issued under a
+        // stashed thread context, so its 200 covers the response header
+        // surviving that stash, both on the create and on the
+        // already_attached answer of a second attach.
+        String suffix = "oldattach-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeTable(scratchDir, tableName, 2);
+        String attachBody = "{\"table\":\"" + scratchDir.resolve(tableName + ".lance") + "\"}";
+        try {
+            Response attached = assertDeprecatedPath("POST", "/_lance/attach", attachBody, "/_lance/attach", "/_plugins/_lance/attach");
+            String body = readAll(attached);
+            assertEquals("expected the index name in " + body, tableName, stringPath(body, "index"));
+            assertFalse("expected a fresh attach in " + body, body.contains("\"already_attached\":true"));
+
+            Response again = assertDeprecatedPath("POST", "/_lance/attach", attachBody, "/_lance/attach", "/_plugins/_lance/attach");
+            String againBody = readAll(again);
+            assertTrue("expected already_attached in " + againBody, againBody.contains("\"already_attached\":true"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + tableName));
+            } catch (Exception ignored) {}
+            deleteRecursively(scratchDir);
+        }
 
         Response stats = client().performRequest(new Request("GET", "/_plugins/_lance/stats"));
         assertEquals(RestStatus.OK.getStatus(), stats.getStatusLine().getStatusCode());
@@ -99,8 +127,17 @@ public class LancePluginIT extends LanceRestTestCase {
      * templates, not the resolved request path.
      */
     private static Response assertDeprecatedPath(String method, String oldPath, String oldTemplate, String newTemplate) throws IOException {
+        return assertDeprecatedPath(method, oldPath, null, oldTemplate, newTemplate);
+    }
+
+    /** {@link #assertDeprecatedPath(String, String, String, String)} with a JSON body. */
+    private static Response assertDeprecatedPath(String method, String oldPath, String jsonBody, String oldTemplate, String newTemplate)
+        throws IOException {
         String warning = "[" + method + " " + oldTemplate + "] is deprecated! Use [" + method + " " + newTemplate + "] instead.";
         Request request = new Request(method, oldPath);
+        if (jsonBody != null) {
+            request.setJsonEntity(jsonBody);
+        }
         request.setOptions(expectWarnings(warning).toBuilder().addHeader("X-Opaque-Id", "lance-deprecated-" + randomAlphaOfLength(12)));
         Response response = client().performRequest(request);
         assertEquals(RestStatus.OK.getStatus(), response.getStatusLine().getStatusCode());
