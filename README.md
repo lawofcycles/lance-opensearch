@@ -12,6 +12,8 @@ This plugin makes such a table addressable through OpenSearch's APIs. An operato
 
 Every request fans the table's fragments out over the data nodes. A cost based planner decides per request what Lance runs natively (filters, full text, nearest neighbour, Substrait aggregations) and what OpenSearch's stock collectors and aggregators run. New table versions need no reindex. The design is discussed in [RFC #22643](https://github.com/opensearch-project/OpenSearch/issues/22643).
 
+The whole of OpenSearch's aggregation DSL applies to the table: `terms`, `date_histogram`, `range`, the metric aggregations, `composite` and the pipeline aggregations, next to the table's own vector and full text search in the same request body. A `size: 0` aggregation the planner can express in Substrait runs inside the Lance scan and never materialises rows in the JVM; the rest run on OpenSearch's aggregators over the same fragments. Either way the request arrives through the OpenSearch clients and Dashboards an operator already has, and the result cache, the admission gate and the multi node fan out of the plugin apply to it. See [docs/aggregations.md](docs/aggregations.md) for the shapes and their paths.
+
 ## Status
 
 This plugin is in preview and is not production ready. The read side works end to end against real Lance tables. Interfaces, settings and response shapes can change between releases without a deprecation period. It is built against OpenSearch 3.8.0 with Lance 12.0.0; a rolling upgrade may run two plugin versions at once ([docs/design/wire-format-compat.md](docs/design/wire-format-compat.md)).
