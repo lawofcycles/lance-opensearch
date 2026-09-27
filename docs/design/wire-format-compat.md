@@ -134,6 +134,8 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 | `LanceStatsNodeRequest` | 1 | Base: nothing after the marker |
 | `LanceRequestCacheClearNodeRequest` | 1 | Base: the index uuids whose result cache entries the node drops |
 | `LanceRequestCacheClearNodeResponse` | 1 | Base: how many entries the node dropped |
+| `LanceStatisticsPrefetchNodeRequest` | 1 | Base: the index name, the table URI the statistics cache keys on, the version to collect |
+| `LanceStatisticsPrefetchNodeResponse` | 1 | Base: the outcome (`STARTED`, `HELD` or `PENDING`) |
 | `LanceBuildIndexesNodeRequest` | 1 | Base: the build request, the source version |
 | `LanceBuildIndexesNodeResponse` | 1 | Base: the three kind results, the status, the optional mapping JSON |
 | `LanceIndexSyncRequest` | 1 | Base: nothing after the marker (the index travels in the OpenSearch base class) |

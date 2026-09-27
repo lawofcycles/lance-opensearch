@@ -23,6 +23,8 @@ import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.common.compress.CompressedXContent;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.util.concurrent.ThreadContext;
+import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.mapper.DocumentMapper;
@@ -33,6 +35,9 @@ import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.dispatch.LanceCoordinatorThreads;
+import org.opensearch.lance.dispatch.LanceStatisticsPrefetchAction;
+import org.opensearch.lance.dispatch.LanceStatisticsPrefetchNodeResponse;
+import org.opensearch.lance.dispatch.LanceStatisticsPrefetchRequest;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceLocalClones;
 import org.opensearch.lance.engine.LanceServedVersions;
@@ -67,7 +72,8 @@ import org.opensearch.transport.client.Client;
  * of the version left behind are retired. The planner's table statistics
  * of the version about to be served are collected in the background
  * from the first check and from every move, so the requests this node
- * coordinates find them. A pinned index
+ * coordinates find them; a move also asks every data node to collect
+ * them, since no other node observes the move. A pinned index
  * ({@code index.lance.version}) never advances and is not tracked. A
  * {@code node_local} index only has its reader advanced; its mapping is
  * maintained by the build action from the clones.
@@ -523,8 +529,43 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
             if (warmCache != null) {
                 warmCache.retire(shard.indexUuid(), target);
             }
+            // The other data nodes have no event of their own for the
+            // move (the served version is not in the cluster state), so
+            // they are told to collect the new version's statistics now
+            // rather than on their first request of it.
+            broadcastStatisticsPrefetch(indexName, tableKey, target);
         }
         return new Outcome(indexName, true, null, moved, served, target, mappingChanged, false, mappingError);
+    }
+
+    /**
+     * Ask every data node to start collecting the statistics of
+     * {@code version} of the table behind {@code indexName}, keyed on
+     * {@code tableUri}. Fire and forget: the requests plan without the
+     * statistics when a node does not get to collect them, so a failed
+     * broadcast is only logged. The call runs under a stashed thread
+     * context, so a manual sync's caller needs no privilege for it.
+     */
+    private void broadcastStatisticsPrefetch(String indexName, String tableUri, long version) {
+        ThreadContext threadContext = threadPool.getThreadContext();
+        try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
+            client.execute(
+                LanceStatisticsPrefetchAction.INSTANCE,
+                new LanceStatisticsPrefetchRequest(indexName, tableUri, version),
+                ActionListener.wrap(
+                    response -> LOG.debug(
+                        "statistics prefetch of {} at version {}: started on {} nodes, held on {}, pending on {}, failed on {}",
+                        indexName,
+                        version,
+                        response.count(LanceStatisticsPrefetchNodeResponse.Outcome.STARTED),
+                        response.count(LanceStatisticsPrefetchNodeResponse.Outcome.HELD),
+                        response.count(LanceStatisticsPrefetchNodeResponse.Outcome.PENDING),
+                        response.failures().size()
+                    ),
+                    e -> LOG.debug("statistics prefetch of {} at version {} could not be broadcast", indexName, version, e)
+                )
+            );
+        }
     }
 
     /**

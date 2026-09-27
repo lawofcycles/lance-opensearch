@@ -32,6 +32,7 @@ import org.opensearch.action.admin.indices.mapping.get.GetMappingsRequest;
 import org.opensearch.action.admin.indices.mapping.get.GetMappingsResponse;
 import org.opensearch.action.admin.indices.mapping.put.PutMappingAction;
 import org.opensearch.action.admin.indices.mapping.put.PutMappingRequest;
+import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.common.settings.MockSecureSettings;
@@ -47,6 +48,9 @@ import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.dispatch.LanceStatisticsPrefetchAction;
+import org.opensearch.lance.dispatch.LanceStatisticsPrefetchRequest;
+import org.opensearch.lance.dispatch.LanceStatisticsPrefetchResponse;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceServedVersions;
 import org.opensearch.lance.engine.LanceWarmCache;
@@ -480,7 +484,7 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
         assertTrue("the detector's refusal is not a refused derivation", service.stats().mappingErrors().isEmpty());
     }
 
-    public void testCheckCollectsTheStatisticsOfTheVersionItServesOnTheFirstCheckAndOnAMove() throws Exception {
+    public void testCheckCollectsTheStatisticsOfTheVersionItServesOnTheFirstCheckAndOnAMoveAndBroadcastsTheMove() throws Exception {
         String tableUri = writeTable("statistics");
         try (
             RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
@@ -511,10 +515,12 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
                 assertNotNull("the first check collected the served version's statistics", statistics.peek(key, first));
                 assertEquals(1L, statistics.collectCount());
                 assertEquals("a collection ahead of the plans is not a plan without statistics", 0L, statistics.missCount());
+                assertEquals("a check that found no move tells no other node", 0, client.count(LanceStatisticsPrefetchAction.NAME));
 
                 // Standing still starts nothing more.
                 withCache.check(entry);
                 assertEquals(1L, statistics.collectCount());
+                assertEquals(0, client.count(LanceStatisticsPrefetchAction.NAME));
 
                 LanceTableFactory.appendRows(tableUri, 6, 4);
                 LanceIndexFreshnessService.Outcome moved = withCache.check(entry);
@@ -522,6 +528,15 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
                 assertNotNull("the move collected the target version's statistics", statistics.peek(key, moved.targetVersion()));
                 assertEquals(10L, statistics.peek(key, moved.targetVersion()).rowCount());
                 assertEquals(2L, statistics.collectCount());
+                // The move is broadcast to the data nodes once, keyed the
+                // way the plans look the statistics up.
+                assertEquals(1, client.count(LanceStatisticsPrefetchAction.NAME));
+                LanceStatisticsPrefetchRequest sent = (LanceStatisticsPrefetchRequest) client.requests(LanceStatisticsPrefetchAction.NAME)
+                    .get(0);
+                assertEquals("statistics", sent.indexName());
+                assertEquals(key, sent.tableUri());
+                assertEquals(moved.targetVersion(), sent.version());
+                assertArrayEquals(new String[] { "data:true" }, sent.nodesIds());
             } finally {
                 withCache.close();
             }
@@ -659,6 +674,12 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
                 String index = ((GetMappingsRequest) request).indices()[0];
                 Map<String, Object> source = mappingSource == null ? Map.of() : mappingSource;
                 listener.onResponse((Response) new GetMappingsResponse(Map.of(index, new MappingMetadata("_doc", source))));
+                return;
+            }
+            if (action.name().equals(LanceStatisticsPrefetchAction.NAME)) {
+                // The broadcast's listener reads the response, so the
+                // no-op's null answer would not do.
+                listener.onResponse((Response) new LanceStatisticsPrefetchResponse(ClusterName.DEFAULT, List.of(), List.of()));
                 return;
             }
             super.doExecute(action, request, listener);

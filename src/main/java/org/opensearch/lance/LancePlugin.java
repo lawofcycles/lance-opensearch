@@ -43,7 +43,9 @@ import org.opensearch.lance.dispatch.LanceGetIndexActionFilter;
 import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
 import org.opensearch.lance.dispatch.LanceRequestCache;
 import org.opensearch.lance.dispatch.LanceRequestCacheClearAction;
+import org.opensearch.lance.dispatch.LanceStatisticsPrefetchAction;
 import org.opensearch.lance.dispatch.TransportLanceRequestCacheClearAction;
+import org.opensearch.lance.dispatch.TransportLanceStatisticsPrefetchAction;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceIndexWarmer;
 import org.opensearch.lance.engine.LanceLocalClones;
@@ -1589,7 +1591,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             new ActionHandler<>(LanceRefsAction.INSTANCE, TransportLanceRefsAction.class),
             new ActionHandler<>(LanceStatsAction.INSTANCE, TransportLanceStatsAction.class),
             new ActionHandler<>(LanceExplainAction.INSTANCE, TransportLanceExplainAction.class),
-            new ActionHandler<>(LanceRequestCacheClearAction.INSTANCE, TransportLanceRequestCacheClearAction.class)
+            new ActionHandler<>(LanceRequestCacheClearAction.INSTANCE, TransportLanceRequestCacheClearAction.class),
+            new ActionHandler<>(LanceStatisticsPrefetchAction.INSTANCE, TransportLanceStatisticsPrefetchAction.class)
         );
     }
 
