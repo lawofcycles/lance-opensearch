@@ -86,7 +86,10 @@ import org.opensearch.search.sort.SortAndFormats;
  * {@code stored_fields}, {@code docvalue_fields}, {@code fields},
  * {@code _explanation}, score and sort values) does not depend on which
  * step collected the page, and reports every hit's Lance row address for
- * the coordinator's tie break.
+ * the coordinator's tie break. When the coordinator asked for deferred
+ * hits, {@link #defer} reports the row address, score and sort values of
+ * the page instead and {@link #render} renders, on the fetch round, the
+ * rows the coordinator kept.
  */
 final class FragmentHitsPages {
 
@@ -463,6 +466,114 @@ final class FragmentHitsPages {
     }
 
     /**
+     * The page of a request whose coordinator asked for deferred hits:
+     * for every collected doc its Lance row address, the score a
+     * rendered hit would carry (a {@code _score} sort clause's value
+     * becoming the score, as in {@link #materialise}) and, for a sorted
+     * page, its raw sort values with the sort's formats. Nothing is
+     * taken from Lance: the coordinator merges the page on these
+     * figures and has the rows it keeps rendered by the fetch round.
+     */
+    static LanceFragmentQueryResponse.DeferredHits defer(IndexReader reader, ScoreDoc[] scoreDocs, SortAndFormats sortAndFormats) {
+        if (scoreDocs.length == 0) {
+            return LanceFragmentQueryResponse.DeferredHits.NONE;
+        }
+        int sortScoreIndex = sortScoreIndex(sortAndFormats);
+        long[] rowAddrs = new long[scoreDocs.length];
+        float[] scores = new float[scoreDocs.length];
+        Object[][] sortValues = new Object[scoreDocs.length][];
+        for (int i = 0; i < scoreDocs.length; i++) {
+            ScoreDoc scoreDoc = scoreDocs[i];
+            rowAddrs[i] = rowAddressOf(reader, scoreDoc.doc);
+            scores[i] = scoreDoc.score;
+            if (sortAndFormats != null && scoreDoc instanceof FieldDoc fieldDoc) {
+                sortValues[i] = fieldDoc.fields;
+                if (sortScoreIndex != -1 && fieldDoc.fields[sortScoreIndex] instanceof Number score) {
+                    scores[i] = score.floatValue();
+                }
+            } else {
+                sortValues[i] = new Object[0];
+            }
+        }
+        return new LanceFragmentQueryResponse.DeferredHits(
+            rowAddrs,
+            scores,
+            sortValues,
+            sortAndFormats == null ? null : sortAndFormats.formats
+        );
+    }
+
+    /**
+     * The position of the {@code _score} clause among the sort fields,
+     * or -1 without one. A sort with a {@code _score} clause carries the
+     * score as that clause's sort value; SearchPhaseController copies it
+     * into {@code _score} on the stock search path, whether or not
+     * {@code track_scores} is set.
+     */
+    private static int sortScoreIndex(SortAndFormats sortAndFormats) {
+        int sortScoreIndex = -1;
+        if (sortAndFormats != null) {
+            SortField[] sortFields = sortAndFormats.sort.getSort();
+            for (int i = 0; i < sortFields.length; i++) {
+                if (sortFields[i].getType() == SortField.Type.SCORE) {
+                    sortScoreIndex = i;
+                }
+            }
+        }
+        return sortScoreIndex;
+    }
+
+    /**
+     * The fetch round of a page: render the rows at {@code rowAddrs} of
+     * {@code reader}, which the caller opened over the fragments those
+     * addresses name, through {@link FragmentFetchPhase} with one take
+     * per leaf ({@link #prefetchHitRows}), the leaves side by side
+     * through {@code groupScan}. The hits come back in the order of the
+     * addresses and carry neither score nor sort values; the coordinator
+     * stamps those from the query round. An address whose fragment is
+     * not a leaf of the reader, or whose offset is past the fragment's
+     * rows, is a coordinator bug (the round names rows the query round
+     * collected from the same version) and fails the round.
+     */
+    static List<SearchHit> render(
+        LanceFragmentSearchContext searchContext,
+        FragmentFetchPhase fetchPhase,
+        IndexReader reader,
+        long[] rowAddrs,
+        FragmentGroupScan groupScan
+    ) throws IOException {
+        if (rowAddrs.length == 0) {
+            return Collections.emptyList();
+        }
+        Map<Integer, LeafReaderContext> leafByFragment = new HashMap<>();
+        for (LeafReaderContext ctx : reader.leaves()) {
+            LanceFragmentLeafReader lance = LanceFragmentLeafReader.unwrap(ctx.reader());
+            if (lance != null) {
+                leafByFragment.put(lance.fragmentId(), ctx);
+            }
+        }
+        ScoreDoc[] scoreDocs = new ScoreDoc[rowAddrs.length];
+        for (int i = 0; i < rowAddrs.length; i++) {
+            int fragmentId = (int) (rowAddrs[i] >>> 32);
+            int offset = (int) (rowAddrs[i] & 0xFFFFFFFFL);
+            LeafReaderContext ctx = leafByFragment.get(fragmentId);
+            if (ctx == null) {
+                throw new IllegalStateException(
+                    "fragment " + fragmentId + " of row address " + rowAddrs[i] + " is not a leaf of the fetch reader"
+                );
+            }
+            LanceFragmentLeafReader lance = LanceFragmentLeafReader.unwrap(ctx.reader());
+            scoreDocs[i] = new ScoreDoc(ctx.docBase + lance.docOfRow(offset), Float.NaN);
+        }
+        prefetchHitRows(reader, scoreDocs, groupScan);
+        int[] docIds = new int[scoreDocs.length];
+        for (int i = 0; i < scoreDocs.length; i++) {
+            docIds[i] = scoreDocs[i].doc;
+        }
+        return Arrays.asList(fetchPhase.fetch(searchContext, docIds));
+    }
+
+    /**
      * Render the hits of a collected page: one Lance take per leaf for
      * the rows behind the page ({@link #prefetchHitRows}, the leaves
      * side by side through {@code groupScan}), the fetch phase over the
@@ -489,18 +600,7 @@ final class FragmentHitsPages {
             docIds[i] = scoreDocs[i].doc;
         }
         SearchHit[] hits = fetchPhase.fetch(searchContext, docIds);
-        // A sort with a _score clause carries the score as that clause's
-        // sort value; SearchPhaseController copies it into _score on the
-        // stock search path, whether or not track_scores is set.
-        int sortScoreIndex = -1;
-        if (sortAndFormats != null) {
-            SortField[] sortFields = sortAndFormats.sort.getSort();
-            for (int i = 0; i < sortFields.length; i++) {
-                if (sortFields[i].getType() == SortField.Type.SCORE) {
-                    sortScoreIndex = i;
-                }
-            }
-        }
+        int sortScoreIndex = sortScoreIndex(sortAndFormats);
         List<SearchHit> out = new ArrayList<>(hits.length);
         long[] rowAddrs = new long[hits.length];
         for (int i = 0; i < hits.length; i++) {
