@@ -516,6 +516,14 @@ public class LanceExplainIT extends LanceRestTestCase {
             Map<String, Object> emptyTopK = (Map<String, Object>) fragmentPlanOf(emptyBody).get("top_k");
             assertEquals(10, emptyTopK.get("fetch"));
 
+            // POST carries the same body for the clients that cannot send
+            // one on a GET, and answers the same plan.
+            Request posted = new Request("POST", "/_plugins/_lance/explain/" + indexName);
+            posted.setJsonEntity("{\"size\":2,\"_source\":[\"id\"],\"sort\":[{\"id\":\"asc\"}]}");
+            Response postedResponse = client().performRequest(posted);
+            assertEquals(RestStatus.OK.getStatus(), postedResponse.getStatusLine().getStatusCode());
+            assertEquals(fragmentPlanOf(sourceBody), fragmentPlanOf(readAll(postedResponse)));
+
             // A body no plan answers (a highlighter): the endpoint reports
             // rather than executes, so it answers 200 with the route
             // unsupported and the refusal message under unplanned, and

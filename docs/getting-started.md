@@ -541,7 +541,7 @@ For OpenSearch's dedicated `hybrid` query (per-sub-query top-K with a score-norm
 
 ### Where a request runs: the explain endpoint
 
-Send the search body to `GET /_plugins/_lance/explain/{index}` to see what the coordinator would execute for it, without running the search. The explain endpoint runs the same planning entry a `_search` runs and prints the result, so what it shows is what a search with the same body executes. [query-plan.md](query-plan.md) is the reference for every field, the operators, the cost model, the refinements and the traits; this section shows the two answers the examples above produce.
+Send the search body to `GET /_plugins/_lance/explain/{index}` (or `POST`, for a client that cannot send a body on a `GET`) to see what the coordinator would execute for it, without running the search. The explain endpoint runs the same planning entry a `_search` runs and prints the result, so what it shows is what a search with the same body executes. [query-plan.md](query-plan.md) is the reference for every field, the operators, the cost model, the refinements and the traits; this section shows the two answers the examples above produce.
 
 The plugin plans every `_search` once, on the coordinating node, through a Calcite planner: the body is translated to a logical tree over the table, the planner picks the cheapest physical form that declares the traits the request demands, and the per node part of that form ships to the data nodes with each fragment request.
 
