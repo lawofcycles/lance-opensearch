@@ -1016,6 +1016,8 @@ plugins.lance.fragment_path.slices: 4                 # default: half the CPUs t
 - Raise `slices` towards the node's core count when an aggregation that the scan does not compute (`multi_terms`, `cardinality`, any tree under a full text or `lance_knn` query, or `terms` with `plugins.lance.aggregation.pushdown: false`) keeps one core busy while the others idle.
 - With the log level of `org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction` at `DEBUG`, each request logs the number of leaves and slices it collected.
 
+A third dynamic setting, `plugins.lance.fragment_path.defer_fetch` (default `true`), decides whether a page answered by several executors is rendered in a fetch round: the executors return only the row address, score and sort values of their top rows, and the coordinator asks the nodes holding the `size` rows it keeps to render those alone. Set it to `false` to have every executor render its own top `from + size` rows on the query round, as a single node does.
+
 ### The coordinator thread pool
 
 The plugin gives the coordinator half of a `_search` its own fixed pool, `lance_coordinator`, so that a burst of requests cannot fill a data node's `search` queue with coordinator work, and a full `search` queue cannot stop the transport layer from delivering a fragment response.

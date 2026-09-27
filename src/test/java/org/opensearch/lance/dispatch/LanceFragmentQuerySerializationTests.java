@@ -10,6 +10,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
+import org.apache.lucene.util.BytesRef;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.bytes.BytesArray;
@@ -26,6 +27,7 @@ import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.WireVersion;
 import org.opensearch.lance.WireVersionTestSupport;
 import org.opensearch.lance.plan.execute.FragmentPlan;
+import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchModule;
 import org.opensearch.search.collapse.CollapseBuilder;
@@ -473,11 +475,11 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
                 assertEquals(LanceFragmentQueryRequest.WIRE_VERSION, in.readVInt());
             }
         }
-        // The stream a version 2 coordinator would write: today's fields
+        // The stream a version 3 coordinator would write: today's fields
         // followed by one optional block this version does not know. The
         // request is read whole and the block is stepped over.
         Writeable prelude = o -> TaskId.EMPTY_TASK_ID.writeTo(o);
-        BytesReference optional = WireVersionTestSupport.asNextVersion(original, prelude, false, o -> o.writeString("a version 2 hint"));
+        BytesReference optional = WireVersionTestSupport.asNextVersion(original, prelude, false, o -> o.writeString("a version 3 hint"));
         try (StreamInput in = new NamedWriteableAwareStreamInput(optional.streamInput(), AGG_REGISTRY)) {
             LanceFragmentQueryRequest restored = new LanceFragmentQueryRequest(in);
             assertEquals(original.tableUri(), restored.tableUri());
@@ -490,15 +492,269 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
             original,
             prelude,
             true,
-            o -> o.writeString("a version 2 constraint")
+            o -> o.writeString("a version 3 constraint")
         );
         try (StreamInput in = new NamedWriteableAwareStreamInput(critical.streamInput(), AGG_REGISTRY)) {
             IOException refused = expectThrows(IOException.class, () -> new LanceFragmentQueryRequest(in));
             assertEquals(
-                "LanceFragmentQueryRequest wire version [2] adds fields in version [2] that this node's [1] cannot ignore: "
+                "LanceFragmentQueryRequest wire version [3] adds fields in version [3] that this node's [2] cannot ignore: "
                     + "upgrade this node before sending it this message",
                 refused.getMessage()
             );
+        }
+    }
+
+    public void testRequestDeferFetchRoundTrip() throws Exception {
+        LanceFragmentQueryRequest rendered = LanceFragmentQueryRequest.allFragments(
+            "/tmp/table.lance",
+            "demo",
+            StorageOptions.empty(),
+            FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_TOPK, null),
+            /* query */ null,
+            Collections.emptyList(),
+            10,
+            /* aggregations */ null
+        );
+        assertFalse("a request built without the flag renders on the query round", rendered.deferFetch());
+        assertSame(rendered, rendered.withDeferFetch(false));
+        LanceFragmentQueryRequest deferred = rendered.withDeferFetch(true);
+        assertTrue(deferred.deferFetch());
+        assertEquals(rendered.size(), deferred.size());
+        for (LanceFragmentQueryRequest original : List.of(rendered, deferred)) {
+            LanceFragmentQueryRequest restored;
+            try (BytesStreamOutput out = new BytesStreamOutput()) {
+                original.writeTo(out);
+                try (StreamInput in = out.bytes().streamInput()) {
+                    restored = new LanceFragmentQueryRequest(in);
+                    assertEquals("the reader consumed the block", -1, in.read());
+                }
+            }
+            assertEquals(original.deferFetch(), restored.deferFetch());
+        }
+    }
+
+    public void testMixedPluginVersionAVersion1ExecutorReadsTodaysRequestAndRendersItsHits() throws Exception {
+        // A version 1 executor steps over the defer fetch block and
+        // renders its page; the coordinator accepts rendered hits next
+        // to deferred ones.
+        LanceFragmentQueryRequest original = LanceFragmentQueryRequest.allFragments(
+            "/tmp/table.lance",
+            "demo",
+            StorageOptions.empty(),
+            FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_TOPK, null),
+            /* query */ null,
+            Collections.emptyList(),
+            10,
+            /* aggregations */ null
+        ).withDeferFetch(true);
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            original.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                LanceFragmentQueryRequest asVersion1 = LanceFragmentQueryRequest.read(in, 1);
+                assertEquals(original.tableUri(), asVersion1.tableUri());
+                assertEquals(10, asVersion1.size());
+                assertFalse("the block it does not know is stepped over and the flag falls back to false", asVersion1.deferFetch());
+                assertEquals("the reader consumed the block", -1, in.read());
+            }
+        }
+    }
+
+    public void testMixedPluginVersionTodaysExecutorReadsAVersion1CoordinatorsRequest() throws Exception {
+        // The stream a version 1 coordinator writes: the parent task id,
+        // the marker 1, the base fields and no block. Today's executor
+        // renders its hits for it.
+        LanceFragmentQueryRequest original = LanceFragmentQueryRequest.allFragments(
+            "/tmp/table.lance",
+            "demo",
+            StorageOptions.empty(),
+            FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_TOPK, null),
+            /* query */ null,
+            Collections.emptyList(),
+            10,
+            /* aggregations */ null
+        ).withDeferFetch(true);
+        int blockBytes;
+        try (BytesStreamOutput block = new BytesStreamOutput()) {
+            WireVersion.writeBlock(block, false, o -> o.writeBoolean(true));
+            blockBytes = block.bytes().length();
+        }
+        try (BytesStreamOutput today = new BytesStreamOutput(); BytesStreamOutput version1 = new BytesStreamOutput()) {
+            original.writeTo(today);
+            try (StreamInput in = today.bytes().streamInput()) {
+                TaskId.readFromStream(in);
+                assertEquals(LanceFragmentQueryRequest.WIRE_VERSION, in.readVInt());
+                byte[] rest = in.readAllBytes();
+                TaskId.EMPTY_TASK_ID.writeTo(version1);
+                version1.writeVInt(1);
+                version1.writeBytes(rest, 0, rest.length - blockBytes);
+            }
+            try (StreamInput in = version1.bytes().streamInput()) {
+                LanceFragmentQueryRequest restored = new LanceFragmentQueryRequest(in);
+                assertEquals(original.tableUri(), restored.tableUri());
+                assertEquals(10, restored.size());
+                assertFalse("no block: the flag falls back to false", restored.deferFetch());
+                assertEquals(-1, in.read());
+            }
+        }
+    }
+
+    public void testResponseDeferredHitsRoundTrip() throws Exception {
+        LanceFragmentQueryResponse.DeferredHits deferred = new LanceFragmentQueryResponse.DeferredHits(
+            new long[] { (1L << 32) | 3L, 7L },
+            new float[] { 2.5f, Float.NaN },
+            new Object[][] { new Object[] { 12L, new BytesRef("k1") }, new Object[] { 9L, null } },
+            new DocValueFormat[] { DocValueFormat.RAW, DocValueFormat.RAW }
+        );
+        LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(
+            2L,
+            false,
+            1,
+            List.of(),
+            new long[0],
+            null,
+            null,
+            new LanceFragmentQueryResponse.Profile(12L, 0L, 0L, 0L, 0L, 0L, 1L),
+            deferred
+        );
+        LanceFragmentQueryResponse restored;
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            original.writeTo(out);
+            try (
+                StreamInput raw = out.bytes().streamInput();
+                NamedWriteableAwareStreamInput in = new NamedWriteableAwareStreamInput(raw, AGG_REGISTRY)
+            ) {
+                restored = new LanceFragmentQueryResponse(in);
+                assertEquals("the reader consumed the blocks", -1, in.read());
+            }
+        }
+        assertTrue(restored.hits().isEmpty());
+        assertEquals(2, restored.deferredHits().size());
+        assertArrayEquals(deferred.rowAddrs(), restored.deferredHits().rowAddrs());
+        assertArrayEquals(deferred.scores(), restored.deferredHits().scores(), 0f);
+        assertEquals(12L, restored.deferredHits().sortValues()[0][0]);
+        assertEquals(new BytesRef("k1"), restored.deferredHits().sortValues()[0][1]);
+        assertNull(restored.deferredHits().sortValues()[1][1]);
+        assertArrayEquals(new DocValueFormat[] { DocValueFormat.RAW, DocValueFormat.RAW }, restored.deferredHits().formats());
+        assertEquals(original.profile(), restored.profile());
+
+        // A page without a sort carries no formats and empty sort values.
+        LanceFragmentQueryResponse.DeferredHits unsorted = new LanceFragmentQueryResponse.DeferredHits(
+            new long[] { 5L },
+            new float[] { 1f },
+            new Object[][] { new Object[0] },
+            null
+        );
+        LanceFragmentQueryResponse scoreOrdered = new LanceFragmentQueryResponse(
+            1L,
+            false,
+            1,
+            List.of(),
+            new long[0],
+            null,
+            null,
+            null,
+            unsorted
+        );
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            scoreOrdered.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                LanceFragmentQueryResponse read = new LanceFragmentQueryResponse(in);
+                assertNull(read.deferredHits().formats());
+                assertEquals(0, read.deferredHits().sortValues()[0].length);
+                assertEquals(-1, in.read());
+            }
+        }
+        assertEquals(
+            "a response built without deferred hits reports none",
+            LanceFragmentQueryResponse.DeferredHits.NONE,
+            new LanceFragmentQueryResponse(2L, false, 1, List.of(), new long[0], null).deferredHits()
+        );
+    }
+
+    public void testResponseRefusesRenderedAndDeferredHitsTogether() {
+        SearchHit hit = new SearchHit(0, "0-3", Collections.emptyMap(), Collections.emptyMap());
+        LanceFragmentQueryResponse.DeferredHits deferred = new LanceFragmentQueryResponse.DeferredHits(
+            new long[] { 5L },
+            new float[] { 1f },
+            new Object[][] { new Object[0] },
+            null
+        );
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> new LanceFragmentQueryResponse(1L, false, 1, List.of(hit), new long[] { 3L }, null, null, null, deferred)
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("rendered hits or deferred hits"));
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> new LanceFragmentQueryResponse.DeferredHits(new long[] { 5L }, new float[0], new Object[][] { new Object[0] }, null)
+        );
+    }
+
+    public void testMixedPluginVersionAVersion4CoordinatorReadsTodaysResponseWithoutTheDeferredHits() throws Exception {
+        // A version 4 coordinator never asks for deferred hits, so the
+        // block it steps over is empty on a real cluster; here it holds
+        // a hit so the walk over an unknown, non empty block is pinned.
+        LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(
+            2L,
+            false,
+            1,
+            List.of(),
+            new long[0],
+            null,
+            Boolean.TRUE,
+            new LanceFragmentQueryResponse.Profile(12L, 3L, 4L, 47L, 9L, 8L, 2L),
+            new LanceFragmentQueryResponse.DeferredHits(new long[] { 5L }, new float[] { 1f }, new Object[][] { new Object[0] }, null)
+        );
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            original.writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                LanceFragmentQueryResponse asVersion4 = LanceFragmentQueryResponse.read(in, 4);
+                assertEquals(2L, asVersion4.matched());
+                assertEquals(original.profile(), asVersion4.profile());
+                assertEquals(
+                    "the deferred hits block is stepped over",
+                    LanceFragmentQueryResponse.DeferredHits.NONE,
+                    asVersion4.deferredHits()
+                );
+                assertEquals("the reader consumed the blocks", -1, in.read());
+            }
+        }
+    }
+
+    public void testMixedPluginVersionTodaysCoordinatorReadsAVersion4NodesResponse() throws Exception {
+        // The stream a version 4 data node writes: today's base fields
+        // and the timings, columns and scans blocks, no deferred hits
+        // block. Its hits are rendered, whatever the request asked.
+        LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(
+            2L,
+            false,
+            1,
+            List.of(),
+            new long[0],
+            null,
+            null,
+            new LanceFragmentQueryResponse.Profile(12L, 3L, 4L, 47L, 9L, 8L, 2L)
+        );
+        int deferredBlockBytes;
+        try (BytesStreamOutput block = new BytesStreamOutput()) {
+            WireVersion.writeBlock(block, false, LanceFragmentQueryResponse.DeferredHits.NONE);
+            deferredBlockBytes = block.bytes().length();
+        }
+        try (BytesStreamOutput today = new BytesStreamOutput(); BytesStreamOutput version4 = new BytesStreamOutput()) {
+            original.writeTo(today);
+            try (StreamInput in = today.bytes().streamInput()) {
+                assertEquals(LanceFragmentQueryResponse.WIRE_VERSION, in.readVInt());
+                byte[] rest = in.readAllBytes();
+                version4.writeVInt(4);
+                version4.writeBytes(rest, 0, rest.length - deferredBlockBytes);
+            }
+            try (StreamInput in = version4.bytes().streamInput()) {
+                LanceFragmentQueryResponse restored = new LanceFragmentQueryResponse(in);
+                assertEquals(2L, restored.matched());
+                assertEquals(original.profile(), restored.profile());
+                assertEquals("no block: no deferred hit", LanceFragmentQueryResponse.DeferredHits.NONE, restored.deferredHits());
+                assertEquals(-1, in.read());
+            }
         }
     }
 
@@ -553,7 +809,8 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
 
     public void testMixedPluginVersionTodaysCoordinatorReadsAVersion3NodesResponse() throws Exception {
         // The stream a version 3 data node writes: today's base fields,
-        // the timings block and the columns block, no scans block.
+        // the timings block and the columns block, no scans block and no
+        // deferred hits block.
         LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(
             2L,
             false,
@@ -567,6 +824,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         int scansBlockBytes;
         try (BytesStreamOutput block = new BytesStreamOutput()) {
             WireVersion.writeBlock(block, false, o -> o.writeVLong(original.profile().ftsScans()));
+            WireVersion.writeBlock(block, false, LanceFragmentQueryResponse.DeferredHits.NONE);
             scansBlockBytes = block.bytes().length();
         }
         try (BytesStreamOutput today = new BytesStreamOutput(); BytesStreamOutput version3 = new BytesStreamOutput()) {
@@ -618,7 +876,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
 
     public void testMixedPluginVersionTodaysCoordinatorReadsAVersion2NodesResponse() throws Exception {
         // The stream a version 2 data node writes: today's base fields
-        // and the timings block, no columns block and no scans block.
+        // and the timings block, no columns, scans or deferred hits block.
         LanceFragmentQueryResponse original = new LanceFragmentQueryResponse(
             2L,
             false,
@@ -633,6 +891,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
         try (BytesStreamOutput blocks = new BytesStreamOutput()) {
             WireVersion.writeBlock(blocks, false, o -> o.writeVLong(original.profile().takeColumns()));
             WireVersion.writeBlock(blocks, false, o -> o.writeVLong(original.profile().ftsScans()));
+            WireVersion.writeBlock(blocks, false, LanceFragmentQueryResponse.DeferredHits.NONE);
             laterBlockBytes = blocks.bytes().length();
         }
         try (BytesStreamOutput today = new BytesStreamOutput(); BytesStreamOutput version2 = new BytesStreamOutput()) {
@@ -697,6 +956,7 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
             WireVersion.writeBlock(blocks, false, original.profile());
             WireVersion.writeBlock(blocks, false, o -> o.writeVLong(original.profile().takeColumns()));
             WireVersion.writeBlock(blocks, false, o -> o.writeVLong(original.profile().ftsScans()));
+            WireVersion.writeBlock(blocks, false, LanceFragmentQueryResponse.DeferredHits.NONE);
             blockBytes = blocks.bytes().length();
         }
         try (BytesStreamOutput today = new BytesStreamOutput(); BytesStreamOutput version1 = new BytesStreamOutput()) {
@@ -724,8 +984,8 @@ public class LanceFragmentQuerySerializationTests extends OpenSearchTestCase {
                 assertEquals(LanceFragmentQueryResponse.WIRE_VERSION, in.readVInt());
             }
         }
-        // The stream a version 5 data node would write back to a version
-        // 4 coordinator: today's fields and one more optional block.
+        // The stream a version 6 data node would write back to a version
+        // 5 coordinator: today's fields and one more optional block.
         BytesReference newer = WireVersionTestSupport.asNextVersion(
             original,
             WireVersionTestSupport.NO_PRELUDE,

@@ -330,6 +330,24 @@ mapping's Lucene sort field type cannot type the page's sort values, when a curs
 missing-value sentinel, or when a reader wrapper is installed. Either way the hit envelope
 (`_source`, `_id`, sort values) is materialised through the fragment readers' stored-fields path.
 
+A page answered by two or more executors is rendered in a second round, the stock search's
+query then fetch. On the query round the coordinator sets `deferFetch` on every
+`LanceFragmentQueryRequest`; each executor collects its top `from + size` rows as before but
+returns only their row address, score and sort values (`LanceFragmentQueryResponse.deferredHits`)
+and takes nothing from Lance. `MergeReducer` merges those entries by the request's sort with the
+row address as tie break and cuts the window. `CoordinatorFetchPhase` then sends one
+`LanceFragmentFetchRequest` per data node that holds rows of the window, naming the rows by
+address and the manifest version the query round read; `TransportLanceFragmentFetchAction` takes
+the same snapshot from its `LanceWarmCache`, opens a reader over the fragments the addresses name
+and renders the rows through the same fetch phase, fetch cache and admission gate as a one round
+page, and the coordinator stamps the query round's score and sort values on the rendered hits.
+Without the split every executor renders its own `from + size` rows and the coordinator discards
+all but `size` of them, so a `size: 10` page over four nodes takes 40 rows from the object store
+for 10 it returns. A single executor, a `collapse` or `"explain": true` body and an index with a
+reader wrapper render on the query round (the fetch round has no search context to run the
+wrapper's decision in); `plugins.lance.fragment_path.defer_fetch: false` renders every page on the
+query round. A fetch round node that fails or times out fails the request.
+
 ## Planner design
 
 The planner exists to answer one question per request and node — which execution strategy runs
