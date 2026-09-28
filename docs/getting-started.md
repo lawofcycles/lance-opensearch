@@ -128,8 +128,8 @@ data = {
 
 table = pa.table(data, schema=schema)
 dataset = lance.write_dataset(table, "/absolute/path/to/tables/demo.lance", mode="create")
-# body stores token positions, which lance_match_phrase needs
-# (pylance defaults to none); title has no phrase example, so it is
+# with_position stores token positions, which lance_match_phrase needs
+# (pylance defaults it to False); title has no phrase example, so it is
 # indexed without them
 dataset.create_scalar_index("body", index_type="INVERTED", with_position=True)
 dataset.create_scalar_index("title", index_type="INVERTED")
@@ -190,8 +190,8 @@ dataset = lance.write_dataset(
     mode="create",
     storage_options=storage_options,
 )
-# body stores token positions, which lance_match_phrase needs
-# (pylance defaults to none); title has no phrase example, so it is
+# with_position stores token positions, which lance_match_phrase needs
+# (pylance defaults it to False); title has no phrase example, so it is
 # indexed without them
 dataset.create_scalar_index("body", index_type="INVERTED", with_position=True)
 dataset.create_scalar_index("title", index_type="INVERTED")
