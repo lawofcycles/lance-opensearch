@@ -393,8 +393,8 @@ coordinating node can see (whether a reader wrapper is installed, whether the pa
 Before the plan ships, the coordinator checks the query predicate against the zone maps of the
 table (`ZoneMapPruner`) and lists the fragments no matching row can come from in
 `FragmentPlan.excludedFragmentIds` (`excluded_fragment_ids` in the explain answer). A zone map
-index (`"scalar": "zonemap"` in the attach's `indexes` clause, or a zone map built on the table
-by another writer) records per zone, a run of `rows_per_zone` rows inside one fragment, the
+index (built on the table by its writer, pylance `create_scalar_index(col, "ZONEMAP")`)
+records per zone, a run of `rows_per_zone` rows inside one fragment, the
 column's minimum, maximum and null count. A fragment is excluded when every one of its zones is
 proven empty: for a comparison (`term`, `terms`, `range`, the bounds of a `date` term) the
 literal falls outside the zone's `[min, max]`, or the zone is all null; for `exists`
@@ -532,8 +532,7 @@ the plan (`LanceFragmentQueryRequest`, `LanceFragmentQueryResponse`) carry one f
 add around it: the request's marker guards the table, storage options, pinned version and the
 Lucene side builders, the plan's marker guards the plan, so a change to either bumps its own
 number. The per node stats request and the stats a node returns (`LanceStatsNodeRequest`,
-`LanceNodeStats`, the whole payload of `LanceStatsNodeResponse`), the per node `node_local` build
-request and response (`LanceBuildIndexesNodeRequest`, `LanceBuildIndexesNodeResponse`), the sync
+`LanceNodeStats`, the whole payload of `LanceStatsNodeResponse`), the sync
 request and response the shard's node answers (`LanceIndexSyncRequest`, `LanceIndexSyncResponse`),
 and the poll, namespace update and attach requests and responses the cluster manager answers
 (`LanceNamespacePollRequest`, `LanceNamespacePollResponse`, `LanceNamespaceUpdateRequest`,
@@ -542,11 +541,10 @@ The marker sits after the fields the OpenSearch base class writes (the parent ta
 the cluster manager timeout of a cluster manager request, the node of a per node response, the
 acknowledged bit of an acknowledged response), which OpenSearch versions itself, and before the
 first field the plugin owns. A `Writeable` nested in one of these messages without a marker of its
-own (`LanceBuildIndexesRequest` inside the node request, `KindResult` inside the node response, the
-records inside `LanceNodeStats`) is covered by the enclosing message's number, so a change to its
+own (the records inside `LanceNodeStats`) is covered by the enclosing message's number, so a change to its
 fields is a new block of that message. Messages the plugin only executes on the node that received
-the REST call (`LanceExplainRequest`, `LanceRefsRequest`, `LanceNamespaceListRequest`,
-`LanceBuildIndexesRequest` at the top level, and their responses) carry no marker: a
+the REST call (`LanceExplainRequest`, `LanceRefsRequest`, `LanceNamespaceListRequest` at the top
+level, and their responses) carry no marker: a
 `HandledTransportAction` invoked through the node client never serialises them.
 `LanceNamespaceMetadata` carries none either: it is cluster state, versioned and published by
 OpenSearch's own mechanism, and its backwards-compatibility policy is written on the class.

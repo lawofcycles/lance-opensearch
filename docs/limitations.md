@@ -10,7 +10,7 @@ Every `_search` over a Lance backed target runs on the fragment executors. A bod
 - `highlight`: refused, ``search body carries a `highlight` clause which needs full-text APIs Lance does not surface.`` Highlighting needs term positions in the stored text, which the Lance Java SDK does not expose. A body carrying both elements is refused for its `suggest`.
 - `inner_hits` on a `nested` query: refused, `[inner_hits] on the nested query [path=...] is not supported for Lance-backed indices`, by the dispatch filter before the coordinator runs, since neither the fragment executor nor the shard engine materialises the block. `inner_hits` under `collapse` is served ([features.md](features.md#query-shapes)).
 
-A request Lance refuses as invalid input (for example `lance_match_phrase` on an FTS index built without `with_position: true`) answers 400 `illegal_argument_exception` with Lance's message; [design/lance-error-mapping.md](design/lance-error-mapping.md) records how Lance's exceptions map onto the status.
+A request Lance refuses as invalid input (for example `lance_match_phrase` on an FTS index built without positions) answers 400 `illegal_argument_exception` with Lance's message; [design/lance-error-mapping.md](design/lance-error-mapping.md) records how Lance's exceptions map onto the status.
 
 ## Query types the field types refuse
 
@@ -233,15 +233,8 @@ Shipping one of the two would take the following changes. The alternative that a
 ## Index lifecycle
 
 - The engine is read-only. `_flush`, `_forcemerge`, `_settings` writes, `_close`, and `_open` on a Lance-backed index are either no-ops or unsupported; mutation happens on the Lance side.
-- Automatic index builds happen only for tables at or under `plugins.lance.builder.max_rows` (default 1,000,000). Larger tables need `POST /_plugins/_lance/build_indexes/{index}` explicitly, or a Lance-side build (Python `dataset.create_index`, Ray, Spark, Java SDK). Indexes built by the plugin still block subsequent `alter_columns` on the indexed column, so drop the index before altering the type.
+- The plugin creates no Lance index. A column gets its inverted, scalar, zone map or vector index from the table's writer (pylance `create_scalar_index` / `create_index`, Ray, Spark, the Java SDK), and the freshness check picks the index up at its manifest commit.
 - If an OpenSearch index already exists under the same name as a surfaced Lance table, the plugin logs one warning and leaves the table alone on every subsequent poll (`POST /_plugins/_lance/namespace/_poll` reports it under `skipped` with the reason). Rename, delete, or attach explicitly to resolve.
-- `index.plugins.lance.index_placement: node_local` (per-node shallow clones, see [features.md](features.md#attach-and-namespace-surface)) has these edges:
-  - The setting is only writable through `POST /_plugins/_lance/attach`; the namespace registration (`POST /_plugins/_lance/namespace`) does not take it, so namespace-surfaced tables always use `in_table`.
-  - There is no cross-node build coordination. A data node that joins after the build (or whose clone was re-created by a source version advance) answers FTS queries with the same 400 a column without an inverted index gets, until the next `POST /_plugins/_lance/build_indexes` run.
-  - A request whose data node cannot resolve its clone (an unreadable clone directory, a marker that cannot be rewritten, a source that cannot be opened for the shallow clone) fails with a 500 and `local_clones.resolution_failures` of that node in `GET /_plugins/_lance/stats` grows by one, over every index and under the index's name; the source is never read in its place.
-  - A source version advance re-creates the clone; indexes that only existed in the previous clone are gone until rebuilt. In-flight readers on the previous clone directory can fail if they load a column after the directory was dropped; the window is one refresh.
-  - The coordinator resolves fragment lists and counts against the source. Between a source advance and the per-node re-clone, counts from the source and hits from the clones can briefly disagree, the same class of staleness the refresh window already has.
-  - Object-store sources for `node_local` are not exercised; only local filesystem sources are covered by tests.
 
 ## Result cache
 
@@ -326,12 +319,7 @@ Items on the roadmap that no version of the plugin ships today.
   - The reader route reaches Lance's DataFusion-backed columnar aggregation for the shapes the [Aggregation pushdown](aggregations.md) covers, and Lance's scalar index resolver consults the Zone Map, BTree and Bitmap indexes whenever the scan carries a filter.
   - What the analytics route adds is a DataFusion runtime shared across plugins, the PPL and SQL entry points, and aggregation trees richer than the single `AggregateRel` root Lance accepts inside a scan; it is not the only path to SIMD aggregation or Zone Map pruning.
 - PPL / SQL integration (lives in `opensearch-project/sql`): not implemented.
-- Text analysis beyond the built-in OpenSearch analyzers: not implemented. The RFC's second text mode (a `type: text_analyzer` override that backfills a derived tokens column) ships, but it resolves globally registered analyzer names only.
-  - Custom analyzers composed in index settings (custom tokenizer + filter + synonym chains) are not resolvable at attach, because the attach creates the index and accepts no analysis settings.
-  - A query-time analyzer separate from the index-time one (`search_analyzer`) is not supported either; index and query use the same analyzer.
-  - Writers that keep appending rows must re-run the backfill themselves or re-attach: rows appended after the backfill have no derived tokens until then.
-  - A backfill is not resumed after a node restart or a failure: it is one `AddColumns` commit, so an interrupted run leaves no derived column, and re-attaching starts it again from the first row.
-  - On a large table (hundreds of millions of rows and more) the tokenizing is a few minutes on `plugins.lance.attach.backfill_threads` threads, after which Lance writes the derived column into the table's storage (about the source column's size again) and builds the inverted index over it; the plugin does not check the free space of the table's storage before it starts.
+- OpenSearch analyzers on a Lance column (the RFC's second text mode): not implemented. Full text queries run through the tokenizer of the table's inverted index; stemming, stop words and language handling are the writer's choice at index creation (Lance's tokenizer options).
 - Native ingestion via `_bulk` / `_doc` (RFC future work item 1): not implemented.
 - Lucene custom index type stored in `_indices/{uuid}/` (RFC future work item 2): not implemented.
 

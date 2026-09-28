@@ -7,8 +7,7 @@ plugin maps those onto HTTP status as follows.
 
 - An `IllegalArgumentException` that `LanceInvalidInput.isInvalidInput` recognises as Lance's answers
   400 `illegal_argument_exception` with Lance's message. The fragment executor reads it back out of
-  the `IOException` the Lucene `Weight` contract wrapped it in (`LanceInvalidInput.unwrap`), and
-  `POST /_plugins/_lance/build_indexes` reports it as `failed` with the flag that makes the response 400.
+  the `IOException` the Lucene `Weight` contract wrapped it in (`LanceInvalidInput.unwrap`).
 - `TaskCancelledException` and `CircuitBreakingException` pass through unchanged.
 - Any other exception, including an `IllegalArgumentException` the plugin's own code raised inside a
   scan, answers 500, so a plugin bug is not reported as the client's mistake.
