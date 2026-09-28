@@ -402,8 +402,8 @@ public class LanceStatsIT extends LanceRestTestCase {
     public void testFailureCountersAreReportedPerNode() throws Exception {
         // The counters of the paths that fail or fall back without a
         // mark in the response are present on every node, zero until one
-        // of those paths fails: a clone resolution (which fails its
-        // request), a table statistics collection, a zone map read.
+        // of those paths fails: a table statistics collection, a zone
+        // map read.
         Map<String, Object> node = nodeStats();
         @SuppressWarnings("unchecked")
         Map<String, Object> plan = (Map<String, Object>) node.get("plan");
@@ -415,10 +415,7 @@ public class LanceStatsIT extends LanceRestTestCase {
         Map<String, Object> pruned = (Map<String, Object>) plan.get("pruned");
         assertTrue("plan.pruned.zone_map_failures is reported: " + pruned, pruned.containsKey("zone_map_failures"));
         assertTrue(pruned.toString(), number(pruned.get("zone_map_failures")) >= 0);
-        @SuppressWarnings("unchecked")
-        Map<String, Object> localClones = (Map<String, Object>) node.get("local_clones");
-        assertTrue("local_clones.resolution_failures is reported: " + localClones, localClones.containsKey("resolution_failures"));
-        assertTrue(localClones.toString(), number(localClones.get("resolution_failures")) >= 0);
+        assertFalse("the node-local clone block is gone: " + node.keySet(), node.containsKey("local_clones"));
     }
 
     public void testStatsEnvelopeAndNodeFilter() throws Exception {
