@@ -647,16 +647,6 @@ public class LanceAttachIT extends LanceRestTestCase {
         assertTrue("expected message about must be a string: " + body, body.contains("must be a string"));
     }
 
-    public void testBuildIndexesOnUnknownIndexFails() throws IOException {
-        String unknown = "does-not-exist-" + randomAlphaOfLength(8);
-        ResponseException failure = expectThrows(
-            ResponseException.class,
-            () -> postJson("/_plugins/_lance/build_indexes/" + unknown, "{}")
-        );
-        int status = failure.getResponse().getStatusLine().getStatusCode();
-        assertEquals("expected 404 for unknown index, saw: " + status, 404, status);
-    }
-
     public void testAttachRecreateAtSamePathServesNewContent() throws Exception {
         // Attach, delete the index, recreate the Lance table at the same
         // path with different rows, re-attach. GET must see the recreated

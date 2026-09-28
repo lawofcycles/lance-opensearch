@@ -8,13 +8,10 @@ package org.opensearch.lance.attach;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.function.BooleanSupplier;
 
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -22,12 +19,10 @@ import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.apache.lucene.analysis.Analyzer;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
-import org.lance.schema.LanceField;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.OpenSearchStatusException;
 import org.opensearch.ResourceAlreadyExistsException;
@@ -48,9 +43,7 @@ import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.rest.RestStatus;
-import org.opensearch.index.analysis.AnalysisRegistry;
 import org.opensearch.lance.LanceInternalHeaders;
-import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.NativeMemoryLimit;
@@ -61,8 +54,6 @@ import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.namespace.AllowedTableRoots;
 import org.opensearch.lance.query.LanceInvalidInput;
 import org.opensearch.lance.rest.RestAttachAction;
-import org.opensearch.tasks.CancellableTask;
-import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 import org.opensearch.transport.client.Client;
@@ -114,7 +105,6 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
 
     private final Client client;
     private final AllowedTableRoots allowedRoots;
-    private final AnalysisRegistry analysisRegistry;
 
     @Inject
     public TransportLanceAttachAction(
@@ -124,8 +114,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         ActionFilters actionFilters,
         IndexNameExpressionResolver indexNameExpressionResolver,
         Client client,
-        AllowedTableRoots allowedRoots,
-        AnalysisRegistry analysisRegistry
+        AllowedTableRoots allowedRoots
     ) {
         super(
             LanceAttachAction.NAME,
@@ -138,7 +127,6 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         );
         this.client = client;
         this.allowedRoots = allowedRoots;
-        this.analysisRegistry = analysisRegistry;
     }
 
     @Override
@@ -164,25 +152,14 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
     @Override
     protected void clusterManagerOperation(LanceAttachRequest request, ClusterState state, ActionListener<LanceAttachResponse> listener)
         throws Exception {
-        clusterManagerOperation(null, request, state, listener);
-    }
-
-    @Override
-    protected void clusterManagerOperation(
-        Task task,
-        LanceAttachRequest request,
-        ClusterState state,
-        ActionListener<LanceAttachResponse> listener
-    ) throws Exception {
         // The state handed in here is not used: nothing before the
         // create depends on cluster state (allowlist and derivation
         // read the request and the table), and the one read that does,
         // the existing-index check, happens after the create has
         // failed with ResourceAlreadyExistsException, which this state
         // predates. verifyExistingLanceIndex reads a fresher state then.
-        BooleanSupplier cancelled = task instanceof CancellableTask cancellable ? cancellable::isCancelled : () -> false;
         try {
-            attach(request, cancelled, listener);
+            attach(request, listener);
         } catch (Exception e) {
             // A Lance open against an object store fails with the
             // store's error body in the message, and S3 echoes the
@@ -224,8 +201,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         return reported;
     }
 
-    private void attach(LanceAttachRequest request, BooleanSupplier cancelled, ActionListener<LanceAttachResponse> listener)
-        throws Exception {
+    private void attach(LanceAttachRequest request, ActionListener<LanceAttachResponse> listener) throws Exception {
         String table = request.table();
         if (!allowedRoots.allows(table)) {
             throw new OpenSearchStatusException(
@@ -260,7 +236,6 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
                 }
             }
         }
-        LanceAttachResponse.Backfill backfill = ensureAnalyzerDerivedColumns(request, openVersion, cancelled);
         RestAttachAction.Derivation derivation;
         long[] fragmentDocs;
         try (Dataset dataset = LanceRegistry.openDataset(table, request.storageOptions(), openVersion)) {
@@ -295,147 +270,9 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
             request.storageOptions(),
             request.pinnedVersion(),
             request.tag(),
-            request.indexPlacement(),
             luceneBoundExceeded,
-            backfill,
             listener
         );
-    }
-
-    /**
-     * The write side of the {@code type: text_analyzer} override, run
-     * before the mapping derivation so the derivation sees the derived
-     * tokens columns: resolve every declared analyzer name (unknown is
-     * a 400), then create, backfill and index the missing derived
-     * columns through {@link LanceTextAnalyzerBackfill}. With
-     * {@code derive: async} the backfill runs on the generic pool after
-     * this method returns and the derivation maps the base column by
-     * the default rules for now; the freshness check on the shard's node
-     * re-derives the mapping as the backfill commits advance the
-     * manifest, and the column flips to the analyzer mode at the commit
-     * that carries the derived column's inverted index. A snapshot pinned by
-     * {@code version} or {@code tag} cannot be written, so every
-     * derived column must already exist there.
-     *
-     * @return what the async backfill is about to do, for the attach
-     *     response; {@code null} when no async backfill was started
-     */
-    private LanceAttachResponse.Backfill ensureAnalyzerDerivedColumns(
-        LanceAttachRequest request,
-        Optional<Long> openVersion,
-        BooleanSupplier cancelled
-    ) throws Exception {
-        Map<String, LanceOverrides.Column> textAnalyzer = request.overrides().textAnalyzerColumns();
-        if (textAnalyzer.isEmpty()) {
-            return null;
-        }
-        Map<String, Analyzer> resolved = new LinkedHashMap<>();
-        for (Map.Entry<String, LanceOverrides.Column> entry : textAnalyzer.entrySet()) {
-            String analyzerName = entry.getValue().analyzer();
-            Analyzer analyzer;
-            try {
-                analyzer = analysisRegistry.getAnalyzer(analyzerName);
-            } catch (Exception e) {
-                throw new OpenSearchStatusException(
-                    "[overrides." + entry.getKey() + ".analyzer=" + analyzerName + "] could not be built: " + e.getMessage(),
-                    RestStatus.BAD_REQUEST,
-                    e
-                );
-            }
-            if (analyzer == null) {
-                throw new OpenSearchStatusException(
-                    "[overrides."
-                        + entry.getKey()
-                        + ".analyzer="
-                        + analyzerName
-                        + "] does not name a built-in OpenSearch analyzer; index-scoped custom analyzers are not resolvable at attach",
-                    RestStatus.BAD_REQUEST
-                );
-            }
-            resolved.put(entry.getKey(), analyzer);
-        }
-        if (openVersion.isPresent()) {
-            // A pinned snapshot is readonly by design: the backfill
-            // commit would land after the pin and never be visible. The
-            // attach may still pin a version where a derived column
-            // already exists (a re-attach of an already-derived table).
-            try (Dataset pinned = LanceRegistry.openDataset(request.table(), request.storageOptions(), openVersion)) {
-                Set<String> names = new HashSet<>();
-                for (LanceField field : pinned.getLanceSchema().fields()) {
-                    names.add(field.getName());
-                }
-                for (Map.Entry<String, LanceOverrides.Column> entry : textAnalyzer.entrySet()) {
-                    String derived = LanceOverrides.derivedColumnName(entry.getKey(), entry.getValue());
-                    if (!names.contains(derived)) {
-                        throw new OpenSearchStatusException(
-                            "[overrides."
-                                + entry.getKey()
-                                + ".type=text_analyzer] cannot backfill derived column ["
-                                + derived
-                                + "] on a snapshot pinned by [version] or [tag]; attach the latest version first, or pin a "
-                                + "version that already carries the derived column",
-                            RestStatus.BAD_REQUEST
-                        );
-                    }
-                }
-            }
-            return null;
-        }
-        int threads = clusterService.getClusterSettings().get(LancePlugin.ATTACH_BACKFILL_THREADS_SETTING);
-        if (request.asyncDerive()) {
-            String table = request.table();
-            // Size the work before answering: the response tells the
-            // operator about how much the table grows and on how many
-            // threads, and the estimate reads one sample batch per
-            // column, which is cheap next to the attach's own scans.
-            long estimatedBytes = 0L;
-            try (Dataset dataset = LanceRegistry.openDataset(table, request.storageOptions())) {
-                for (String base : LanceTextAnalyzerBackfill.missingDerivedColumns(dataset, textAnalyzer).keySet()) {
-                    estimatedBytes += LanceTextAnalyzerBackfill.estimateDerivedBytes(dataset, base);
-                }
-            }
-            // The attach task is done once the response leaves, so an
-            // async backfill cannot be cancelled through it; it runs to
-            // completion or fails on its own.
-            LanceTextAnalyzerBackfill.Options asyncOptions = new LanceTextAnalyzerBackfill.Options(
-                threadPool.generic(),
-                threads,
-                () -> false
-            );
-            threadPool.generic().execute(() -> {
-                try (Dataset dataset = LanceRegistry.openDataset(table, request.storageOptions())) {
-                    LanceTextAnalyzerBackfill.Ensured ensured = LanceTextAnalyzerBackfill.ensureDerivedColumns(
-                        dataset,
-                        textAnalyzer,
-                        resolved::get,
-                        LanceRegistry.allocator(),
-                        asyncOptions
-                    );
-                    LOG.info(
-                        "async text_analyzer backfill finished for table {}: created {}, already present {}",
-                        table,
-                        ensured.created(),
-                        ensured.existing()
-                    );
-                } catch (Exception e) {
-                    LOG.warn(
-                        "async text_analyzer backfill failed for table {}; re-attach to retry",
-                        table,
-                        StorageOptions.redactCredentials(e)
-                    );
-                }
-            });
-            return new LanceAttachResponse.Backfill(estimatedBytes, "none", threads);
-        }
-        try (Dataset dataset = LanceRegistry.openDataset(request.table(), request.storageOptions())) {
-            LanceTextAnalyzerBackfill.Options options = new LanceTextAnalyzerBackfill.Options(threadPool.generic(), threads, cancelled);
-            try {
-                LanceTextAnalyzerBackfill.ensureDerivedColumns(dataset, textAnalyzer, resolved::get, LanceRegistry.allocator(), options);
-            } catch (IllegalArgumentException e) {
-                throw new OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST, e);
-            }
-        }
-        return null;
     }
 
     /**
@@ -583,9 +420,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         StorageOptions storageOptions,
         Optional<Long> pinnedVersion,
         Optional<String> tag,
-        Optional<String> indexPlacement,
         boolean luceneBoundExceeded,
-        LanceAttachResponse.Backfill backfill,
         ActionListener<LanceAttachResponse> listener
     ) {
         Settings.Builder settings = Settings.builder()
@@ -599,7 +434,6 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         }
         pinnedVersion.ifPresent(v -> settings.put(LanceEngineFactory.VERSION_SETTING, v));
         tag.ifPresent(t -> settings.put(LanceEngineFactory.TAG_SETTING, t));
-        indexPlacement.ifPresent(p -> settings.put(LanceEngineFactory.INDEX_PLACEMENT_SETTING, p));
         storageOptions.writeToSettings(settings);
         CreateIndexRequest create = new CreateIndexRequest(indexName).settings(settings.build()).mapping(derivation.mappingJson());
 
@@ -633,7 +467,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
                     // index's shard picks it up for freshness checks from
                     // its settings (table, tag, storage options), and a
                     // pinned index is left alone there by design.
-                    responding.onResponse(response(indexName, table, derivation, false, luceneBoundExceeded, backfill));
+                    responding.onResponse(response(indexName, table, derivation, false, luceneBoundExceeded));
                 }
 
                 @Override
@@ -646,7 +480,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
                     // for the same table before claiming success; otherwise
                     // attach would silently take credit for an unrelated
                     // index.
-                    verifyExistingLanceIndex(indexName, table, derivation, storageOptions, luceneBoundExceeded, backfill, responding);
+                    verifyExistingLanceIndex(indexName, table, derivation, storageOptions, luceneBoundExceeded, responding);
                 }
             });
         }
@@ -658,7 +492,6 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         RestAttachAction.Derivation derivation,
         StorageOptions storageOptions,
         boolean luceneBoundExceeded,
-        LanceAttachResponse.Backfill backfill,
         ActionListener<LanceAttachResponse> listener
     ) {
         // This runs on the elected cluster manager, whose applied state
@@ -700,7 +533,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         }
         // Same table: the existing index keeps following its own
         // settings (its version pin or tag), whatever this request named.
-        listener.onResponse(response(indexName, table, derivation, true, luceneBoundExceeded, backfill));
+        listener.onResponse(response(indexName, table, derivation, true, luceneBoundExceeded));
     }
 
     private static LanceAttachResponse response(
@@ -708,8 +541,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         String table,
         RestAttachAction.Derivation derivation,
         boolean alreadyAttached,
-        boolean luceneBoundExceeded,
-        LanceAttachResponse.Backfill backfill
+        boolean luceneBoundExceeded
     ) {
         return new LanceAttachResponse(
             indexName,
@@ -721,8 +553,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
             derivation.mappingJson(),
             derivation.notes(),
             alreadyAttached,
-            luceneBoundExceeded,
-            backfill
+            luceneBoundExceeded
         );
     }
 

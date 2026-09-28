@@ -29,9 +29,8 @@ import org.opensearch.lance.StorageOptions;
  * report so the client sees Lance's message with the status the
  * criterion below assigns.
  *
- * <p>{@code LanceIndexBuilder} classifies a failed index build through
- * {@link #isInvalidInput} on the exception it caught directly; a scan
- * failure arrives wrapped, so {@link #find} additionally walks the
+ * <p>{@link #isInvalidInput} classifies an exception caught directly; a
+ * scan failure arrives wrapped, so {@link #find} additionally walks the
  * cause chain. Both accept only an {@code IllegalArgumentException}
  * that Lance produced.
  *

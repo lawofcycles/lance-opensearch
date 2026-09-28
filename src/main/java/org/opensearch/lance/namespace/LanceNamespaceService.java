@@ -75,7 +75,6 @@ public final class LanceNamespaceService implements Closeable {
     private final Client client;
     private final ClusterService clusterService;
     private final TimeValue cadence;
-    private final long builderMaxRows;
     private final AllowedTableRoots allowedRoots;
     /**
      * Per-node cache of the runtime {@link LanceNamespace} handles
@@ -125,14 +124,8 @@ public final class LanceNamespaceService implements Closeable {
     /** The applier listener as registered, so {@link #close} can take it off the cluster service again. */
     private final ClusterStateListener stateListener = this::onClusterStateChanged;
 
-    public LanceNamespaceService(
-        Client client,
-        ClusterService clusterService,
-        ThreadPool threadPool,
-        TimeValue cadence,
-        long builderMaxRows
-    ) {
-        this(client, clusterService, threadPool, cadence, builderMaxRows, TimeValue.timeValueHours(1));
+    public LanceNamespaceService(Client client, ClusterService clusterService, ThreadPool threadPool, TimeValue cadence) {
+        this(client, clusterService, threadPool, cadence, TimeValue.timeValueHours(1));
     }
 
     public LanceNamespaceService(
@@ -140,10 +133,9 @@ public final class LanceNamespaceService implements Closeable {
         ClusterService clusterService,
         ThreadPool threadPool,
         TimeValue cadence,
-        long builderMaxRows,
         TimeValue resurfaceGrace
     ) {
-        this(client, clusterService, threadPool, cadence, builderMaxRows, resurfaceGrace, null, new AllowedTableRoots(List.of()));
+        this(client, clusterService, threadPool, cadence, resurfaceGrace, null, new AllowedTableRoots(List.of()));
     }
 
     public LanceNamespaceService(
@@ -151,11 +143,10 @@ public final class LanceNamespaceService implements Closeable {
         ClusterService clusterService,
         ThreadPool threadPool,
         TimeValue cadence,
-        long builderMaxRows,
         TimeValue resurfaceGrace,
         LanceWarmCache warmCache
     ) {
-        this(client, clusterService, threadPool, cadence, builderMaxRows, resurfaceGrace, warmCache, new AllowedTableRoots(List.of()));
+        this(client, clusterService, threadPool, cadence, resurfaceGrace, warmCache, new AllowedTableRoots(List.of()));
     }
 
     /**
@@ -171,7 +162,6 @@ public final class LanceNamespaceService implements Closeable {
         ClusterService clusterService,
         ThreadPool threadPool,
         TimeValue cadence,
-        long builderMaxRows,
         TimeValue resurfaceGrace,
         LanceWarmCache warmCache,
         AllowedTableRoots allowedRoots
@@ -180,7 +170,6 @@ public final class LanceNamespaceService implements Closeable {
         this.clusterService = clusterService;
         this.threadPool = threadPool;
         this.cadence = cadence;
-        this.builderMaxRows = builderMaxRows;
         this.warmCache = warmCache;
         this.allowedRoots = allowedRoots;
         this.resurfaceGuard = new LanceResurfaceGuard(resurfaceGrace);
@@ -816,9 +805,7 @@ public final class LanceNamespaceService implements Closeable {
         RestAttachAction.Derivation derivation;
         try (Dataset dataset = LanceRegistry.openDataset(table, storageOptions)) {
             // Derive first so the CreateIndex settings and mapping reflect
-            // the current Lance schema. Automatic index creation is off by
-            // default; operators build indexes explicitly through
-            // POST /_plugins/_lance/build_indexes.
+            // the current Lance schema.
             derivation = RestAttachAction.derive(dataset, overrides, true);
         }
         if (!derivation.notes().isEmpty() && LOG.isDebugEnabled()) {

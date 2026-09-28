@@ -6,19 +6,15 @@
 package org.opensearch.lance.attach;
 
 import java.io.IOException;
-import java.util.Map;
 import java.util.Optional;
 
 import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.action.support.clustermanager.ClusterManagerNodeRequest;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
-import org.opensearch.core.tasks.TaskId;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.WireVersion;
-import org.opensearch.tasks.CancellableTask;
-import org.opensearch.tasks.Task;
 
 /**
  * Request for {@link LanceAttachAction}: the parsed body of
@@ -41,31 +37,6 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
     private final String tag;
     private final StorageOptions storageOptions;
     private final LanceOverrides overrides;
-    private final String indexPlacement;
-    private final boolean asyncDerive;
-
-    public LanceAttachRequest(
-        String table,
-        String indexName,
-        Long pinnedVersion,
-        String tag,
-        StorageOptions storageOptions,
-        LanceOverrides overrides
-    ) {
-        this(table, indexName, pinnedVersion, tag, storageOptions, overrides, null, false);
-    }
-
-    public LanceAttachRequest(
-        String table,
-        String indexName,
-        Long pinnedVersion,
-        String tag,
-        StorageOptions storageOptions,
-        LanceOverrides overrides,
-        String indexPlacement
-    ) {
-        this(table, indexName, pinnedVersion, tag, storageOptions, overrides, indexPlacement, false);
-    }
 
     /**
      * @param table          Lance table URI to attach.
@@ -79,15 +50,6 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
      * @param overrides      per-column mapping overrides, already merged
      *                       from the {@code overrides} and legacy
      *                       {@code multi_fields} clauses.
-     * @param indexPlacement {@code "node_local"} to build and read search
-     *                       structures from per-node shallow clones,
-     *                       {@code "in_table"} or {@code null} for the
-     *                       default in-table commits.
-     * @param asyncDerive    {@code true} to run the text_analyzer backfill
-     *                       in the background after the attach answers;
-     *                       {@code false} (the default) blocks the attach
-     *                       until the derived tokens columns are written
-     *                       and indexed.
      */
     public LanceAttachRequest(
         String table,
@@ -95,9 +57,7 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
         Long pinnedVersion,
         String tag,
         StorageOptions storageOptions,
-        LanceOverrides overrides,
-        String indexPlacement,
-        boolean asyncDerive
+        LanceOverrides overrides
     ) {
         this.table = table;
         this.indexName = indexName;
@@ -105,8 +65,6 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
         this.tag = tag;
         this.storageOptions = storageOptions == null ? StorageOptions.empty() : storageOptions;
         this.overrides = overrides == null ? LanceOverrides.EMPTY : overrides;
-        this.indexPlacement = indexPlacement;
-        this.asyncDerive = asyncDerive;
     }
 
     public LanceAttachRequest(StreamInput in) throws IOException {
@@ -122,8 +80,6 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
         // bytes that end up in the index setting. Declaration order
         // survives because the JSON object preserves it.
         this.overrides = LanceOverrides.parse(in.readString());
-        this.indexPlacement = in.readOptionalString();
-        this.asyncDerive = in.readBoolean();
         reader.finish();
     }
 
@@ -137,24 +93,6 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
         out.writeOptionalString(tag);
         storageOptions.writeTo(out);
         out.writeString(overrides.toJson());
-        out.writeOptionalString(indexPlacement);
-        out.writeBoolean(asyncDerive);
-    }
-
-    /**
-     * A cancellable task, so {@code POST _tasks/<id>/_cancel} on a
-     * blocking ({@code derive: sync}) attach stops its text_analyzer
-     * backfill between two batches; the pending {@code AddColumns}
-     * then commits nothing.
-     */
-    @Override
-    public Task createTask(long id, String type, String action, TaskId parentTaskId, Map<String, String> headers) {
-        return new CancellableTask(id, type, action, "lance attach " + table, parentTaskId, headers) {
-            @Override
-            public boolean shouldCancelChildrenOnCancellation() {
-                return true;
-            }
-        };
     }
 
     @Override
@@ -184,12 +122,6 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
             }
             ex.addValidationError("[version] and [tag] are mutually exclusive");
         }
-        if (indexPlacement != null && !"in_table".equals(indexPlacement) && !"node_local".equals(indexPlacement)) {
-            if (ex == null) {
-                ex = new ActionRequestValidationException();
-            }
-            ex.addValidationError("[index_placement] must be 'in_table' or 'node_local'");
-        }
         return ex;
     }
 
@@ -217,18 +149,5 @@ public final class LanceAttachRequest extends ClusterManagerNodeRequest<LanceAtt
 
     public LanceOverrides overrides() {
         return overrides;
-    }
-
-    /**
-     * Requested {@code index.plugins.lance.index_placement}, or empty for the
-     * default ({@code in_table}).
-     */
-    public Optional<String> indexPlacement() {
-        return Optional.ofNullable(indexPlacement);
-    }
-
-    /** Whether the text_analyzer backfill runs in the background after the attach answers. */
-    public boolean asyncDerive() {
-        return asyncDerive;
     }
 }

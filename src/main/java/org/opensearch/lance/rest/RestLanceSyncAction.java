@@ -25,8 +25,7 @@ import org.opensearch.transport.client.node.NodeClient;
  * on the generic pool. Idempotent: a check that finds the shard at the
  * table's version does nothing and answers {@code moved: false}.
  *
- * <p>The index comes after the verb, as in {@code build_indexes/{index}}
- * and {@code refs/{index}}, because {@code /_plugins/_lance/{index}/_sync}
+ * <p>The index comes after the verb, as in {@code refs/{index}}, because {@code /_plugins/_lance/{index}/_sync}
  * would put an {@code {index}} wildcard on the same path segment as the
  * {@code {node_id}} of {@code /_plugins/_lance/{node_id}/stats}, which
  * the REST path trie rejects at registration.

@@ -77,7 +77,7 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
         clusterService = ClusterServiceUtils.createClusterService(threadPool);
         // A one-hour cadence keeps the scheduled poll from firing during a
         // unit test, so the tests only see the state we drive explicitly.
-        service = new LanceNamespaceService(client, clusterService, threadPool, TimeValue.timeValueHours(1), 1_000_000L);
+        service = new LanceNamespaceService(client, clusterService, threadPool, TimeValue.timeValueHours(1));
     }
 
     @Override
@@ -110,13 +110,7 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
             }
         };
         try {
-            LanceNamespaceService polling = new LanceNamespaceService(
-                client,
-                clusterService,
-                counting,
-                TimeValue.timeValueMillis(20),
-                1_000_000L
-            );
+            LanceNamespaceService polling = new LanceNamespaceService(client, clusterService, counting, TimeValue.timeValueMillis(20));
             assertNotNull("the poll was scheduled on the thread pool", scheduled.get());
             assertBusy(() -> assertTrue("the poll fires at its cadence", cycles.get() >= 2));
             polling.close();
@@ -180,13 +174,7 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
         recording.tables = Set.of("orders");
         LanceNamespaceFactory.setInstantiatorForTests(type -> recording);
         RecordingNoOpClient recordingClient = new RecordingNoOpClient(threadPool);
-        LanceNamespaceService listing = new LanceNamespaceService(
-            recordingClient,
-            clusterService,
-            threadPool,
-            TimeValue.timeValueHours(1),
-            1_000_000L
-        );
+        LanceNamespaceService listing = new LanceNamespaceService(recordingClient, clusterService, threadPool, TimeValue.timeValueHours(1));
         try {
             String root = "/no-such-root-" + randomAlphaOfLength(6);
             LanceNamespaceMetadata metadata = LanceNamespaceMetadata.EMPTY.withRegistered(
@@ -228,13 +216,7 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
         recording.tables = Set.of("orders");
         LanceNamespaceFactory.setInstantiatorForTests(type -> recording);
         RecordingNoOpClient recordingClient = new RecordingNoOpClient(threadPool);
-        LanceNamespaceService listing = new LanceNamespaceService(
-            recordingClient,
-            clusterService,
-            threadPool,
-            TimeValue.timeValueHours(1),
-            1_000_000L
-        );
+        LanceNamespaceService listing = new LanceNamespaceService(recordingClient, clusterService, threadPool, TimeValue.timeValueHours(1));
         try {
             String root = "/no-such-root-" + randomAlphaOfLength(6);
             LanceNamespaceMetadata metadata = LanceNamespaceMetadata.EMPTY.withRegistered(
@@ -682,7 +664,6 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
             clusterService,
             threadPool,
             TimeValue.timeValueHours(1),
-            1_000_000L,
             TimeValue.timeValueHours(1),
             null,
             new AllowedTableRoots(List.of("/allowed"))
