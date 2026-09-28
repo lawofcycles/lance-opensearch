@@ -277,38 +277,7 @@ public final class LanceFragmentSchema {
         Map<String, String> nestedChildToParent = new LinkedHashMap<>();
         List<String> topLevelOrder = new ArrayList<>();
         try {
-            // A text_analyzer override hides its derived tokens column
-            // from the reader (no FieldInfo, no _source entry: queries
-            // reach it through Lance directly) and serves the base
-            // column like any other lance_text column (FieldInfo only)
-            // once the derived column exists and carries its inverted
-            // index. The backfill commits the column and the index
-            // separately; until the index commit the base keeps its
-            // default classification, matching the mapping derivation's
-            // fallback, so no query runs against the unindexed column.
-            Set<String> derivedTokensColumns = new HashSet<>();
-            Set<String> analyzerModeBases = new HashSet<>();
-            if (overrides != null && !overrides.textAnalyzerColumns().isEmpty()) {
-                Set<String> utf8Columns = new HashSet<>();
-                for (Field field : dataset.getSchema().getFields()) {
-                    if (field.getType() instanceof ArrowType.Utf8) {
-                        utf8Columns.add(field.getName());
-                    }
-                }
-                for (Map.Entry<String, LanceOverrides.Column> entry : overrides.textAnalyzerColumns().entrySet()) {
-                    String derived = LanceOverrides.derivedColumnName(entry.getKey(), entry.getValue());
-                    if (utf8Columns.contains(derived)) {
-                        derivedTokensColumns.add(derived);
-                        if (utf8Columns.contains(entry.getKey()) && ftsColumns.contains(derived)) {
-                            analyzerModeBases.add(entry.getKey());
-                        }
-                    }
-                }
-            }
             for (Field field : dataset.getSchema().getFields()) {
-                if (derivedTokensColumns.contains(field.getName())) {
-                    continue;
-                }
                 if (geoOverridden.containsKey(field.getName())) {
                     // Geo override first: it replaces both the object
                     // classification a Struct would get and the null a
@@ -356,7 +325,7 @@ public final class LanceFragmentSchema {
                     continue;
                 }
                 if (kind == ColumnKind.TEXT_FTS) {
-                    kind = (ftsColumns.contains(field.getName()) || analyzerModeBases.contains(field.getName()))
+                    kind = ftsColumns.contains(field.getName())
                         && !keywordOverridden.contains(field.getName())
                         && !ipOverridden.contains(field.getName()) ? ColumnKind.TEXT_FTS : ColumnKind.TEXT_KEYWORD;
                 }

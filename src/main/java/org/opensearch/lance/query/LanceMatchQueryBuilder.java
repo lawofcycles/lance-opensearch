@@ -302,8 +302,8 @@ public class LanceMatchQueryBuilder extends AbstractQueryBuilder<LanceMatchQuery
             );
         }
         return FullTextQuery.match(
-            textType.searchText(context, query),
-            textType.lanceColumn(),
+            query,
+            textType.name(),
             1f,
             fuzziness == null ? Optional.empty() : Optional.of(fuzziness),
             maxExpansions,

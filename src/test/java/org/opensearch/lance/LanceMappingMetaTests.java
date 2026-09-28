@@ -69,7 +69,7 @@ public class LanceMappingMetaTests extends OpenSearchTestCase {
         MappingMetadata metadata = mapping(
             Map.of(
                 "body",
-                Map.of("type", "lance_text", "tokens_column", "body__lance_tokens"),
+                Map.of("type", "lance_text"),
                 "old_title",
                 field("lance_text", "3", "Utf8", true),
                 "category",
@@ -81,10 +81,6 @@ public class LanceMappingMetaTests extends OpenSearchTestCase {
         assertEquals(Set.of("body", "old_title"), LanceMappingMeta.lanceTextFields(metadata));
         assertTrue(LanceMappingMeta.lanceTextFields(null).isEmpty());
         assertTrue(LanceMappingMeta.lanceTextFields(new MappingMetadata("_doc", Map.of())).isEmpty());
-        // The column each field's full text queries read: the tokens
-        // column in the analyzer mode, the field itself otherwise.
-        assertEquals(Map.of("body", "body__lance_tokens", "old_title", "old_title"), LanceMappingMeta.lanceTextColumns(metadata));
-        assertTrue(LanceMappingMeta.lanceTextColumns(null).isEmpty());
     }
 
     public void testIsDroppedReadsTheMarker() {
