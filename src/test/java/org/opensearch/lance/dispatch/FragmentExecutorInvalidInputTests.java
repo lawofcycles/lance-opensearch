@@ -11,23 +11,18 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 import java.nio.file.Path;
 import java.util.Collection;
 import java.util.List;
-import java.util.Optional;
-import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
-import org.lance.Dataset;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.lance.LancePlugin;
-import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.attach.LanceAttachAction;
 import org.opensearch.lance.attach.LanceAttachRequest;
 import org.opensearch.lance.attach.LanceAttachResponse;
-import org.opensearch.lance.engine.LanceIndexBuilder;
 import org.opensearch.lance.query.LanceInvalidInput;
 import org.opensearch.lance.query.LanceMatchPhraseQueryBuilder;
 import org.opensearch.lance.query.LanceMatchQueryBuilder;
@@ -37,8 +32,8 @@ import org.opensearch.test.OpenSearchSingleNodeTestCase;
 /**
  * A request Lance refuses as invalid input fails the fragment executor
  * with the status of a client error. The fixture's {@code category}
- * column gets an inverted index without positions, which is what
- * {@code build_indexes} creates by default, so a phrase query on it
+ * column gets an inverted index without positions, Lance's default, so
+ * a phrase query on it
  * makes Lance throw {@code IllegalArgumentException} inside the FTS
  * scan; the executor must report that exception rather than the
  * {@code IOException} the Lucene Weight contract wrapped it in.
@@ -62,18 +57,7 @@ public class FragmentExecutorInvalidInputTests extends OpenSearchSingleNodeTestC
     private String attachWithPositionlessIndex(String indexName) throws Exception {
         Path dir = createTempDir();
         String tableUri = LanceTableFactory.writeInterleavedTable(dir, indexName, FRAGMENTS, ROWS_PER_FRAGMENT);
-        try (Dataset dataset = LanceRegistry.openDataset(tableUri, StorageOptions.empty())) {
-            LanceIndexBuilder.BuildResult built = LanceIndexBuilder.ensureFtsIndexes(
-                dataset,
-                Set.of("category"),
-                Long.MAX_VALUE,
-                Optional.empty(),
-                LanceIndexBuilder.DEFAULT_FTS_TOKENIZER,
-                /* withPosition */ false
-            );
-            assertEquals("fts build failures: " + built.failed(), 0, built.failed().size());
-            assertEquals(List.of(new LanceIndexBuilder.Built("category", "INVERTED")), built.built());
-        }
+        LanceTableFactory.createFtsIndex(tableUri, "category", "simple", false);
         LanceAttachResponse attached = client().execute(
             LanceAttachAction.INSTANCE,
             new LanceAttachRequest(tableUri, indexName, null, null, StorageOptions.empty(), null)

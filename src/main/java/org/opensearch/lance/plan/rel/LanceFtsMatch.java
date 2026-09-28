@@ -76,8 +76,7 @@ public final class LanceFtsMatch extends SingleRel {
     /**
      * @param kind the FTS shape of {@code ftsClause}
      * @param columns the Lance columns the scan reads for the clause,
-     *     in declaration order: the derived tokens column of a field in
-     *     the analyzer mode, otherwise the field's own column
+     *     in declaration order
      * @param ftsClause the parsed DSL builder; implements
      *     {@code LanceFtsQueryBuilder} and prints every parameter as
      *     its JSON
@@ -101,7 +100,7 @@ public final class LanceFtsMatch extends SingleRel {
         return kind;
     }
 
-    /** The Lance columns the scan reads for the clause (the derived tokens column of an analyzer mode field). */
+    /** The Lance columns the scan reads for the clause. */
     public List<String> columns() {
         return columns;
     }

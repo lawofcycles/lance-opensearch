@@ -6,12 +6,10 @@
 package org.opensearch.lance.mapper;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 
@@ -27,7 +25,6 @@ import org.apache.lucene.util.BytesRef;
 import org.lance.ipc.FullTextQuery;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.unit.Fuzziness;
-import org.opensearch.index.analysis.NamedAnalyzer;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.ParametrizedFieldMapper;
 import org.opensearch.index.mapper.ParseContext;
@@ -35,7 +32,6 @@ import org.opensearch.index.mapper.SourceValueFetcher;
 import org.opensearch.index.mapper.TextSearchInfo;
 import org.opensearch.index.mapper.ValueFetcher;
 import org.opensearch.index.query.QueryShardContext;
-import org.opensearch.lance.attach.LanceTextAnalyzerBackfill;
 import org.opensearch.lance.query.LanceFtsQuery;
 import org.opensearch.lance.query.LanceScanFilterQuery;
 import org.opensearch.lance.query.LanceStringPatternSql;
@@ -44,10 +40,7 @@ import org.opensearch.search.lookup.SearchLookup;
 /**
  * Field type "lance_text". Term, match, phrase and fuzzy queries on it
  * are rewritten to Lance FTS execution; wildcard, regexp and prefix
- * queries to a Lance scan filter over the raw column. The optional
- * "tokens_column" parameter selects the RFC's analyzer mode: term and
- * match queries target the derived column holding OpenSearch-analyzed
- * tokens instead of the raw column.
+ * queries to a Lance scan filter over the raw column.
  *
  * <p>The field's {@link TextSearchInfo} decides how OpenSearch's stock
  * {@code match} family reaches the field type. The search analyzer is
@@ -62,32 +55,14 @@ import org.opensearch.search.lookup.SearchLookup;
  * Lance as one phrase query with the requested slop; a one word
  * {@code match_phrase} takes the term path, whose hits are the same. The
  * Lucene field type declares positions so core's phrase parser accepts
- * the field (the inverted index stores positions when it was built with
- * {@code with_position}; Lance refuses the phrase itself otherwise).
+ * the field (the inverted index stores positions when its writer built
+ * it with positions; Lance refuses the phrase itself otherwise).
  */
 public class LanceTextFieldMapper extends ParametrizedFieldMapper {
 
     public static final String CONTENT_TYPE = "lance_text";
 
-    private final String tokensColumn;
-
     public static class Builder extends ParametrizedFieldMapper.Builder {
-        /**
-         * A mapping update may set {@code tokens_column} on a field that
-         * had none: an analyzer mode attach with {@code derive: async}
-         * maps a column that already carries a Lance inverted index as
-         * plain {@code lance_text} until the backfill commits, and the
-         * re-derivation after that commit adds the derived column's
-         * name. Once set, the name cannot change or be removed: the
-         * derived column is what the queries target, so renaming it is
-         * a re-attach.
-         */
-        private final Parameter<String> tokensColumn = Parameter.stringParam(
-            "tokens_column",
-            false,
-            m -> ((LanceTextFieldMapper) m).tokensColumn,
-            null
-        ).acceptsNull().setMergeValidator((previous, updated) -> previous == null || Objects.equals(previous, updated));
         private final Parameter<Map<String, String>> meta = Parameter.metaParam();
 
         public Builder(String name) {
@@ -96,14 +71,14 @@ public class LanceTextFieldMapper extends ParametrizedFieldMapper {
 
         @Override
         protected List<Parameter<?>> getParameters() {
-            return Arrays.asList(tokensColumn, meta);
+            return Arrays.asList(meta);
         }
 
         @Override
         public LanceTextFieldMapper build(BuilderContext context) {
             return new LanceTextFieldMapper(
                 name,
-                new LanceTextFieldType(buildFullName(context), tokensColumn.getValue(), meta.getValue()),
+                new LanceTextFieldType(buildFullName(context), meta.getValue()),
                 multiFieldsBuilder.build(this, context),
                 copyTo.build(),
                 this
@@ -141,11 +116,8 @@ public class LanceTextFieldMapper extends ParametrizedFieldMapper {
             Lucene.WHITESPACE_ANALYZER
         );
 
-        private final String tokensColumn;
-
-        LanceTextFieldType(String name, String tokensColumn, Map<String, String> meta) {
+        LanceTextFieldType(String name, Map<String, String> meta) {
             super(name, true, false, false, TEXT_SEARCH_INFO, meta);
-            this.tokensColumn = tokensColumn;
         }
 
         @Override
@@ -153,65 +125,11 @@ public class LanceTextFieldMapper extends ParametrizedFieldMapper {
             return CONTENT_TYPE;
         }
 
-        /** The derived tokens column term and match queries target, or {@code null} for the raw column. */
-        public String tokensColumn() {
-            return tokensColumn;
-        }
-
-        /** The Lance column term and match queries run against: {@link #tokensColumn()} when set, else the field's own column. */
-        public String lanceColumn() {
-            return tokensColumn != null ? tokensColumn : name();
-        }
-
-        /**
-         * The OpenSearch analyzer name of the RFC's analyzer mode
-         * ({@code meta.lance_analyzer}, written by the derivation for a
-         * {@code type: text_analyzer} override), or {@code null} when
-         * the field runs on Lance's native tokenizer.
-         */
-        public String analyzerName() {
-            return meta().get("lance_analyzer");
-        }
-
-        /**
-         * The query text as it should reach Lance: in the analyzer mode
-         * the text goes through the field's OpenSearch analyzer and the
-         * tokens are joined by single spaces, matching what the
-         * backfill stored in the tokens column (whose inverted index
-         * splits on whitespace); otherwise the text passes through
-         * untouched and Lance's own tokenizer handles it.
-         *
-         * @throws IllegalArgumentException when the analyzer named in
-         *     the mapping meta does not resolve on this index (the
-         *     analyzer definition disappeared after attach)
-         */
-        public String searchText(QueryShardContext context, String text) {
-            String analyzerName = analyzerName();
-            if (analyzerName == null) {
-                return text;
-            }
-            NamedAnalyzer analyzer = context.getIndexAnalyzers().get(analyzerName);
-            if (analyzer == null) {
-                throw new IllegalArgumentException(
-                    "field [" + name() + "] declares analyzer [" + analyzerName + "] which does not exist on this index"
-                );
-            }
-            try {
-                return LanceTextAnalyzerBackfill.joinTokens(analyzer, name(), text);
-            } catch (IOException e) {
-                throw new UncheckedIOException("failed to analyze query text for field [" + name() + "]", e);
-            }
-        }
-
         @Override
         public Query termQuery(Object value, QueryShardContext context) {
             rejectIfDropped();
             String text = value instanceof BytesRef b ? b.utf8ToString() : value.toString();
-            // The FullTextQuery targets the Lance column (the derived
-            // tokens column in the analyzer mode); the FLS visibility
-            // set carries the mapped field name, because that is the
-            // name a security plugin's wrapper reader hides.
-            return new LanceFtsQuery(FullTextQuery.match(searchText(context, text), lanceColumn()), Set.of(name()));
+            return new LanceFtsQuery(FullTextQuery.match(text, name()), Set.of(name()));
         }
 
         /**
@@ -246,8 +164,8 @@ public class LanceTextFieldMapper extends ParametrizedFieldMapper {
             rejectIfDropped();
             String text = value instanceof BytesRef b ? b.utf8ToString() : value.toString();
             FullTextQuery match = FullTextQuery.match(
-                searchText(context, text),
-                lanceColumn(),
+                text,
+                name(),
                 1f,
                 Optional.of(fuzzyDistance(fuzziness, text)),
                 maxExpansions,
@@ -261,10 +179,8 @@ public class LanceTextFieldMapper extends ParametrizedFieldMapper {
          * A stock {@code match_phrase} of two or more words: the words
          * of the stream, joined by single spaces, as one Lance phrase
          * query with {@code slop}. Lance tokenises the joined text with
-         * the inverted index's analyzer (or, in the analyzer mode, the
-         * field's OpenSearch analyzer runs over it first through
-         * {@link #searchText}), so the whitespace split the quote
-         * analyzer made only decided that the query is a phrase.
+         * the inverted index's analyzer, so the whitespace split the
+         * quote analyzer made only decided that the query is a phrase.
          * {@code enablePositionIncrements} has no effect: the stream
          * carries no gaps (the quote analyzer drops nothing).
          */
@@ -292,7 +208,7 @@ public class LanceTextFieldMapper extends ParametrizedFieldMapper {
 
         private Query phraseOf(List<String> terms, int slop, QueryShardContext context) {
             String text = String.join(" ", terms);
-            return new LanceFtsQuery(FullTextQuery.phrase(searchText(context, text), lanceColumn(), Math.max(0, slop)), Set.of(name()));
+            return new LanceFtsQuery(FullTextQuery.phrase(text, name(), Math.max(0, slop)), Set.of(name()));
         }
 
         /**
@@ -326,11 +242,11 @@ public class LanceTextFieldMapper extends ParametrizedFieldMapper {
 
         /**
          * Wildcard, regexp and prefix run as a Lance scan filter over
-         * the raw stored string of the column named by this field, not
-         * over the analyzed tokens of {@code tokens_column}: Lance's
-         * inverted index has no wildcard or regexp query type and keeps
-         * its term dictionary to itself, and a pattern match on the raw
-         * value is what the same filter means to a Lance user. The
+         * the raw stored string of the column named by this field:
+         * Lance's inverted index has no wildcard or regexp query type
+         * and keeps its term dictionary to itself, and a pattern match
+         * on the raw value is what the same filter means to a Lance
+         * user. The
          * query is unbounded ({@link LanceScanFilterQuery#SCAN_LIMIT_UNBOUNDED});
          * the fragment executor's top-k clip applies when the
          * coordinator translated the whole request to SQL, which is the
@@ -389,7 +305,6 @@ public class LanceTextFieldMapper extends ParametrizedFieldMapper {
 
     private LanceTextFieldMapper(String simpleName, MappedFieldType fieldType, MultiFields multiFields, CopyTo copyTo, Builder builder) {
         super(simpleName, fieldType, multiFields, copyTo);
-        this.tokensColumn = builder.tokensColumn.getValue();
     }
 
     @Override

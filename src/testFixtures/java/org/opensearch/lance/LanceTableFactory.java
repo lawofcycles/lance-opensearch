@@ -738,10 +738,8 @@ public final class LanceTableFactory {
     /**
      * Add a column computed by a SQL expression over the existing
      * columns through {@code Dataset.addColumns(SqlExpressions)}, one
-     * commit. Used by the text_analyzer tests to put the derived tokens
-     * column in place with real values ({@code lower(body)}) without
-     * running the backfill, so the state between the backfill's column
-     * commit and its index commit can be reproduced deterministically.
+     * commit, the way a table's writer adds a column after the table was
+     * attached.
      */
     public static void addColumnFromSql(String tableUri, String column, String sql) throws Exception {
         try (
@@ -1001,10 +999,10 @@ public final class LanceTableFactory {
      * Writes a two-column Lance table ({@code id} int32, {@code text} Utf8)
      * holding the five Japanese sentences in {@link #JAPANESE_SENTENCES},
      * without an FTS index. The ITs build the index afterwards through
-     * {@code POST /_plugins/_lance/build_indexes/{index}} with a chosen tokenizer,
-     * so the attach derivation first maps {@code text} as {@code keyword}
-     * and the namespace poll flips it to {@code lance_text} once the
-     * build lands.
+     * {@link #createFtsIndex} with a chosen tokenizer, so the attach
+     * derivation first maps {@code text} as {@code keyword} and the
+     * freshness check flips it to {@code lance_text} once the index
+     * commit lands.
      *
      * @return absolute URI of the table, usable as-is for
      *         {@code /_plugins/_lance/attach} or namespace register.
@@ -1030,10 +1028,7 @@ public final class LanceTableFactory {
     /**
      * Writes a two-column Lance table ({@code id} int32, {@code body}
      * Utf8) holding {@link #ENGLISH_SENTENCES}, without an FTS index,
-     * so the attach derivation maps {@code body} as {@code keyword}
-     * unless a {@code type: text_analyzer} override selects the
-     * analyzer mode. Public because the analyzer-mode unit tests and
-     * ITs share it.
+     * so the attach derivation maps {@code body} as {@code keyword}.
      *
      * @return absolute URI of the table, usable as-is for
      *         {@code /_plugins/_lance/attach} or namespace register.
@@ -1058,9 +1053,7 @@ public final class LanceTableFactory {
      * {@link #writeEnglishTextTable} plus a Lance inverted index over
      * {@code body} built by the table writer (Lance's own English
      * tokenizer, with positions), so the attach derivation maps
-     * {@code body} as {@code lance_text} before any {@code text_analyzer}
-     * override applies. This is the shape of an existing table whose
-     * text column a {@code text_analyzer} override is put on.
+     * {@code body} as {@code lance_text}.
      *
      * @return absolute URI of the table, usable as-is for
      *         {@code /_plugins/_lance/attach} or namespace register.
@@ -1088,13 +1081,9 @@ public final class LanceTableFactory {
     }
 
     /**
-     * Build over {@code column} the inverted index the text_analyzer
-     * backfill builds over a derived tokens column: whitespace
-     * tokenizer, positions, and every default transformation of Lance's
-     * inverted index turned off, so the stored tokens are indexed
-     * verbatim. One commit. Used by the tests that reproduce the
-     * backfill's index commit on a table whose derived column was put
-     * in place by {@link #addColumnFromSql}.
+     * Build over {@code column} a whitespace tokenized inverted index
+     * with positions and no lower casing, stemming or stop words, the
+     * way a writer that pre-tokenized the column builds it.
      */
     public static void createWhitespaceFtsIndex(String tableUri, String column) throws Exception {
         withLocaleRoot(() -> {
@@ -1106,6 +1095,35 @@ public final class LanceTableFactory {
                     "inverted",
                     "{\"base_tokenizer\":\"whitespace\",\"with_position\":true,\"lower_case\":false,\"stem\":false,"
                         + "\"remove_stop_words\":false,\"ascii_folding\":false,\"max_token_length\":null}"
+                );
+                IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+                dataset.createIndex(
+                    IndexOptions.builder(Collections.singletonList(column), IndexType.INVERTED, indexParams)
+                        .withIndexName(column + "_fts")
+                        .build()
+                );
+            }
+            return tableUri;
+        });
+    }
+
+    /**
+     * Builds a Lance inverted index over {@code column} of the table at
+     * {@code tableUri} the way a table's writer does, with Lance's
+     * {@code baseTokenizer} ({@code simple}, {@code whitespace},
+     * {@code icu}, ...) and with or without positions. The ITs use it to
+     * give a surfaced table an index after the fact, so the freshness
+     * check sees the column become full text.
+     */
+    public static void createFtsIndex(String tableUri, String column, String baseTokenizer, boolean withPosition) throws Exception {
+        withLocaleRoot(() -> {
+            try (
+                RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+                Dataset dataset = Dataset.open().allocator(allocator).uri(tableUri).build()
+            ) {
+                ScalarIndexParams scalarParams = ScalarIndexParams.create(
+                    "inverted",
+                    "{\"base_tokenizer\":\"" + baseTokenizer + "\",\"with_position\":" + withPosition + "}"
                 );
                 IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
                 dataset.createIndex(

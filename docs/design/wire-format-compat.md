@@ -61,9 +61,7 @@ shows the stats without them.
 A block is decoded from a stream of its own bytes, so a parser that leaves bytes of the block
 unread fails the message with `<Message> wire version block [n] left k bytes unread` rather than
 misreading what follows. A `Writeable` nested in a message without a marker of its own (the
-records inside `LanceNodeStats`, `KindResult` inside the build node response,
-`LanceBuildIndexesRequest` inside the build node request) is covered by the enclosing message's
-number; a change to its fields is a new block of the enclosing message.
+records inside `LanceNodeStats`) is covered by the enclosing message's number; a change to its fields is a new block of the enclosing message.
 
 The cost is one byte for the marker, one for each flag, and the length prefix of each block, plus
 one copy of the block's bytes on the writer. A version 1 message costs what it did before.
@@ -97,8 +95,8 @@ default a retired field is still written with, are not covered by this note; a p
 comes with the first release that needs one.
 
 The message classes that only execute on the node that received the REST call
-(`LanceExplainRequest`, `LanceRefsRequest`, `LanceNamespaceListRequest`, `LanceBuildIndexesRequest`
-at the top level, and their responses) carry no marker: a `HandledTransportAction` invoked through
+(`LanceExplainRequest`, `LanceRefsRequest`, `LanceNamespaceListRequest` at the top level, and
+their responses) carry no marker: a `HandledTransportAction` invoked through
 the node client never serialises them. `LanceNamespaceMetadata` is cluster state, versioned and
 published by OpenSearch's own mechanism, and keeps the policy written on the class.
 
@@ -133,15 +131,14 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 | | 7 | Block, optional: the coordinator result cache's figures (enabled, size, limit, entries, hits, misses, evictions, invalidations, skipped; fallback disabled and zero) |
 | | 8 | Block, optional: the fetch take counters (scans, rows addressed, columns projected, milliseconds total and maximum, scans per caller; seven counters, fallback zero) |
 | | 9 | Block, optional: the fetch cache's figures (enabled, size, limit, entries, hits, misses, evictions, invalidations, skipped, rows served; fallback disabled and zero) |
-| | 10 | Block, optional: the failure counters (node-local clone resolutions failed, over every index and per index name; table statistics collections failed; zone map reads failed; fallback zero and empty) |
+| | 10 | Block, optional: the failure counters (table statistics collections failed; zone map reads failed; fallback zero) |
 | | 11 | Block, optional: the names of the indexes whose row counts are withheld because a reader wrapper is installed; the base layout carries such an index with zero counts (fallback empty, no index withheld) |
+| | 12 | Block, optional, empty. Removed the node-local clone list from the base layout and the clone resolution failures from block 10, before 0.1.0; a version 11 reader is not a compatibility target |
 | `LanceStatsNodeRequest` | 1 | Base: nothing after the marker |
 | `LanceRequestCacheClearNodeRequest` | 1 | Base: the index uuids whose result cache entries the node drops |
 | `LanceRequestCacheClearNodeResponse` | 1 | Base: how many entries the node dropped |
 | `LanceStatisticsPrefetchNodeRequest` | 1 | Base: the index name, the table URI the statistics cache keys on, the version to collect |
 | `LanceStatisticsPrefetchNodeResponse` | 1 | Base: the outcome (`STARTED`, `HELD` or `PENDING`) |
-| `LanceBuildIndexesNodeRequest` | 1 | Base: the build request, the source version |
-| `LanceBuildIndexesNodeResponse` | 1 | Base: the three kind results, the status, the optional mapping JSON |
 | `LanceIndexSyncRequest` | 1 | Base: nothing after the marker (the index travels in the OpenSearch base class) |
 | `LanceIndexSyncResponse` | 1 | Base: the freshness outcome (index, checked, reason, moved, served and target version, mapping changed, rebuilt) |
 | | 2 | Block, optional: the message of the mapping update the check sent and the cluster manager refused (optional string; fallback absent) |
@@ -150,8 +147,8 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 | | 2 | Block, optional: the registrations whose listing could not descend into a subnamespace, name to message (fallback empty) |
 | `LanceNamespaceUpdateRequest` | 1 | Base: operation, name, optional type, optional root URI, storage options, config, overrides JSON |
 | `LanceNamespaceUpdateResponse` | 1 | Base: changed |
-| `LanceAttachRequest` | 1 | Base: table, optional index name, optional pinned version, optional tag, storage options, overrides JSON, optional index placement, async derive |
-| `LanceAttachResponse` | 1 | Base: index, table, version, rows, fragments, derived key field, derived mapping JSON, notes, already attached, Lucene bound exceeded, optional backfill |
+| `LanceAttachRequest` | 1 | Base: table, optional index name, optional pinned version, optional tag, storage options, overrides JSON |
+| `LanceAttachResponse` | 1 | Base: index, table, version, rows, fragments, derived key field, derived mapping JSON, notes, already attached, Lucene bound exceeded |
 
 `LanceExplainResponse` version 1 predates the block layout and changed the base fields, which the
 rules above no longer allow; it is decoded by a branch on the marker that maps a shard path answer

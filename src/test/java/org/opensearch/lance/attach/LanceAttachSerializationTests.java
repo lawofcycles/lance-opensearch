@@ -13,12 +13,10 @@ import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.action.support.clustermanager.ClusterManagerNodeRequest;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.unit.TimeValue;
-import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.tasks.TaskId;
-import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.WireVersionTestSupport;
@@ -80,24 +78,7 @@ public class LanceAttachSerializationTests extends OpenSearchTestCase {
         assertTrue(restored.tag().isEmpty());
         assertTrue(restored.storageOptions().isEmpty());
         assertTrue(restored.overrides().isEmpty());
-        assertFalse(restored.asyncDerive());
         assertEquals(ClusterManagerNodeRequest.DEFAULT_CLUSTER_MANAGER_NODE_TIMEOUT, restored.clusterManagerNodeTimeout());
-        assertNull(restored.validate());
-    }
-
-    public void testRequestWithTextAnalyzerAndAsyncDeriveRoundTrip() throws Exception {
-        LanceOverrides overrides = LanceOverrides.parseAttachClauses(
-            Map.of("body", Map.of("type", "text_analyzer", "analyzer", "english", "derived_column_name", "body_tokens")),
-            null
-        );
-        LanceAttachRequest original = new LanceAttachRequest("/tmp/demo.lance", null, null, null, null, overrides, null, true);
-
-        LanceAttachRequest restored = roundTrip(original);
-
-        assertTrue(restored.asyncDerive());
-        LanceOverrides.Column column = restored.overrides().textAnalyzerColumns().get("body");
-        assertEquals("english", column.analyzer());
-        assertEquals("body_tokens", column.derivedColumn());
         assertNull(restored.validate());
     }
 
@@ -154,31 +135,6 @@ public class LanceAttachSerializationTests extends OpenSearchTestCase {
         assertEquals(original.notes(), restored.notes());
         assertEquals(original.alreadyAttached(), restored.alreadyAttached());
         assertEquals(original.luceneBoundExceeded(), restored.luceneBoundExceeded());
-        assertNull(restored.backfill());
-
-        // The backfill object of a derive: async attach travels too.
-        LanceAttachResponse withBackfill = new LanceAttachResponse(
-            "demo",
-            "/tmp/demo.lance",
-            3L,
-            1000L,
-            4,
-            "id",
-            "{\"properties\":{\"id\":{\"type\":\"long\"}}}",
-            List.of(),
-            false,
-            false,
-            new LanceAttachResponse.Backfill(123_456_789L, "none", 8)
-        );
-        try (BytesStreamOutput out = new BytesStreamOutput()) {
-            withBackfill.writeTo(out);
-            try (StreamInput in = out.bytes().streamInput()) {
-                restored = new LanceAttachResponse(in);
-            }
-        }
-        assertEquals(withBackfill.backfill(), restored.backfill());
-        String json = Strings.toString(MediaTypeRegistry.JSON, restored);
-        assertTrue(json, json.contains("\"backfill\":{\"estimated_bytes\":123456789,\"spool_path\":\"none\",\"threads\":8}"));
     }
 
     public void testRequestStreamOpensWithTheWireVersionAndANewerOptionalBlockIsSteppedOver() throws Exception {

@@ -242,7 +242,7 @@ curl -X POST http://localhost:9200/_plugins/_lance/attach \
 
 The call is idempotent; a second attach on the same table returns `already_attached: true`.
 
-Every endpoint of the plugin lives under `/_plugins/_lance/`, the node settings under `plugins.lance.*` and the index settings under `index.plugins.lance.*`. In 0.1.0 the previous paths (`/_lance/attach`, `/_lance/namespace`, `/_lance/build_indexes/{index}`, `/_lance/refs/{index}`, `/_lance/stats`, `/_lance/stats/{node_id}`, `/{index}/_lance/explain`, `/{index}/_lance/sync`) still answer, with a deprecation `Warning` header on the response and a line in the node's deprecation log naming the new path. The previous setting names, `lance.*` and `index.lance.*`, are accepted the same way: a value under an old key is read when the new key is absent, and every read of an old key logs a deprecation warning (a `Warning` header on the request that read it). An index created under the old keys keeps opening; attach and the namespace poll write the new keys only. The old paths and the old setting names are removed in the next minor release.
+Every endpoint of the plugin lives under `/_plugins/_lance/`, the node settings under `plugins.lance.*` and the index settings under `index.plugins.lance.*`. In 0.1.0 the previous paths (`/_lance/attach`, `/_lance/namespace`, `/_lance/refs/{index}`, `/_lance/stats`, `/_lance/stats/{node_id}`, `/{index}/_lance/explain`, `/{index}/_lance/sync`) still answer, with a deprecation `Warning` header on the response and a line in the node's deprecation log naming the new path. The previous setting names, `lance.*` and `index.lance.*`, are accepted the same way: a value under an old key is read when the new key is absent, and every read of an old key logs a deprecation warning (a `Warning` header on the request that read it). An index created under the old keys keeps opening; attach and the namespace poll write the new keys only. The old paths and the old setting names are removed in the next minor release.
 
 ### Point at S3, GCS, or Azure with storage_options
 
@@ -326,7 +326,7 @@ curl -s -X POST 'http://localhost:9200/demo/_search?size=3' \
 
 Expected `hits.total.value`: 8. Word order is enforced: `{"match_phrase":{"body":"lance hello"}}` returns 0. Non zero `slop` lets tokens sit further apart: `{"match_phrase":{"body":{"query":"quick fox","slop":1}}}` matches every `quick brown fox <i>` because `brown` sits one position between `quick` and `fox`.
 
-A phrase needs an inverted index that stores token positions (the `with_position=True` argument in the step 3 scripts; `"with_position": true` on `POST /_plugins/_lance/build_indexes/{index}` when the plugin builds the index). On an index built without positions Lance answers 400 with `position is not found but required for phrase queries`.
+A phrase needs an inverted index that stores token positions (the `with_position=True` argument in the step 3 scripts). On an index built without positions Lance answers 400 with `position is not found but required for phrase queries`.
 
 #### Explicit form: lance_match_phrase
 
@@ -632,35 +632,24 @@ plugins.lance.namespace.poll_cadence: 1s
 
 ### How the plugin thinks about indexes
 
-Indexes on the Lance table (FTS, scalar, vector) are treated as an external concern. The recommended flow is to build them from the same writer that produced the table, using `dataset.create_index` in Python, the Lance Java SDK, or a Ray / Spark job. The plugin never creates or optimises indexes on its own poll cycle; that principle is what keeps the plugin from writing new versions to the user's Lance table behind their back.
+Indexes on the Lance table (FTS, scalar, vector) belong to the writer. Build them from the same writer that produced the table, using pylance, the Lance Java SDK, or a Ray / Spark job; the freshness check picks a new index up at its manifest commit, and the mapping follows (a Utf8 column becomes `lance_text` once it has an inverted index). The plugin never creates or optimises an index: it holds no write credentials for the table and never commits a version to it.
 
-For operators who want to trigger a build from the cluster, `POST /_plugins/_lance/build_indexes/{index}` is the auxiliary path. It supports two modes.
+```python
+import lance
 
+ds = lance.dataset("/tables/demo.lance")
+ds.create_scalar_index("body", "INVERTED", with_position=True)
+ds.create_scalar_index("id", "BTREE")
+ds.create_index("embedding", "IVF_PQ", num_partitions=64, num_sub_vectors=16)
 ```
-POST /_plugins/_lance/build_indexes/demo
-{
-  "columns": ["body"]
-}
-```
-
-Runs FTS, scalar, or vector index builds for the requested columns.
-
-```
-POST /_plugins/_lance/build_indexes/demo
-{
-  "optimize": true
-}
-```
-
-Runs `Dataset.optimizeIndices` so every existing index folds in fragments that appended since the last build. Use this after a batch of appends, or on a schedule, to keep the fraction of uncovered fragments from growing.
 
 ### Append visibility
 
-When Lance advances to a new version, the plugin exposes it as soon as the next freshness check observes the change. The appended fragments do not have to be covered by every existing index first. Whenever uncovered fragments accumulate to the point that flat-scan latency becomes noticeable, call `POST /_plugins/_lance/build_indexes/{index}` with `{"optimize": true}` to fold them into the existing indexes.
+When Lance advances to a new version, the plugin exposes it as soon as the next freshness check observes the change. The appended fragments do not have to be covered by every existing index first. Whenever uncovered fragments accumulate to the point that flat-scan latency becomes noticeable, the writer folds them into the existing indexes (pylance `ds.optimize.optimize_indices()`).
 
 Lance's own scanner produces a mixed execution plan for FTS and knn: covered fragments use the existing index, uncovered fragments run a flat scan, and the results are unioned by the query engine, so an incremental append never slows down queries hitting the previously-covered fragments.
 
-The `index.plugins.lance.uncovered_fragment_policy` setting accepts `wait` alongside the default `immediate`. Both values expose the new version immediately; `wait` is reserved for a future async-optimize implementation, and setting it logs an informational message so operators are aware that the plugin does not run auto-optimize.
+The `index.plugins.lance.uncovered_fragment_policy` setting accepts `wait` alongside the default `immediate`. Both values expose the new version immediately; `wait` is reserved for a future async-optimize implementation, and setting it logs an informational message so operators are aware that the plugin does not optimise the table's indexes.
 
 ### Serving an object store table from local NVMe
 
@@ -711,8 +700,6 @@ Set the TTL to `minimal` or to a few seconds when a writer commits to the table;
 This path needs no copy step and no cron, but the project has not measured it. Mountpoint documents itself as optimised for sequential reads of large objects, while the reads that dominate a cold request here are small ranges at scattered offsets (BTree pages, `_rowaddr` takes), so how much of the 164 s above the cache removes on the second request, and what the first request costs through the mount compared with reading S3 directly, is not known.
 
 Should Lance's object store layer gain a read-through disk cache of its own (the project intends to propose one upstream), both answers reduce to one `storage_options` entry on the attach body.
-
-`index_placement: node_local` is not a read cache: it makes every data node build indexes into a shallow clone of the table under its data path so that the source stays read only, and every data read of the source still goes to the store. See "Attach and namespace surface" in [features.md](features.md#attach-and-namespace-surface).
 
 ### Cap Lance's native memory footprint
 
@@ -856,7 +843,7 @@ curl -sS localhost:9200/_plugins/_lance/stats?pretty
 }
 ```
 
-The response carries three more sections than shown (`freshness`, `indices`, `local_clones`); the ones above are the ones this walkthrough refers to.
+The response carries two more sections than shown (`freshness`, `indices`); the ones above are the ones this walkthrough refers to.
 
 How to read it:
 
@@ -1058,7 +1045,7 @@ Deleting a Lance-backed index while its namespace is still registered is honoure
 
 **`match` returns hits `operator: and` should have excluded, or `match_phrase` ignores word order.** On a `lance_text` field at the top of the query or inside a `bool` / `dis_max`, both reach Lance (step 5); check the field's mapping type with `GET /<index>/_mapping` (a `keyword` override answers `match` as an exact term) and `GET /_plugins/_lance/explain/<index>` (`lance_clause` names the rewritten clause). Inside another compound (`function_score`, `nested`, `constant_score`) the `operator` of `match` is not applied; write `lance_match` there.
 
-**`lance_match_phrase` answers 400 `position is not found but required for phrase queries`.** The inverted index was built without token positions. Rebuild it with `with_position=True` (pylance) or `"with_position": true` on `POST /_plugins/_lance/build_indexes/{index}`; positions are fixed when the index is created.
+**`lance_match_phrase` answers 400 `position is not found but required for phrase queries`.** The inverted index was built without token positions. Rebuild it with `with_position=True` (pylance `create_scalar_index(..., replace=True)`); positions are fixed when the index is created.
 
 **A request is slower than expected and you want to know where it ran.** `GET /_plugins/_lance/explain/<index>` with the same body (step 5) prints the plan and names what kept it on the Lucene side under `unplanned`; `GET /_plugins/_lance/stats` shows under `plan` whether the data nodes executed the shipped plan or downgraded it, and why.
 

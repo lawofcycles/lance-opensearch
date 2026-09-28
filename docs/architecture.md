@@ -86,7 +86,7 @@ flowchart TD
 Six concerns make up the plugin.
 
 The REST layer parses and forwards. Every handler (attach, namespace registration, search
-pass-through, explain, stats, refs, index builds) validates its body and hands the work to a
+pass-through, explain, stats, refs, sync) validates its body and hands the work to a
 transport action; nothing that touches a table, the cluster state or the network happens on a
 REST or transport thread.
 
@@ -138,9 +138,8 @@ src/main/java/org/opensearch/lance/
 ├── (top level)      # plugin entry point, registry, overrides, storage options, breaker
 ├── attach/          # the attach transport action
 ├── dispatch/        # search interception, coordinator, per-node fragment executor
-├── engine/          # Lance-backed Lucene readers, snapshot cache, index builds and warm-up
+├── engine/          # Lance-backed Lucene readers, snapshot cache and warm-up
 ├── execute/         # pushed-aggregate result decoding
-├── index/           # the build_indexes transport actions
 ├── mapper/          # the lance_text and lance_vector field types
 ├── namespace/       # catalog registration, poll loop, per shard freshness, drift handling
 ├── plan/            # the Calcite planner

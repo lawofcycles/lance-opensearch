@@ -580,125 +580,6 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
         return counts;
     }
 
-    public void testNodeLocalPlacementBuildsAndCleansUpOnEveryNode() throws Exception {
-        // node_local placement: the build fans out to all three data
-        // nodes, each answers under its node id, every node can serve the
-        // FTS query, and deleting the index removes the clone directory
-        // on every node (observed through GET /_plugins/_lance/stats).
-        String suffix = "mn-placement-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
-        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
-        String indexName = "demo-" + suffix;
-        String tableUri = LanceTableFactory.writeKeywordOnlyTable(scratchDir, indexName, 6);
-        try {
-            Response attach = postJson(
-                "/_plugins/_lance/attach",
-                "{\"table\":\"" + tableUri + "\",\"name\":\"" + indexName + "\",\"index_placement\":\"node_local\"}"
-            );
-            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
-
-            String build = readAll(postJson("/_plugins/_lance/build_indexes/" + indexName, "{\"fts_columns\":[\"label\"]}"));
-            assertTrue(
-                "merged fts built list must carry label: " + build,
-                build.contains("\"fts\":[{\"column\":\"label\",\"type\":\"INVERTED\"}]")
-            );
-            int nodesStart = build.indexOf("\"nodes\":{");
-            assertTrue("per-node nodes block expected: " + build, nodesStart >= 0);
-            int nodeEntries = countOccurrences(
-                build.substring(nodesStart),
-                "\"built\":{\"fts\":[{\"column\":\"label\",\"type\":\"INVERTED\"}]"
-            );
-            assertEquals("every data node must report its own build: " + build, 3, nodeEntries);
-
-            assertBusy(() -> {
-                String mapping = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
-                assertTrue("label must map to lance_text after the build: " + mapping, mapping.contains("\"type\":\"lance_text\""));
-            });
-            ensureGreen(indexName);
-
-            for (HttpHost host : getClusterHosts()) {
-                try (var pinned = buildClient(restClientSettings(), new HttpHost[] { host })) {
-                    Request search = new Request("POST", "/" + indexName + "/_search");
-                    search.setJsonEntity("{\"query\":{\"lance_match\":{\"field\":\"label\",\"query\":\"3\"}}}");
-                    assertBusy(() -> {
-                        String hits = readAll(pinned.performRequest(search));
-                        assertEquals("lance_match through " + host + ": " + hits, 1, extractIntPath(hits, "hits", "total", "value"));
-                    });
-                }
-            }
-
-            String stats = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
-            assertEquals(
-                "every data node must report the clone under local_clones: " + stats,
-                3,
-                countOccurrences(stats, "\"" + indexName + "\":{\"local_clone_bytes\"")
-            );
-
-            client().performRequest(new Request("DELETE", "/" + indexName));
-            assertBusy(() -> {
-                String after = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
-                assertEquals(
-                    "the clone directories must be gone on every node: " + after,
-                    0,
-                    countOccurrences(after, "\"" + indexName + "\":{\"local_clone_bytes\"")
-                );
-            });
-        } finally {
-            try {
-                client().performRequest(new Request("DELETE", "/" + indexName));
-            } catch (Exception ignored) {}
-            LanceRestTestCase.deleteRecursively(scratchDir);
-        }
-    }
-
-    public void testNodeLocalBuildHonoursIndexesPreferenceOnEveryNode() throws Exception {
-        // node_local placement with an attach-time `indexes` preference:
-        // every data node builds the requested type into its own clone
-        // and reports it under its node id.
-        String suffix = "mn-idxtypes-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
-        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
-        String indexName = "demo-" + suffix;
-        String tableUri = LanceTableFactory.writeKeywordOnlyTable(scratchDir, indexName, 6);
-        try {
-            Response attach = postJson(
-                "/_plugins/_lance/attach",
-                "{\"table\":\""
-                    + tableUri
-                    + "\",\"name\":\""
-                    + indexName
-                    + "\",\"index_placement\":\"node_local\",\"indexes\":{\"label\":{\"scalar\":\"bitmap\"}}}"
-            );
-            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
-            ensureGreen(indexName);
-
-            String build = readAll(postJson("/_plugins/_lance/build_indexes/" + indexName, "{\"columns\":[\"label\"]}"));
-            assertTrue(
-                "merged scalar built list must carry the bitmap on label: " + build,
-                build.contains("{\"column\":\"label\",\"type\":\"BITMAP\"}")
-            );
-            int nodesStart = build.indexOf("\"nodes\":{");
-            assertTrue("per-node nodes block expected: " + build, nodesStart >= 0);
-            int nodeEntries = countOccurrences(build.substring(nodesStart), "\"scalar\":[{\"column\":\"label\",\"type\":\"BITMAP\"}]");
-            assertEquals("every data node must report the type it built: " + build, 3, nodeEntries);
-
-            client().performRequest(new Request("DELETE", "/" + indexName));
-        } finally {
-            try {
-                client().performRequest(new Request("DELETE", "/" + indexName));
-            } catch (Exception ignored) {}
-            LanceRestTestCase.deleteRecursively(scratchDir);
-        }
-    }
-
-    private static int countOccurrences(String haystack, String needle) {
-        int count = 0;
-        int index = 0;
-        while ((index = haystack.indexOf(needle, index)) >= 0) {
-            count++;
-            index += needle.length();
-        }
-        return count;
-    }
-
     public void testFtsAcrossFragmentsOnThreeNodeCluster() throws Exception {
         // 12 rows written 4 per file give fragments 0, 1 and 2. The
         // coordinator sends one fragment to each of the three data
@@ -3600,10 +3481,11 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 holderDelta > managerDelta
             );
 
-            // The keyword to lance_text rebuild is issued from the holder
-            // too: it deletes the index and creates it again through the
-            // manager, with the internal create header travelling in the
-            // request's thread context.
+            // The keyword to lance_text rebuild, after the table's writer
+            // adds an inverted index, is issued from the holder too: it
+            // deletes the index and creates it again through the manager,
+            // with the internal create header travelling in the request's
+            // thread context.
             String keywordTable = "kw-" + suffix;
             LanceTableFactory.writeKeywordOnlyTable(scratchDir, keywordTable, 5);
             String keywordUri = scratchDir.resolve(keywordTable + ".lance").toString();
@@ -3612,8 +3494,7 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             client().performRequest(new Request("GET", "/_cluster/health/" + keywordTable + "?wait_for_status=green&timeout=30s"));
             String keywordHolder = readAll(client().performRequest(new Request("GET", "/_cat/shards/" + keywordTable + "?h=node"))).trim();
             assertNotEquals(managerName, keywordHolder);
-            String build = readAll(postJson("/_plugins/_lance/build_indexes/" + keywordTable, "{\"fts_columns\":[\"label\"]}"));
-            assertTrue("the FTS index is built: " + build, build.contains("\"fts\":[{\"column\":\"label\",\"type\":\"INVERTED\"}]"));
+            LanceTableFactory.createFtsIndex(keywordUri, "label", "simple", false);
             assertBusy(() -> {
                 try {
                     String mapping = readAll(client().performRequest(new Request("GET", "/" + keywordTable + "/_mapping")));

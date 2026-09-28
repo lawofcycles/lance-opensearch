@@ -907,7 +907,6 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 target.renamedFields(),
                 target.primaryKeyField(),
                 target.dateOverrideColumns(),
-                target.lanceTextColumns(),
                 statistics
             )
             : LanceSchemas.model(
@@ -917,7 +916,6 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                 target.renamedFields(),
                 target.primaryKeyField(),
                 target.dateOverrideColumns(),
-                target.lanceTextColumns(),
                 () -> totalRows
             );
         // Stock match / match_phrase / multi_match clauses on the
@@ -1228,7 +1226,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
                     primaryKeyField,
                     PlanExecutor.sqlExcludedColumns(overrides),
                     overrides.dateColumns().keySet(),
-                    LanceMappingMeta.lanceTextColumns(indexMetadata.mapping())
+                    LanceMappingMeta.lanceTextFields(indexMetadata.mapping())
                 )
             );
         }
@@ -1275,16 +1273,14 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * {@code primaryKeyField}, {@code sqlExcludedColumns} and
      * {@code dateOverrideColumns} feed the planner model the per-target
      * filter SQL derivation builds once the target's Arrow schema is
-     * known. {@code lanceTextColumns} maps each field the mapping types
-     * as {@code lance_text} to the Lance column its full text queries
-     * read (the derived tokens column in the analyzer mode); its keys
-     * are the fields on which stock full text clauses rewrite to Lance
-     * FTS clauses ({@link StockTextQueryRewriter}).
+     * known. {@code lanceTextFields} are the fields the mapping types
+     * as {@code lance_text}, on which stock full text clauses rewrite
+     * to Lance FTS clauses ({@link StockTextQueryRewriter}).
      */
     private record IndexTarget(Index index, String tableUri, StorageOptions storageOptions, long pinnedVersion, Map<
         String,
         LinkedHashMap<String, String>> multiFields, Map<String, String> renamedFields, String primaryKeyField, Set<
-            String> sqlExcludedColumns, Set<String> dateOverrideColumns, Map<String, String> lanceTextColumns) {
+            String> sqlExcludedColumns, Set<String> dateOverrideColumns, Set<String> lanceTextFields) {
 
         String indexName() {
             return index.getName();
@@ -1294,10 +1290,6 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             return pinnedVersion >= 0 ? Optional.of(pinnedVersion) : Optional.empty();
         }
 
-        /** The fields the mapping types as {@code lance_text}. */
-        Set<String> lanceTextFields() {
-            return lanceTextColumns.keySet();
-        }
     }
 
     /**

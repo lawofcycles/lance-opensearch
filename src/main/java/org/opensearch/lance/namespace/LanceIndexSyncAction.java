@@ -16,10 +16,9 @@ import org.opensearch.action.ActionType;
  * when they differ re-derive the mapping, apply it if it changed, and
  * refresh the shard.
  *
- * <p>The name is an index level {@code indices:admin/} permission, like
- * {@code build_indexes}: the check may update the index's mapping and
- * settings, so the roles that administer the index are the ones that may
- * trigger it.
+ * <p>The name is an index level {@code indices:admin/} permission: the
+ * check may update the index's mapping and settings, so the roles that
+ * administer the index are the ones that may trigger it.
  */
 public final class LanceIndexSyncAction extends ActionType<LanceIndexSyncResponse> {
 

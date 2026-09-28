@@ -40,7 +40,6 @@ import org.opensearch.lance.dispatch.LanceStatisticsPrefetchAction;
 import org.opensearch.lance.dispatch.LanceStatisticsPrefetchNodeResponse;
 import org.opensearch.lance.dispatch.LanceStatisticsPrefetchRequest;
 import org.opensearch.lance.engine.LanceEngineFactory;
-import org.opensearch.lance.engine.LanceLocalClones;
 import org.opensearch.lance.engine.LanceServedVersions;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.rest.RestAttachAction;
@@ -75,9 +74,7 @@ import org.opensearch.transport.client.Client;
  * from the first check and from every move, so the requests this node
  * coordinates find them; a move also asks every data node to collect
  * them, since no other node observes the move. A pinned index
- * ({@code index.plugins.lance.version}) never advances and is not tracked. A
- * {@code node_local} index only has its reader advanced; its mapping is
- * maintained by the build action from the clones.
+ * ({@code index.plugins.lance.version}) never advances and is not tracked.
  *
  * <p>The first check after a shard starts derives the mapping even when
  * the version did not move: the table may have changed while no node held
@@ -367,8 +364,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         StorageOptions storageOptions = StorageOptions.fromIndexSettings(settings);
         String tagSetting = LancePlugin.TAG_SETTING.get(settings);
         String tag = tagSetting.isEmpty() ? null : tagSetting;
-        boolean nodeLocal = LanceLocalClones.isNodeLocal(settings);
-        long served = nodeLocal ? nodeLocalServedVersion(indexName, shard) : shard.servedVersion();
+        long served = shard.servedVersion();
         long target;
         boolean moved;
         // The table URI as Lance spells it, the key the statistics cache
@@ -391,12 +387,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
                 // difference from the served version is a move.
                 moved = target != served;
             }
-            // node_local: the search structures live in per node clones
-            // the source never carries, so a derivation from the source
-            // would flip every clone built lance_text column back to
-            // keyword. The build action maintains that mapping; the check
-            // only advances the reader.
-            boolean derive = !nodeLocal && (moved || !entry.derivedOnce);
+            boolean derive = moved || !entry.derivedOnce;
             if (derive) {
                 // Re-apply the overrides captured at attach or register
                 // so the re-derived mapping keeps the operator's type and
@@ -457,8 +448,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
                 // `wait` is accepted but converges with the immediate
                 // branch: the plugin never writes to a user table, so
                 // folding appended fragments into the existing indexes is
-                // left to the table's writer or to
-                // POST /_plugins/_lance/build_indexes/{index}.
+                // left to the table's writer.
                 warnWaitPolicyOnce(indexName);
             }
             entry.derivedOnce = true;
@@ -569,23 +559,6 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
     }
 
     /**
-     * The source version a {@code node_local} shard serves: the base
-     * version its clone was created at. The reader itself is over the
-     * clone, whose own manifest chain advances with every index build,
-     * so its version says nothing about the source.
-     */
-    private static long nodeLocalServedVersion(String indexName, TrackedShard shard) {
-        LanceLocalClones clones = LanceLocalClones.instance();
-        if (clones != null) {
-            Optional<LanceLocalClones.Marker> marker = clones.current(indexName);
-            if (marker.isPresent()) {
-                return marker.get().sourceVersion();
-            }
-        }
-        return shard.servedVersion();
-    }
-
-    /**
      * A Utf8 column flipped between keyword and lance_text after an FTS
      * index was created or dropped on the Lance side. PutMapping refuses
      * the type change, and leaving the stale mapping in place makes the
@@ -634,9 +607,9 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
     private void warnWaitPolicyOnce(String indexName) {
         if (warnedWaitPolicy.add(indexName)) {
             LOG.info(
-                "index [{}] has index.plugins.lance.uncovered_fragment_policy=wait, but the plugin no longer runs auto-optimize on the user's Lance table. "
-                    + "Index maintenance is expected to happen outside OpenSearch (Python, Ray, Spark, or the Lance Java SDK) or via "
-                    + "an explicit POST /_plugins/_lance/build_indexes/{{index}} call. The wait value is accepted for a future async-optimize implementation.",
+                "index [{}] has index.plugins.lance.uncovered_fragment_policy=wait, but the plugin never writes to the user's Lance table. "
+                    + "Index maintenance happens outside OpenSearch (Python, Ray, Spark, or the Lance Java SDK). "
+                    + "The wait value is accepted for a future async-optimize implementation.",
                 indexName
             );
         }

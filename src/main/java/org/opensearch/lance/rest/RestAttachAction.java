@@ -25,7 +25,6 @@ import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.attach.LanceAttachAction;
 import org.opensearch.lance.attach.LanceAttachRequest;
-import org.opensearch.lance.engine.LanceLocalClones;
 import org.opensearch.lance.namespace.LanceNamespaceService;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
@@ -42,10 +41,8 @@ import org.opensearch.transport.client.node.NodeClient;
  * numeric doc values fields), the shard count is always one, and the
  * primary key is detected from Lance field metadata. Optional overrides:
  * "name" (index name, defaults to the table directory name), "version"
- * (pin a manifest version), "tag" (follow a Lance tag; not together
- * with "version") or "index_placement" ("node_local" builds and reads
- * search structures from per-node shallow clones so the source stays
- * read-only; default "in_table").
+ * (pin a manifest version) or "tag" (follow a Lance tag; not together
+ * with "version").
  *
  * <p>Attach always creates a single-shard index because the fragment path
  * (see {@code LanceDispatchActionFilter}) is the only search implementation
@@ -85,8 +82,6 @@ public class RestAttachAction extends BaseRestHandler {
         String tag;
         StorageOptions storageOptions;
         LanceOverrides overrides;
-        String placement;
-        boolean asyncDerive;
         try {
             table = readOptionalString(body, "table");
             if (table == null || table.isEmpty()) {
@@ -128,51 +123,13 @@ public class RestAttachAction extends BaseRestHandler {
             // `overrides` is the forward-looking clause; the legacy
             // `multi_fields` clause folds into `overrides.[col].fields`
             // at parse time so everything downstream sees one shape.
-            // `indexes` declares per-column Lance index type preferences
-            // and rides in the same LanceOverrides object (persisted in
-            // the same setting).
-            overrides = LanceOverrides.parseAttachClauses(body.get("overrides"), body.get("multi_fields"), body.get("indexes"));
-            String indexPlacement = readOptionalString(body, "index_placement");
-            if (indexPlacement != null
-                && !LanceLocalClones.PLACEMENT_IN_TABLE.equals(indexPlacement)
-                && !LanceLocalClones.PLACEMENT_NODE_LOCAL.equals(indexPlacement)) {
-                return channel -> channel.sendResponse(
-                    new BytesRestResponse(RestStatus.BAD_REQUEST, "[index_placement] must be 'in_table' or 'node_local'")
-                );
-            }
-            placement = indexPlacement;
-            // `derive` steers the text_analyzer backfill: `sync` (default)
-            // blocks the attach until the derived tokens columns are
-            // written and indexed, `async` answers at once and lets the
-            // freshness check flip the mapping when the backfill commits.
-            String derive = readOptionalString(body, "derive");
-            if (derive != null && !"sync".equals(derive) && !"async".equals(derive)) {
-                return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, "[derive] must be 'sync' or 'async'"));
-            }
-            if (derive != null && overrides.textAnalyzerColumns().isEmpty()) {
-                return channel -> channel.sendResponse(
-                    new BytesRestResponse(
-                        RestStatus.BAD_REQUEST,
-                        "[derive] is only accepted together with a [type: text_analyzer] override; nothing else derives a column"
-                    )
-                );
-            }
-            asyncDerive = "async".equals(derive);
+            overrides = LanceOverrides.parseAttachClauses(body.get("overrides"), body.get("multi_fields"));
         } catch (IllegalArgumentException e) {
             String message = e.getMessage();
             return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, message));
         }
 
-        LanceAttachRequest attach = new LanceAttachRequest(
-            table,
-            explicitName,
-            pinnedVersion,
-            tag,
-            storageOptions,
-            overrides,
-            placement,
-            asyncDerive
-        );
+        LanceAttachRequest attach = new LanceAttachRequest(table, explicitName, pinnedVersion, tag, storageOptions, overrides);
         return channel -> client.execute(LanceAttachAction.INSTANCE, attach, new RestToXContentListener<>(channel));
     }
 
@@ -223,7 +180,7 @@ public class RestAttachAction extends BaseRestHandler {
      * can be applied uniformly to several tables. {@code type: keyword} on
      * a Utf8 column maps it to {@code keyword} even when the column
      * carries a Lance inverted index, which also keeps it out of
-     * {@code ftsColumns} so no FTS index is built or optimised for it; on
+     * {@code ftsColumns}; on
      * a List&lt;Utf8&gt; column it pins the derived type. Sub-field
      * declarations ({@code fields}) behave as the {@code multi_fields}
      * clause always has.
@@ -261,41 +218,16 @@ public class RestAttachAction extends BaseRestHandler {
         mapping.startObject().startObject("properties");
         LanceSchema lanceSchema = dataset.getLanceSchema();
         LanceOverrides effective = validateOverrides(overrides, lanceSchema, lenient, notes);
-        validateIndexPreferences(overrides.indexPreferences(), lanceSchema, lenient, notes);
         multiFields = effective.subFields();
         Map<String, String> dateOverrides = effective.dateColumns();
         java.util.Set<String> keywordOverrides = effective.keywordColumns();
         java.util.Set<String> ipOverrides = effective.ipColumns();
         java.util.Set<String> wildcardOverrides = effective.wildcardColumns();
         Map<String, String> geoPointOverrides = effective.geoPointColumns();
-        Map<String, LanceOverrides.Column> textAnalyzerOverrides = effective.textAnalyzerColumns();
-        // Derived tokens column name -> the base column its text_analyzer
-        // override derives it from. Such a column is plugin-managed: it is
-        // hidden from the mapping (queries reach it through the base
-        // field's tokens_column) and carries the whitespace FTS index the
-        // base field's queries run against.
-        Map<String, String> derivedToBase = new LinkedHashMap<>();
-        for (Map.Entry<String, LanceOverrides.Column> entry : textAnalyzerOverrides.entrySet()) {
-            derivedToBase.put(LanceOverrides.derivedColumnName(entry.getKey(), entry.getValue()), entry.getKey());
-        }
-        Map<String, LanceField> fieldsByName = new LinkedHashMap<>();
-        for (LanceField field : lanceSchema.fields()) {
-            fieldsByName.put(field.getName(), field);
-        }
         for (LanceField field : lanceSchema.fields()) {
             ArrowType type = field.getType();
             String name = field.getName();
             int fieldId = field.getId();
-            if (derivedToBase.containsKey(name) && type instanceof ArrowType.Utf8) {
-                // The plugin-managed tokens column of a text_analyzer
-                // override: queries reach it through the base field's
-                // tokens_column, so it does not surface as a field of its
-                // own, but it is the FTS build and optimise target of the
-                // analyzer mode.
-                notes.add(name + ": derived tokens column of [" + derivedToBase.get(name) + "], not surfaced");
-                ftsColumns.add(name);
-                continue;
-            }
             boolean declaredPk = field.getMetadata() != null && field.getMetadata().containsKey(PK_METADATA_KEY);
             if (declaredPk) {
                 // Lance's Rust schema validator refuses a table whose
@@ -479,69 +411,6 @@ public class RestAttachAction extends BaseRestHandler {
                 mapping.field("index", false).field("doc_values", true).endObject();
                 scalarColumns.add(name);
             } else if (type instanceof ArrowType.Utf8) {
-                if (textAnalyzerOverrides.containsKey(name)) {
-                    LanceOverrides.Column override = textAnalyzerOverrides.get(name);
-                    String derived = LanceOverrides.derivedColumnName(name, override);
-                    LanceField derivedField = fieldsByName.get(derived);
-                    if (derivedField != null && derivedField.getType() instanceof ArrowType.Utf8) {
-                        // The backfill commits the derived column first and
-                        // its inverted index in a second commit. Only the
-                        // second one makes the analyzer mode servable: a
-                        // match on the derived column without its index is
-                        // a flat scan of the whole column, so the field
-                        // stays on its default mapping (the base column's
-                        // own index, or keyword) until the index exists.
-                        boolean derivedIndexed = !dataset.describeIndices(
-                            new IndexCriteria.Builder().forColumn(derived).mustSupportFts(true).build()
-                        ).isEmpty();
-                        if (derivedIndexed) {
-                            // The analyzer mode: the field surfaces under its own
-                            // name as lance_text, term and FTS queries run against
-                            // the derived tokens column (tokens_column), and the
-                            // query text goes through the same OpenSearch analyzer
-                            // (meta.lance_analyzer) before it reaches Lance, so
-                            // the index-time and query-time tokenisation agree.
-                            mapping.startObject(name).field("type", "lance_text");
-                            mapping.field("tokens_column", derived);
-                            mapping.startObject("meta");
-                            mapping.field("lance_field_id", Integer.toString(fieldId));
-                            mapping.field("lance_arrow_type", arrowTypeIdentity(type));
-                            mapping.field("lance_analyzer", override.analyzer());
-                            mapping.endObject();
-                            writeMultiFieldsBlock(mapping, name, multiFields);
-                            mapping.endObject();
-                            continue;
-                        }
-                        notes.add(
-                            name
-                                + ": text_analyzer override pending; derived column ["
-                                + derived
-                                + "] has no inverted index in this version"
-                        );
-                    } else if (derivedField != null) {
-                        String message = "[overrides."
-                            + name
-                            + "] derived column ["
-                            + derived
-                            + "] exists with Arrow type "
-                            + derivedField.getType()
-                            + "; the analyzer mode needs a Utf8 tokens column. Declare a different [derived_column_name]";
-                        if (!lenient) {
-                            throw new IllegalArgumentException(message);
-                        }
-                        notes.add(name + ": text_analyzer override skipped (" + message + ")");
-                    } else {
-                        // The backfill has not created the tokens column yet
-                        // (attach with derive: async, or a namespace poll
-                        // before the attach-side backfill lands). The column
-                        // derives by the default rules this cycle; the
-                        // re-derivation after the index commit flips it to
-                        // the analyzer mode.
-                        notes.add(
-                            name + ": text_analyzer override pending; derived column [" + derived + "] does not exist in this version"
-                        );
-                    }
-                }
                 boolean hasFts = !dataset.describeIndices(new IndexCriteria.Builder().forColumn(name).mustSupportFts(true).build())
                     .isEmpty();
                 if (ipOverrides.contains(name)) {
@@ -552,8 +421,7 @@ public class RestAttachAction extends BaseRestHandler {
                     // SortedSetDocValues, which is exactly the doc-values
                     // shape IpFieldType queries, sorts and aggregates
                     // over. The meta keeps the real Arrow type. Like a
-                    // keyword override, the column leaves the FTS build
-                    // and optimise targets.
+                    // keyword override, the column leaves ftsColumns.
                     startFieldWithId(mapping, name, fieldId, "ip", arrowTypeIdentity(type));
                     mapping.field("index", false).field("doc_values", true);
                     writeMultiFieldsBlock(mapping, name, multiFields);
@@ -567,11 +435,10 @@ public class RestAttachAction extends BaseRestHandler {
                 } else {
                     // Either no FTS index, or the operator overrode the
                     // column to keyword or wildcard: map it onto the
-                    // doc-values path and leave it out of ftsColumns so
-                    // the index build paths do not create or optimise an
-                    // FTS index for it. The Lance inverted index the
-                    // table may carry stays untouched; this index just
-                    // does not use it. A `wildcard` override emits the
+                    // doc-values path and leave it out of ftsColumns. The
+                    // Lance inverted index the table may carry stays
+                    // untouched; this index just does not use it. A
+                    // `wildcard` override emits the
                     // same keyword mapping (the reader has no postings
                     // for the n gram accelerated wildcard field type of
                     // OpenSearch core, and keyword doc values already
@@ -630,8 +497,7 @@ public class RestAttachAction extends BaseRestHandler {
                     // lance_knn call would hit a 500 inside Lance ("Column X has
                     // element type Y and the query vector is Float32"). Surface the
                     // column so the operator sees it, but leave it out of
-                    // vectorColumns so no auto vector index is attempted and
-                    // ensureVectorIndexes / optimizeExistingVectorIndexes skip it.
+                    // vectorColumns.
                     String elementType = childType == null ? "unknown" : childType.toString();
                     notes.add(
                         name
@@ -871,13 +737,6 @@ public class RestAttachAction extends BaseRestHandler {
                 "[overrides." + baseName + ".type=wildcard] needs a Utf8 column; [" + baseName + "] is " + type
             );
         }
-        if (LanceOverrides.TYPE_TEXT_ANALYZER.equals(column.type())) {
-            if (!(type instanceof ArrowType.Utf8)) {
-                throw new IllegalArgumentException(
-                    "[overrides." + baseName + ".type=text_analyzer] needs a Utf8 column; [" + baseName + "] is " + type
-                );
-            }
-        }
         if (LanceOverrides.TYPE_GEO_POINT.equals(column.type())) {
             boolean structShape = false;
             boolean fslShape = false;
@@ -954,109 +813,6 @@ public class RestAttachAction extends BaseRestHandler {
                 }
             }
         }
-    }
-
-    /**
-     * Validate the {@code indexes} clause's per-column index type
-     * preferences against the actual schema. A {@code scalar} preference
-     * needs a column the derivation classifies as scalar (signed
-     * integer, float, boolean, Date / Timestamp, Utf8 or
-     * List&lt;Utf8&gt;); a {@code vector} preference needs a
-     * FixedSizeList&lt;Float32&gt; column. Strict mode ({@code lenient}
-     * false) throws {@link IllegalArgumentException} naming the column
-     * and its Arrow type, which attach answers as a 400; lenient mode
-     * (namespace surface and poll re-derivation, where one preference
-     * list applies to many tables) records a note and goes on. The full
-     * preference list stays persisted either way, so a column that
-     * appears in a later manifest picks its preference up.
-     *
-     * <p>A {@code scalar} preference on a Utf8 column that carries an
-     * FTS index passes this check (the Arrow type admits a scalar
-     * index) but never applies: the column classifies as
-     * {@code lance_text} and only the FTS build targets it.
-     */
-    static void validateIndexPreferences(
-        Map<String, LanceOverrides.IndexPreference> preferences,
-        LanceSchema lanceSchema,
-        boolean lenient,
-        List<String> notes
-    ) {
-        if (preferences.isEmpty()) {
-            return;
-        }
-        Map<String, LanceField> fieldsByName = new LinkedHashMap<>();
-        for (LanceField field : lanceSchema.fields()) {
-            fieldsByName.put(field.getName(), field);
-        }
-        for (Map.Entry<String, LanceOverrides.IndexPreference> entry : preferences.entrySet()) {
-            String column = entry.getKey();
-            LanceOverrides.IndexPreference preference = entry.getValue();
-            try {
-                LanceField field = fieldsByName.get(column);
-                if (field == null) {
-                    throw new IllegalArgumentException("[indexes] references unknown column [" + column + "]");
-                }
-                ArrowType type = field.getType();
-                if (preference.scalar() != null && !isScalarIndexCapable(field, type)) {
-                    throw new IllegalArgumentException(
-                        "[indexes."
-                            + column
-                            + ".scalar="
-                            + preference.scalar()
-                            + "] needs a scalar column (signed integer, float, boolean, date, timestamp, Utf8 or List<Utf8>); ["
-                            + column
-                            + "] is "
-                            + type
-                    );
-                }
-                if (preference.vector() != null && !isVectorIndexCapable(field, type)) {
-                    throw new IllegalArgumentException(
-                        "[indexes."
-                            + column
-                            + ".vector="
-                            + preference.vector()
-                            + "] needs a FixedSizeList<Float32> column; ["
-                            + column
-                            + "] is "
-                            + type
-                    );
-                }
-            } catch (IllegalArgumentException e) {
-                if (!lenient) {
-                    throw e;
-                }
-                notes.add(column + ": index preference skipped (" + e.getMessage() + ")");
-            }
-        }
-    }
-
-    private static boolean isScalarIndexCapable(LanceField field, ArrowType type) {
-        if (type instanceof ArrowType.Int intType) {
-            return intType.getIsSigned() && intType.getBitWidth() <= 64;
-        }
-        if (type instanceof ArrowType.FloatingPoint fp) {
-            return fp.getPrecision() == FloatingPointPrecision.SINGLE || fp.getPrecision() == FloatingPointPrecision.DOUBLE;
-        }
-        if (type instanceof ArrowType.Bool || type instanceof ArrowType.Date || type instanceof ArrowType.Timestamp) {
-            return true;
-        }
-        if (type instanceof ArrowType.Utf8) {
-            return true;
-        }
-        return type instanceof ArrowType.List
-            && field.getChildren().size() == 1
-            && field.getChildren().get(0).getType() instanceof ArrowType.Utf8;
-    }
-
-    private static boolean isVectorIndexCapable(LanceField field, ArrowType type) {
-        if (!(type instanceof ArrowType.FixedSizeList)) {
-            return false;
-        }
-        // LanceField.getChildren() is empty for FixedSizeList; the item
-        // type only materialises through the Arrow representation.
-        Field arrow = field.asArrowField();
-        ArrowType childType = arrow.getChildren().isEmpty() ? null : arrow.getChildren().get(0).getType();
-        return childType instanceof ArrowType.FloatingPoint fp && fp.getPrecision() == FloatingPointPrecision.SINGLE;
     }
 
     /**

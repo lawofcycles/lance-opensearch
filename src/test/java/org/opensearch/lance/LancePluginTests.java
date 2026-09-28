@@ -89,7 +89,6 @@ public class LancePluginTests extends OpenSearchTestCase {
         // a rename is a breaking change and has to show up in review.
         Set<String> names = plugin.getActions().stream().map(h -> h.getAction().name()).collect(java.util.stream.Collectors.toSet());
         assertTrue(names.toString(), names.contains("cluster:admin/lance/attach"));
-        assertTrue(names.toString(), names.contains("indices:admin/lance/build_indexes"));
         assertTrue(names.toString(), names.contains("indices:monitor/lance/refs"));
         assertTrue(names.toString(), names.contains("cluster:monitor/lance/namespace"));
         assertTrue(names.toString(), names.contains("cluster:admin/lance/namespace/update"));
@@ -110,10 +109,8 @@ public class LancePluginTests extends OpenSearchTestCase {
         assertTrue(settingKeys.contains(LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING));
         assertTrue(settingKeys.contains(LanceEngineFactory.MULTI_FIELDS_SETTING));
         assertTrue(settingKeys.contains("index.plugins.lance.uncovered_fragment_policy"));
-        assertTrue(settingKeys.contains(LanceEngineFactory.INDEX_PLACEMENT_SETTING));
         assertTrue(settingKeys.contains(LanceEngineFactory.TAG_SETTING));
         assertTrue(settingKeys.contains("plugins.lance.namespace.poll_cadence"));
-        assertTrue(settingKeys.contains("plugins.lance.builder.max_rows"));
     }
 
     public void testEverySettingHasACurrentAndADeprecatedKey() {
@@ -128,8 +125,8 @@ public class LancePluginTests extends OpenSearchTestCase {
         List<Setting<?>> settings = plugin.getSettings();
         List<Setting<?>> current = settings.stream().filter(s -> s.isDeprecated() == false).collect(java.util.stream.Collectors.toList());
         List<Setting<?>> deprecated = settings.stream().filter(Setting::isDeprecated).collect(java.util.stream.Collectors.toList());
-        // 39 node settings and 10 index settings.
-        assertEquals(49, current.size());
+        // 37 node settings and 9 index settings.
+        assertEquals(46, current.size());
         assertEquals(current.size() - introducedAfterRename.size(), deprecated.size());
         java.util.Map<String, Setting<?>> deprecatedByKey = deprecated.stream()
             .collect(java.util.stream.Collectors.toMap(Setting::getKey, s -> s));
@@ -164,7 +161,6 @@ public class LancePluginTests extends OpenSearchTestCase {
         // and a current key set next to an old one wins.
         Settings settings = Settings.builder()
             .put("lance.namespace.poll_cadence", "3s")
-            .put("lance.builder.max_rows", 42)
             .putList("lance.allowed_table_roots", "/a", "/b")
             .put("lance.native_memory.limit", "7gb")
             .put("lance.cache.column_share", 0.25)
@@ -176,7 +172,6 @@ public class LancePluginTests extends OpenSearchTestCase {
             .put("plugins.lance.fragment_path.slices", 9)
             .build();
         assertEquals(TimeValue.timeValueSeconds(3), LancePlugin.NAMESPACE_POLL_CADENCE_SETTING.get(settings));
-        assertEquals(Long.valueOf(42L), LancePlugin.BUILDER_MAX_ROWS_SETTING.get(settings));
         assertEquals(List.of("/a", "/b"), LancePlugin.ALLOWED_TABLE_ROOTS_SETTING.get(settings));
         assertEquals("7gb", LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.get(settings));
         assertEquals(0.25, LancePlugin.CACHE_COLUMN_SHARE_SETTING.get(settings), 0.0);
@@ -192,7 +187,6 @@ public class LancePluginTests extends OpenSearchTestCase {
         assertSettingDeprecationsAndWarnings(
             new Setting<?>[] {
                 LancePlugin.NAMESPACE_POLL_CADENCE_SETTING_DEPRECATED,
-                LancePlugin.BUILDER_MAX_ROWS_SETTING_DEPRECATED,
                 LancePlugin.ALLOWED_TABLE_ROOTS_SETTING_DEPRECATED,
                 LancePlugin.NATIVE_MEMORY_LIMIT_SETTING_DEPRECATED,
                 LancePlugin.CACHE_COLUMN_SHARE_SETTING_DEPRECATED,
@@ -329,23 +323,6 @@ public class LancePluginTests extends OpenSearchTestCase {
         }
     }
 
-    public void testIndexPlacementSettingAcceptsOnlyKnownValues() {
-        assertEquals("in_table", LancePlugin.INDEX_PLACEMENT_SETTING.getDefault(org.opensearch.common.settings.Settings.EMPTY));
-        assertEquals(
-            "node_local",
-            LancePlugin.INDEX_PLACEMENT_SETTING.get(
-                org.opensearch.common.settings.Settings.builder().put(LanceEngineFactory.INDEX_PLACEMENT_SETTING, "node_local").build()
-            )
-        );
-        IllegalArgumentException rejected = expectThrows(
-            IllegalArgumentException.class,
-            () -> LancePlugin.INDEX_PLACEMENT_SETTING.get(
-                org.opensearch.common.settings.Settings.builder().put(LanceEngineFactory.INDEX_PLACEMENT_SETTING, "sideways").build()
-            )
-        );
-        assertTrue(rejected.getMessage(), rejected.getMessage().contains("in_table"));
-    }
-
     public void testNamespacePollCadenceHasSaneDefaults() {
         Setting<?> setting = plugin.getSettings()
             .stream()
@@ -353,16 +330,6 @@ public class LancePluginTests extends OpenSearchTestCase {
             .findFirst()
             .orElseThrow();
         assertTrue("poll cadence should be node-scoped", setting.hasNodeScope());
-    }
-
-    public void testBuilderMaxRowsDefaultsToOneMillion() {
-        Setting<?> setting = plugin.getSettings()
-            .stream()
-            .filter(s -> "plugins.lance.builder.max_rows".equals(s.getKey()))
-            .findFirst()
-            .orElseThrow();
-        assertEquals(Long.valueOf(1_000_000L), setting.getDefault(org.opensearch.common.settings.Settings.EMPTY));
-        assertTrue("max_rows should be node-scoped", setting.hasNodeScope());
     }
 
     public void testAttachWarmIndexesDefaultsToMetadata() {
