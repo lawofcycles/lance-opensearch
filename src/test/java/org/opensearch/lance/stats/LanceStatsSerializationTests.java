@@ -120,7 +120,6 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 ),
                 LanceNodeStats.IndexReaderStats.withheld("wrapped", false)
             ),
-            List.of(new LanceNodeStats.LocalCloneStats("cloned", 4321L, 9L)),
             5,
             123L,
             2,
@@ -142,7 +141,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             new LanceNodeStats.FetchStats(11L, 1_234L, 33L, 456L, 78L, 8L, 3L)
         ).withRequestCache(new LanceNodeStats.RequestCacheStats(true, 2048L, 1_048_576L, 3, 11L, 4L, 1L, 2L, 6L))
             .withFetchCache(new LanceNodeStats.FetchCacheStats(true, 8192L, 2_097_152L, 40, 120L, 30L, 5L, 9L, 7L, 25L))
-            .withFailures(new LanceNodeStats.FailureCounters(3L, Map.of("cloned", 3L), 2L, 1L));
+            .withFailures(new LanceNodeStats.FailureCounters(2L, 1L));
     }
 
     /** The admission rejections in the gate's key order, one per kind. */
@@ -237,9 +236,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"renamed_fields\":[{\"from\":\"ts\",\"to\":\"event_ts\",\"lance_field_id\":1}]},"
                     + "\"small\":{\"rows\":120,\"shard_reader_rows\":120,\"nested_docs\":14,\"lucene_bound_exceeded\":false,"
                     + "\"index_types\":{\"rating\":[\"BTree\",\"Bitmap\"]}},"
-                    + "\"wrapped\":{\"lucene_bound_exceeded\":false}},"
-                    + "\"local_clones\":{\"resolution_failures\":3,"
-                    + "\"cloned\":{\"local_clone_bytes\":4321,\"source_version\":9,\"resolution_failures\":3}}}",
+                    + "\"wrapped\":{\"lucene_bound_exceeded\":false}}}",
                 builder.toString()
             );
         }
@@ -286,13 +283,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                         + "\"column_load\":0}},\"warm_up\":{\"mode\":\"metadata\""
                 )
             );
-            assertTrue(
-                json,
-                json.endsWith(
-                    "\"local_clones\":{\"resolution_failures\":3,"
-                        + "\"cloned\":{\"local_clone_bytes\":4321,\"source_version\":9,\"resolution_failures\":3}}}}}"
-                )
-            );
+            assertTrue(json, json.endsWith("\"wrapped\":{\"lucene_bound_exceeded\":false}}}}}"));
         }
     }
 
@@ -316,7 +307,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 assertEquals(LanceNodeStats.WIRE_VERSION, in.readVInt());
             }
         }
-        // The stream a version 12 data node would return: today's fields
+        // The stream a version 13 data node would return: today's fields
         // and one optional block this coordinator steps over.
         BytesReference newer = WireVersionTestSupport.asNextVersion(
             sample(),
@@ -509,8 +500,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 assertEquals(sample().fetch(), asVersion9.fetch());
                 assertEquals("the blocks version 9 knows are read", sample().fetchCache(), asVersion9.fetchCache());
                 assertEquals("the block it does not know is stepped over", LanceNodeStats.FailureCounters.NONE, asVersion9.failures());
-                assertEquals(0L, asVersion9.failures().cloneResolutionFailures());
-                assertEquals(Map.of(), asVersion9.failures().cloneResolutionFailuresByIndex());
+                assertEquals(0L, asVersion9.failures().tableStatisticsFailures());
                 assertEquals(unflagged(sample().indices()), asVersion9.indices());
                 assertEquals("the reader consumed the blocks", -1, in.read());
             }
@@ -575,8 +565,12 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             // errors, 5 the statistics progress counters, 6 the retained
             // pool's scope, 7 the result cache, 8 the fetch take counters,
             // 9 the fetch cache, 10 the failure counters, 11 the indexes
-            // whose counts are withheld, in that order.
+            // whose counts are withheld, 12 the empty block of the version
+            // that removed the node-local clone figures, in that order.
             int trailing = 0;
+            if (marker < 12) {
+                trailing += blockSize(o -> {});
+            }
             if (marker < 11) {
                 trailing += blockSize(o -> o.writeStringCollection(rowsWithheldIndices(stats)));
             }
@@ -907,7 +901,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
         ScanAdmissionTestSupport.reset();
         LanceFetchCache fetchCache = new LanceFetchCache(4096L, 1024L, true, TimeValue.ZERO);
         fetchCache.table("uuid", 3L).put(5L, List.of("id"), new Object[] { 5L });
-        LanceStatsCollector collector = new LanceStatsCollector(null, () -> 0L, () -> null, null, null, null, null, fetchCache::stats);
+        LanceStatsCollector collector = new LanceStatsCollector(null, () -> 0L, () -> null, null, null, null, fetchCache::stats);
         LanceNodeStats stats = collector.collect();
         assertEquals(fetchCache.stats(), stats.fetchCache());
         assertTrue(stats.fetchCache().enabled());

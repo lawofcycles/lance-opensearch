@@ -18,7 +18,6 @@ import org.opensearch.lance.engine.ColumnStore;
 import org.opensearch.lance.engine.FetchTakeStats;
 import org.opensearch.lance.engine.HeapFallbackStats;
 import org.opensearch.lance.engine.LanceIndexWarmer;
-import org.opensearch.lance.engine.LanceLocalClones;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.plan.execute.FragmentPlanRefiner;
 import org.opensearch.lance.query.ScanAdmission;
@@ -53,9 +52,8 @@ import org.opensearch.lance.query.LanceFtsQuery;
  * columns of small hit sets, how many rows and columns they asked for
  * and how long they took. {@code fetch_cache} reads the node's cache of
  * the rows behind hits ({@code LanceFetchCache}). The failure counters
- * ({@code local_clones.resolution_failures}, {@code plan.statistics.failures},
- * {@code plan.pruned.zone_map_failures}) read {@link LanceLocalClones},
- * the warm cache's table statistics and {@link FragmentPlanRefiner}.
+ * ({@code plan.statistics.failures}, {@code plan.pruned.zone_map_failures})
+ * read the warm cache's table statistics and {@link FragmentPlanRefiner}.
  */
 public final class LanceStatsCollector {
 
@@ -63,7 +61,6 @@ public final class LanceStatsCollector {
     private final LongSupplier sessionBytes;
     private final Supplier<IndexCacheSizing> indexCacheSizing;
     private final LanceIndexWarmer indexWarmer;
-    private final Supplier<Map<String, LanceLocalClones.CloneStat>> localClones;
     private final Supplier<LanceNodeStats.FreshnessStats> freshness;
     private final Supplier<LanceNodeStats.RequestCacheStats> requestCache;
     private final Supplier<LanceNodeStats.FetchCacheStats> fetchCache;
@@ -81,7 +78,7 @@ public final class LanceStatsCollector {
      *                         then zero)
      */
     public LanceStatsCollector(LanceWarmCache warmCache, LongSupplier sessionBytes, Supplier<IndexCacheSizing> indexCacheSizing) {
-        this(warmCache, sessionBytes, indexCacheSizing, null, null);
+        this(warmCache, sessionBytes, indexCacheSizing, null);
     }
 
     /**
@@ -99,23 +96,6 @@ public final class LanceStatsCollector {
     }
 
     /**
-     * @param localClones reads this node's {@code node_local} clone
-     *                    directories (bytes and recorded source version
-     *                    per index), or {@code null} when the plugin
-     *                    created no clone service (the {@code local_clones}
-     *                    block is then empty)
-     */
-    public LanceStatsCollector(
-        LanceWarmCache warmCache,
-        LongSupplier sessionBytes,
-        Supplier<IndexCacheSizing> indexCacheSizing,
-        LanceIndexWarmer indexWarmer,
-        Supplier<Map<String, LanceLocalClones.CloneStat>> localClones
-    ) {
-        this(warmCache, sessionBytes, indexCacheSizing, indexWarmer, localClones, null);
-    }
-
-    /**
      * @param freshness reads this node's freshness counters (the checks of
      *                  the Lance backed shards it holds), or {@code null}
      *                  when the plugin created no freshness service (the
@@ -126,10 +106,9 @@ public final class LanceStatsCollector {
         LongSupplier sessionBytes,
         Supplier<IndexCacheSizing> indexCacheSizing,
         LanceIndexWarmer indexWarmer,
-        Supplier<Map<String, LanceLocalClones.CloneStat>> localClones,
         Supplier<LanceNodeStats.FreshnessStats> freshness
     ) {
-        this(warmCache, sessionBytes, indexCacheSizing, indexWarmer, localClones, freshness, null);
+        this(warmCache, sessionBytes, indexCacheSizing, indexWarmer, freshness, null);
     }
 
     /**
@@ -143,11 +122,10 @@ public final class LanceStatsCollector {
         LongSupplier sessionBytes,
         Supplier<IndexCacheSizing> indexCacheSizing,
         LanceIndexWarmer indexWarmer,
-        Supplier<Map<String, LanceLocalClones.CloneStat>> localClones,
         Supplier<LanceNodeStats.FreshnessStats> freshness,
         Supplier<LanceNodeStats.RequestCacheStats> requestCache
     ) {
-        this(warmCache, sessionBytes, indexCacheSizing, indexWarmer, localClones, freshness, requestCache, null);
+        this(warmCache, sessionBytes, indexCacheSizing, indexWarmer, freshness, requestCache, null);
     }
 
     /**
@@ -161,7 +139,6 @@ public final class LanceStatsCollector {
         LongSupplier sessionBytes,
         Supplier<IndexCacheSizing> indexCacheSizing,
         LanceIndexWarmer indexWarmer,
-        Supplier<Map<String, LanceLocalClones.CloneStat>> localClones,
         Supplier<LanceNodeStats.FreshnessStats> freshness,
         Supplier<LanceNodeStats.RequestCacheStats> requestCache,
         Supplier<LanceNodeStats.FetchCacheStats> fetchCache
@@ -170,7 +147,6 @@ public final class LanceStatsCollector {
         this.sessionBytes = sessionBytes;
         this.indexCacheSizing = indexCacheSizing;
         this.indexWarmer = indexWarmer;
-        this.localClones = localClones;
         this.freshness = freshness;
         this.requestCache = requestCache;
         this.fetchCache = fetchCache;
@@ -215,15 +191,6 @@ public final class LanceStatsCollector {
             }
             warmUps.sort((a, b) -> a.index().compareTo(b.index()));
         }
-        List<LanceNodeStats.LocalCloneStats> cloneStats = new ArrayList<>();
-        if (localClones != null) {
-            for (Map.Entry<String, LanceLocalClones.CloneStat> entry : localClones.get().entrySet()) {
-                cloneStats.add(
-                    new LanceNodeStats.LocalCloneStats(entry.getKey(), entry.getValue().bytes(), entry.getValue().sourceVersion())
-                );
-            }
-            cloneStats.sort((a, b) -> a.index().compareTo(b.index()));
-        }
         LanceNodeStats.FreshnessStats freshnessStats = freshness == null ? LanceNodeStats.FreshnessStats.NONE : freshness.get();
         LanceNodeStats.RequestCacheStats requestCacheStats = requestCache == null
             ? LanceNodeStats.RequestCacheStats.NONE
@@ -263,7 +230,6 @@ public final class LanceStatsCollector {
                 warmUpMode,
                 warmUps,
                 indices,
-                cloneStats,
                 0,
                 0L,
                 0,
@@ -308,7 +274,6 @@ public final class LanceStatsCollector {
             warmUpMode,
             warmUps,
             indices,
-            cloneStats,
             warmCache.tableStatistics().size(),
             warmCache.tableStatistics().collectMillisTotal(),
             warmCache.tableStatistics().pendingCount(),
@@ -323,22 +288,13 @@ public final class LanceStatsCollector {
 
     /**
      * The counters of the paths that fail or fall back without a mark
-     * in the response: the clone resolutions of {@link LanceLocalClones}
-     * (read from the node wide instance, zero when the plugin installed
-     * none), the failed collections of the warm cache's table statistics
-     * (zero without a warm cache) and the zone map reads the coordinator
-     * on this node could not do ({@link FragmentPlanRefiner#zoneMapFailures()}).
+     * in the response: the failed collections of the warm cache's table
+     * statistics (zero without a warm cache) and the zone map reads the
+     * coordinator on this node could not do
+     * ({@link FragmentPlanRefiner#zoneMapFailures()}).
      */
     private LanceNodeStats.FailureCounters failureCounters() {
-        LanceLocalClones clones = LanceLocalClones.instance();
-        long cloneFailures = clones == null ? 0L : clones.resolutionFailures();
-        Map<String, Long> cloneFailuresByIndex = clones == null ? Map.of() : clones.resolutionFailuresByIndex();
         long statisticsFailures = warmCache == null ? 0L : warmCache.tableStatistics().failureCount();
-        return new LanceNodeStats.FailureCounters(
-            cloneFailures,
-            cloneFailuresByIndex,
-            statisticsFailures,
-            FragmentPlanRefiner.zoneMapFailures()
-        );
+        return new LanceNodeStats.FailureCounters(statisticsFailures, FragmentPlanRefiner.zoneMapFailures());
     }
 }

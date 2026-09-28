@@ -91,12 +91,15 @@ import org.opensearch.lance.query.ScanAdmission;
  * figures ({@code fetch_cache}), shown as disabled with zero counters by
  * an older coordinator; version 10 added the failure counters of the
  * paths that fall back or fail without a mark in the response (the
- * node-local clone resolutions, the table statistics collections and the
- * zone map reads that failed), shown as zero by an older coordinator;
- * version 11 added the names of the indexes whose row counts are
- * withheld because a reader wrapper is installed
- * ({@link IndexReaderStats#rowsWithheld()}), shown by an older
- * coordinator as indexes with zero rows.
+ * table statistics collections and the zone map reads that failed),
+ * shown as zero by an older coordinator; version 11 added the names of
+ * the indexes whose row counts are withheld because a reader wrapper is
+ * installed ({@link IndexReaderStats#rowsWithheld()}), shown by an
+ * older coordinator as indexes with zero rows; version 12 removed the
+ * node-local clone list from the base layout and the clone resolution
+ * failures from the version 10 block, before the first release, so no
+ * reader of an earlier version exists, and writes an empty block so
+ * the framing stays one block per version.
  */
 public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
@@ -108,9 +111,10 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
      * plans made without statistics, 6 the identity of the scans the
      * retained pool was filled by, 7 the result cache figures, 8 the fetch
      * take counters, 9 the fetch cache figures, 10 the failure counters,
-     * 11 the indexes whose row counts are withheld.
+     * 11 the indexes whose row counts are withheld, 12 removed the
+     * node-local clone figures.
      */
-    public static final int WIRE_VERSION = 11;
+    public static final int WIRE_VERSION = 12;
 
     private final boolean cacheEnabled;
     private final int snapshotCount;
@@ -160,7 +164,6 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     private final String warmUpMode;
     private final List<LanceWarmUpStatus> warmUps;
     private final List<IndexReaderStats> indices;
-    private final List<LocalCloneStats> localClones;
     /**
      * How many times this node's fragment executor moved a pushed
      * operation of a shipped plan to the Lucene side, per reason
@@ -200,40 +203,26 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
     /**
      * How often the paths that answer without a mark in the response
-     * failed on this node since it started: the reads of a
-     * {@code node_local} index whose clone could not be resolved
-     * ({@code cloneResolutionFailures}, each of which failed its request,
-     * over every index and per index name), the table statistics
+     * failed on this node since it started: the table statistics
      * collections that threw ({@code tableStatisticsFailures}, the
      * requests planned without statistics) and the requests this node
      * coordinated whose zone maps could not be read
      * ({@code zoneMapFailures}, the requests planned without fragment
-     * pruning). Rendered as {@code local_clones.resolution_failures} and
-     * {@code local_clones.<index>.resolution_failures},
-     * {@code plan.statistics.failures} and
+     * pruning). Rendered as {@code plan.statistics.failures} and
      * {@code plan.pruned.zone_map_failures}. Travels in the version 10
      * block of {@link LanceNodeStats}.
      */
-    public record FailureCounters(long cloneResolutionFailures, Map<String, Long> cloneResolutionFailuresByIndex,
-        long tableStatisticsFailures, long zoneMapFailures) implements Writeable {
+    public record FailureCounters(long tableStatisticsFailures, long zoneMapFailures) implements Writeable {
 
         /** What an older node stands for: nothing counted. */
-        public static final FailureCounters NONE = new FailureCounters(0L, Map.of(), 0L, 0L);
-
-        public FailureCounters {
-            cloneResolutionFailuresByIndex = cloneResolutionFailuresByIndex == null
-                ? Map.of()
-                : Collections.unmodifiableMap(new LinkedHashMap<>(cloneResolutionFailuresByIndex));
-        }
+        public static final FailureCounters NONE = new FailureCounters(0L, 0L);
 
         public FailureCounters(StreamInput in) throws IOException {
-            this(in.readVLong(), in.readOrderedMap(StreamInput::readString, StreamInput::readVLong), in.readVLong(), in.readVLong());
+            this(in.readVLong(), in.readVLong());
         }
 
         @Override
         public void writeTo(StreamOutput out) throws IOException {
-            out.writeVLong(cloneResolutionFailures);
-            out.writeMap(cloneResolutionFailuresByIndex, StreamOutput::writeString, StreamOutput::writeVLong);
             out.writeVLong(tableStatisticsFailures);
             out.writeVLong(zoneMapFailures);
         }
@@ -449,27 +438,6 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
     }
 
     /**
-     * One node-local shallow clone directory on this node (an index
-     * attached with {@code index.plugins.lance.index_placement = node_local}):
-     * the bytes its files occupy under the node's data path (manifests
-     * and search-index files only; data files stay in the source) and
-     * the source manifest version the clone was created at.
-     */
-    public record LocalCloneStats(String index, long bytes, long sourceVersion) implements Writeable {
-
-        public LocalCloneStats(StreamInput in) throws IOException {
-            this(in.readString(), in.readVLong(), in.readLong());
-        }
-
-        @Override
-        public void writeTo(StreamOutput out) throws IOException {
-            out.writeString(index);
-            out.writeVLong(bytes);
-            out.writeLong(sourceVersion);
-        }
-    }
-
-    /**
      * The shard reader of one Lance-backed index this node hosts: the
      * live rows of the table version it was opened over, the live rows
      * it holds, the hidden nested child docs its leaves carry beyond
@@ -621,7 +589,6 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             "none",
             List.of(),
             List.of(),
-            List.of(),
             0,
             0L,
             Map.of(),
@@ -662,7 +629,6 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         String warmUpMode,
         List<LanceWarmUpStatus> warmUps,
         List<IndexReaderStats> indices,
-        List<LocalCloneStats> localClones,
         int planStatisticsTables,
         long planStatisticsCollectMillisTotal,
         Map<String, Long> planRefinements,
@@ -701,7 +667,6 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             warmUpMode,
             warmUps,
             indices,
-            localClones,
             planStatisticsTables,
             planStatisticsCollectMillisTotal,
             0,
@@ -745,7 +710,6 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         String warmUpMode,
         List<LanceWarmUpStatus> warmUps,
         List<IndexReaderStats> indices,
-        List<LocalCloneStats> localClones,
         int planStatisticsTables,
         long planStatisticsCollectMillisTotal,
         int planStatisticsPending,
@@ -787,7 +751,6 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             warmUpMode,
             warmUps,
             indices,
-            localClones,
             planStatisticsTables,
             planStatisticsCollectMillisTotal,
             planStatisticsPending,
@@ -832,7 +795,6 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         String warmUpMode,
         List<LanceWarmUpStatus> warmUps,
         List<IndexReaderStats> indices,
-        List<LocalCloneStats> localClones,
         int planStatisticsTables,
         long planStatisticsCollectMillisTotal,
         int planStatisticsPending,
@@ -874,7 +836,6 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.warmUpMode = warmUpMode;
         this.warmUps = List.copyOf(warmUps);
         this.indices = List.copyOf(indices);
-        this.localClones = List.copyOf(localClones);
         this.planStatisticsTables = planStatisticsTables;
         this.planStatisticsCollectMillisTotal = planStatisticsCollectMillisTotal;
         this.planStatisticsPending = planStatisticsPending;
@@ -936,7 +897,6 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.warmUpMode = copy.warmUpMode;
         this.warmUps = copy.warmUps;
         this.indices = copy.indices;
-        this.localClones = copy.localClones;
         this.planStatisticsTables = copy.planStatisticsTables;
         this.planStatisticsCollectMillisTotal = copy.planStatisticsCollectMillisTotal;
         this.planStatisticsPending = copy.planStatisticsPending;
@@ -1020,7 +980,6 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         }
         this.warmUps = List.copyOf(read);
         List<IndexReaderStats> readIndices = in.readList(IndexReaderStats::new);
-        this.localClones = in.readList(LocalCloneStats::new);
         this.planStatisticsTables = in.readVInt();
         this.planStatisticsCollectMillisTotal = in.readVLong();
         this.planRefinements = Collections.unmodifiableMap(in.readOrderedMap(StreamInput::readString, StreamInput::readVLong));
@@ -1041,6 +1000,8 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.failures = reader.block(10, FailureCounters::new, FailureCounters.NONE);
         List<String> withheld = reader.block(11, StreamInput::readStringList, List.of());
         this.indices = withRowsWithheld(readIndices, withheld);
+        // Version 12 removed fields and added none; its block is empty.
+        reader.block(12, block -> null, null);
         reader.finish();
     }
 
@@ -1126,7 +1087,6 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             warmUp.writeTo(out);
         }
         out.writeList(indices);
-        out.writeList(localClones);
         out.writeVInt(planStatisticsTables);
         out.writeVLong(planStatisticsCollectMillisTotal);
         out.writeMap(planRefinements, StreamOutput::writeString, StreamOutput::writeVLong);
@@ -1166,6 +1126,9 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         // older coordinator shows them with the zero counts the base
         // layout carries, never with the counts themselves.
         WireVersion.writeBlock(out, false, o -> o.writeStringCollection(rowsWithheldIndices()));
+        // Version 12 removed the node-local clone figures and added no
+        // field; the empty block keeps one block per version.
+        WireVersion.writeBlock(out, false, o -> {});
     }
 
     @Override
@@ -1337,31 +1300,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         }
         builder.endObject();
 
-        builder.startObject("local_clones");
-        builder.field("resolution_failures", failures.cloneResolutionFailures());
-        Map<String, Long> unlistedFailures = new LinkedHashMap<>(failures.cloneResolutionFailuresByIndex());
-        for (LocalCloneStats clone : localClones) {
-            builder.startObject(clone.index());
-            builder.field("local_clone_bytes", clone.bytes());
-            builder.field("source_version", clone.sourceVersion());
-            Long cloneFailures = unlistedFailures.remove(clone.index());
-            builder.field("resolution_failures", cloneFailures == null ? 0L : cloneFailures);
-            builder.endObject();
-        }
-        // An index whose clone never came to exist on this node (every
-        // resolution failed before the directory was written) has no
-        // clone entry; its failures are still shown under its name.
-        for (Map.Entry<String, Long> unlisted : unlistedFailures.entrySet()) {
-            builder.startObject(unlisted.getKey());
-            builder.field("resolution_failures", unlisted.getValue());
-            builder.endObject();
-        }
-        builder.endObject();
         return builder;
-    }
-
-    public List<LocalCloneStats> localClones() {
-        return localClones;
     }
 
     /** The failure counters of this node; {@link FailureCounters#NONE} from a node that does not report them. */
@@ -1629,7 +1568,6 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             && warmUpMode.equals(other.warmUpMode)
             && warmUps.equals(other.warmUps)
             && indices.equals(other.indices)
-            && localClones.equals(other.localClones)
             && planStatisticsTables == other.planStatisticsTables
             && planStatisticsCollectMillisTotal == other.planStatisticsCollectMillisTotal
             && planStatisticsPending == other.planStatisticsPending
@@ -1678,7 +1616,6 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             warmUpMode,
             warmUps,
             indices,
-            localClones,
             planStatisticsTables,
             planStatisticsCollectMillisTotal,
             planStatisticsPending,
