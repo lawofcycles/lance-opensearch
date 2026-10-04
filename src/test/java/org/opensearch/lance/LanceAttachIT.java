@@ -794,6 +794,69 @@ public class LanceAttachIT extends LanceRestTestCase {
         }
     }
 
+    public void testGetUnderTheHidingWrapperAnswers404ForAHiddenRowAnd200ForAVisibleOne() throws Exception {
+        // The test hook installs a reader wrapper shaped like the security
+        // plugin's DLS reader on the index under the prefix, hiding the
+        // rows whose id is below 3. GET resolves the key through a Lance
+        // scan and then consults the wrapper's live docs, so a hidden row
+        // is a 404 as it is under DLS, while the same table attached
+        // outside the prefix answers the row.
+        String suffix = "getdls-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        String tableUri = LanceTableFactory.writeStructTable(scratchDir, tableName, 0);
+        String wrapped = "wrapped-" + suffix;
+        String plain = "plain-" + suffix;
+        setHidingWrapperIndexPrefix(wrapped + ":meta.region:id:3");
+        try {
+            for (String index : new String[] { wrapped, plain }) {
+                Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\",\"name\":\"" + index + "\"}");
+                assertEquals("attach failed: " + readAll(attach), RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+                ensureGreen(index);
+            }
+
+            Response visible = client().performRequest(new Request("GET", "/" + wrapped + "/_doc/4"));
+            assertEquals(200, visible.getStatusLine().getStatusCode());
+            String visibleBody = readAll(visible);
+            assertEquals(visibleBody, "true", String.valueOf(parseJson(visibleBody).get("found")));
+            assertEquals(visibleBody, 4, extractIntPath(visibleBody, "_source", "id"));
+
+            ResponseException hidden = expectThrows(
+                ResponseException.class,
+                () -> client().performRequest(new Request("GET", "/" + wrapped + "/_doc/1"))
+            );
+            String hiddenBody = readAll(hidden.getResponse());
+            assertEquals("a hidden row is a 404: " + hiddenBody, 404, hidden.getResponse().getStatusLine().getStatusCode());
+            assertEquals(hiddenBody, "false", String.valueOf(parseJson(hiddenBody).get("found")));
+
+            Response unwrapped = client().performRequest(new Request("GET", "/" + plain + "/_doc/1"));
+            assertEquals(200, unwrapped.getStatusLine().getStatusCode());
+            assertEquals(1, extractIntPath(readAll(unwrapped), "_source", "id"));
+
+            // A key the table does not have is a 404 on both.
+            ResponseException absent = expectThrows(
+                ResponseException.class,
+                () -> client().performRequest(new Request("GET", "/" + wrapped + "/_doc/99"))
+            );
+            assertEquals(404, absent.getResponse().getStatusLine().getStatusCode());
+        } finally {
+            setHidingWrapperIndexPrefix(null);
+            for (String index : new String[] { wrapped, plain }) {
+                try {
+                    client().performRequest(new Request("DELETE", "/" + index));
+                } catch (Exception ignored) {}
+            }
+            deleteRecursively(scratchDir);
+        }
+    }
+
+    private static void setHidingWrapperIndexPrefix(String value) throws IOException {
+        Request request = new Request("PUT", "/_cluster/settings");
+        String encoded = value == null ? "null" : "\"" + value + "\"";
+        request.setJsonEntity("{\"transient\":{\"plugins.lance.test.hiding_wrapper_index_prefix\":" + encoded + "}}");
+        assertEquals(RestStatus.OK.getStatus(), client().performRequest(request).getStatusLine().getStatusCode());
+    }
+
     public void testMultiFieldsExposesKeywordSubField() throws Exception {
         // multi_fields gives a lance_text column a keyword sub-field
         // backed by the same Lance column. The fixture's body values are

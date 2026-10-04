@@ -8,23 +8,15 @@ import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.cluster.service.ClusterService;
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
-import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-import org.apache.lucene.index.DirectoryReader;
-import org.apache.lucene.index.FilterDirectoryReader;
-import org.apache.lucene.index.FilterLeafReader;
-import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.search.TotalHits;
-import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.FixedBitSet;
 import org.opensearch.action.search.SearchResponse;
-import org.opensearch.common.CheckedFunction;
-import org.opensearch.index.IndexModule;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
@@ -34,7 +26,6 @@ import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.attach.LanceAttachAction;
 import org.opensearch.lance.attach.LanceAttachRequest;
 import org.opensearch.lance.attach.LanceAttachResponse;
-import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.query.LanceMatchQueryBuilder;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.search.SearchHit;
@@ -47,18 +38,22 @@ import org.opensearch.test.OpenSearchSingleNodeTestCase;
  * of rows the wrapper lets through, for every way of spelling
  * {@code match_all} and whatever {@code size} the request carries.
  *
- * <p>{@link DlsLikeReaderWrapperPlugin} installs a wrapper shaped like
- * the security plugin's DLS leaf reader: {@code getLiveDocs()} hides the
- * odd offset of every fragment leaf and {@code hasDeletions()} is true,
- * while {@code numDocs()} stays at the unfiltered value of the wrapped
- * leaf. That last detail is what a {@code MatchAllDocsQuery} Weight
- * answers {@code IndexSearcher.count} with, so a count that reaches
- * that shortcut reports the hidden rows too. The tests drive the
- * executor directly for the per node {@code matched} value and the
- * search API for the merged {@code hits.total.value}; the search API
- * cases also cover a scalar filter and a bare FTS clause, whose Lance
- * scan must not be clipped to {@code size} before the wrapper hides
- * rows, or the page comes back short.
+ * <p>The node runs with {@code plugins.lance.test.hiding_wrapper_index_prefix}
+ * set, so the plugin installs its {@code HidingReaderWrapper} on every
+ * Lance backed index whose name starts with {@code wrapped}. The wrapper
+ * is shaped like the security plugin's DLS leaf reader:
+ * {@code getLiveDocs()} hides the rows whose {@code id} is below 6 and
+ * {@code hasDeletions()} is true, while {@code numDocs()} stays at the
+ * unfiltered value of the wrapped leaf. That last detail is what a
+ * {@code MatchAllDocsQuery} Weight answers {@code IndexSearcher.count}
+ * with, so a count that reaches that shortcut reports the hidden rows
+ * too. With four rows per fragment the first leaf is hidden whole, the
+ * second in half and the third not at all. The tests drive the executor
+ * directly for the per node {@code matched} value and the search API for
+ * the merged {@code hits.total.value}; the search API cases also cover a
+ * scalar filter and a bare FTS clause, whose Lance scan must not be
+ * clipped to {@code size} before the wrapper hides rows, or the page
+ * comes back short.
  *
  * <p>Thread leak checks are off as in the other tests that load the Lance
  * native library.
@@ -68,11 +63,21 @@ public class ReaderWrapperMatchAllTotalTests extends OpenSearchSingleNodeTestCas
 
     private static final int ROWS = 12;
     private static final int ROWS_PER_FRAGMENT = 4;
-    private static final int VISIBLE_ROWS = ROWS / 2;
+    /** Rows whose {@code id} is below this are hidden. */
+    private static final int FIRST_VISIBLE_ID = 6;
+    private static final int VISIBLE_ROWS = ROWS - FIRST_VISIBLE_ID;
 
     @Override
     protected Collection<Class<? extends Plugin>> getPlugins() {
-        return List.of(LancePlugin.class, DlsLikeReaderWrapperPlugin.class);
+        return List.of(LancePlugin.class);
+    }
+
+    @Override
+    protected Settings nodeSettings() {
+        return Settings.builder()
+            .put(super.nodeSettings())
+            .put(LancePlugin.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.getKey(), "wrapped:body:id:" + FIRST_VISIBLE_ID)
+            .build();
     }
 
     private String attach(String indexName) throws Exception {
@@ -195,99 +200,13 @@ public class ReaderWrapperMatchAllTotalTests extends OpenSearchSingleNodeTestCas
 
     private static void assertOnlyVisibleRows(String label, List<SearchHit> hits) {
         for (SearchHit hit : hits) {
-            // Ids are "<fragment>-<offset>"; the wrapper hides odd
-            // offsets inside every fragment leaf.
-            int offset = Integer.parseInt(hit.getId().substring(hit.getId().indexOf('-') + 1));
-            assertEquals(label + ": hit " + hit.getId() + " should have been hidden", 0, offset % 2);
-        }
-    }
-
-    /**
-     * Installs a reader wrapper on every Lance-backed index that hides
-     * the odd documents of each leaf the way the security plugin's DLS
-     * leaf reader does: filtered {@code getLiveDocs()},
-     * {@code hasDeletions() == true}, and {@code numDocs()} left at the
-     * wrapped leaf's unfiltered value.
-     */
-    public static class DlsLikeReaderWrapperPlugin extends Plugin {
-
-        @Override
-        public void onIndexModule(IndexModule indexModule) {
-            if (indexModule.getSettings().get(LanceEngineFactory.TABLE_SETTING) != null) {
-                indexModule.setReaderWrapper(indexService -> new DlsLikeWrapperFactory());
-            }
-        }
-    }
-
-    static final class DlsLikeWrapperFactory implements CheckedFunction<DirectoryReader, DirectoryReader, IOException> {
-        @Override
-        public DirectoryReader apply(DirectoryReader reader) throws IOException {
-            return new DlsLikeDirectoryReader(reader);
-        }
-    }
-
-    static final class DlsLikeDirectoryReader extends FilterDirectoryReader {
-
-        DlsLikeDirectoryReader(DirectoryReader in) throws IOException {
-            super(in, new SubReaderWrapper() {
-                @Override
-                public LeafReader wrap(LeafReader reader) {
-                    return new DlsLikeLeafReader(reader);
-                }
-            });
-        }
-
-        @Override
-        protected DirectoryReader doWrapDirectoryReader(DirectoryReader in) throws IOException {
-            return new DlsLikeDirectoryReader(in);
-        }
-
-        @Override
-        public CacheHelper getReaderCacheHelper() {
-            return in.getReaderCacheHelper();
-        }
-    }
-
-    static final class DlsLikeLeafReader extends FilterLeafReader {
-
-        private final FixedBitSet liveDocs;
-
-        DlsLikeLeafReader(LeafReader in) {
-            super(in);
-            Bits inner = in.getLiveDocs();
-            liveDocs = new FixedBitSet(in.maxDoc());
-            for (int doc = 0; doc < in.maxDoc(); doc += 2) {
-                if (inner == null || inner.get(doc)) {
-                    liveDocs.set(doc);
-                }
-            }
-        }
-
-        @Override
-        public Bits getLiveDocs() {
-            return liveDocs;
-        }
-
-        @Override
-        public boolean hasDeletions() {
-            return true;
-        }
-
-        @Override
-        public int numDocs() {
-            // Deliberately not the cardinality of liveDocs: the security
-            // plugin's DlsGetEvaluator keeps in.numDocs() here.
-            return in.numDocs();
-        }
-
-        @Override
-        public CacheHelper getCoreCacheHelper() {
-            return in.getCoreCacheHelper();
-        }
-
-        @Override
-        public CacheHelper getReaderCacheHelper() {
-            return null;
+            // Ids are "<fragment>-<offset>" and row i sits at fragment
+            // i / 4, offset i % 4; the wrapper hides the rows below id 6.
+            int dash = hit.getId().indexOf('-');
+            int fragment = Integer.parseInt(hit.getId().substring(0, dash));
+            int offset = Integer.parseInt(hit.getId().substring(dash + 1));
+            int row = fragment * ROWS_PER_FRAGMENT + offset;
+            assertTrue(label + ": hit " + hit.getId() + " should have been hidden", row >= FIRST_VISIBLE_ID);
         }
     }
 }
