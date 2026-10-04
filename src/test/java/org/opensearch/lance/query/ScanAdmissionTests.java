@@ -16,6 +16,7 @@ import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
@@ -262,6 +263,193 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
     public void testAvailableMemoryReportsTheProbeReading() {
         ScanAdmission.setMemoryProbeForTests(() -> 123L);
         assertEquals(123L, ScanAdmission.availablePhysicalMemoryBytes());
+    }
+
+    // ---- full text scans over columns without an inverted index ----
+
+    public void testFlatFtsEstimateIsRowsTimesTheCoefficientPerColumn() {
+        // 1B rows at 100 bytes, once per column without an index; zero
+        // when the sum fits the shard share.
+        long rows = 1_000_000_000L;
+        assertEquals(rows * ScanAdmission.FLAT_FTS_BYTES_PER_ROW, ScanAdmission.flatFtsEstimateBytes(rows, 1, 8 * GB));
+        assertEquals(2L * rows * ScanAdmission.FLAT_FTS_BYTES_PER_ROW, ScanAdmission.flatFtsEstimateBytes(rows, 2, 8 * GB));
+        assertEquals(0L, ScanAdmission.flatFtsEstimateBytes(1_000L, 1, 8 * GB));
+        assertEquals(0L, ScanAdmission.flatFtsEstimateBytes(rows, 0, 1L));
+        // The r19 shape: a match over 1B rows on a 128 GB node reading
+        // 88 GB after the headroom is refused at 100 GB; a 20M row
+        // table (2 GB) is admitted.
+        long available = 96L * GB;
+        assertFalse(
+            ScanAdmission.decide(ScanAdmission.flatFtsEstimateBytes(rows, 1, 8 * GB), 0L, available, Long.MAX_VALUE, true, 8 * GB, 0L)
+                .admitted()
+        );
+        assertTrue(
+            ScanAdmission.decide(
+                ScanAdmission.flatFtsEstimateBytes(20_000_000L, 1, 8 * GB),
+                0L,
+                available,
+                Long.MAX_VALUE,
+                true,
+                8 * GB,
+                0L
+            ).admitted()
+        );
+    }
+
+    public void testColumnWithoutAnIndexIsJudgedAsFtsFlatWithItsOwnMessage() {
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(1, ByteSizeUnit.BYTES));
+        ScanAdmission.setHeadroom(new ByteSizeValue(Long.MAX_VALUE / 2, ByteSizeUnit.BYTES));
+        ScanAdmission.Shape shape = new ScanAdmission.Shape(true, false, 10L, 1, 0, Set.of("body"));
+        long ftsBefore = ScanAdmission.rejections(ScanAdmission.Kind.FTS);
+        // No column of the table carries an index: the one path judged
+        // is the flat scan, under its own kind and identity.
+        CircuitBreakingException rejection = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admit("demo", 1_000L, shape, Set.of(), Optional.empty(), null)
+        );
+        String message = rejection.getMessage();
+        assertTrue(message, message.startsWith("[" + ScanAdmission.LABEL + "] fts_flat estimate [97.6kb] exceeds available [0b]"));
+        assertTrue(message, message.contains("full text scan without an inverted index over [demo]"));
+        assertTrue(message, message.contains("flat BM25 scan of [1000] rows on column [body] at [100b] each"));
+        assertTrue(
+            message,
+            message.contains("Create an inverted index on column [body] with the table's writer (pylance create_scalar_index)")
+        );
+        assertTrue(message, message.contains("plugins.lance.admission.headroom / plugins.lance.admission.enabled"));
+        assertFalse("the indexed wording is not used", message.contains("inverted index document set"));
+        assertEquals(1_000L * ScanAdmission.FLAT_FTS_BYTES_PER_ROW, ScanAdmission.lastEstimateBytes());
+        assertEquals("fts_flat", ScanAdmission.lastKind());
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.FTS_FLAT));
+        assertEquals("the fts kind was not judged", ftsBefore, ScanAdmission.rejections(ScanAdmission.Kind.FTS));
+
+        // Two columns without an index: the estimate doubles and the
+        // message names both.
+        ScanAdmission.Shape two = new ScanAdmission.Shape(true, false, 10L, 2, 0, new LinkedHashSet<>(List.of("body", "title")));
+        CircuitBreakingException twice = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admit("demo", 1_000L, two, Set.of(), Optional.empty(), null)
+        );
+        assertTrue(twice.getMessage(), twice.getMessage().contains("on each of columns [body, title]"));
+        assertTrue(twice.getMessage(), twice.getMessage().contains("Create an inverted index on columns [body, title]"));
+        assertEquals(2L * 1_000L * ScanAdmission.FLAT_FTS_BYTES_PER_ROW, ScanAdmission.lastEstimateBytes());
+    }
+
+    public void testColumnWithAnIndexKeepsTheFtsJudgementAndAFlatColumnNextToItIsJudgedAfterIt() {
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(1, ByteSizeUnit.BYTES));
+        ScanAdmission.setHeadroom(new ByteSizeValue(Long.MAX_VALUE / 2, ByteSizeUnit.BYTES));
+        ScanAdmission.Shape indexed = new ScanAdmission.Shape(true, true, 0L, 1, 0, Set.of("body"));
+        // The column carries an index: the message and the estimate are
+        // the inverted index ones, unchanged, and nothing is charged
+        // for a flat path.
+        CircuitBreakingException rejection = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admit("demo", 1_000L, indexed, Set.of("body"), Optional.empty(), null)
+        );
+        assertTrue(rejection.getMessage(), rejection.getMessage().contains("fts estimate"));
+        assertTrue(rejection.getMessage(), rejection.getMessage().contains("inverted index document set"));
+        assertFalse(rejection.getMessage(), rejection.getMessage().contains("flat BM25"));
+        long expected = NativeMemoryLimit.invertedIndexEntryEstimateBytes(1_000L) + ScanAdmission.scanBufferEstimateBytes(1_000L, indexed);
+        assertEquals(expected, ScanAdmission.lastEstimateBytes());
+        assertEquals("fts", ScanAdmission.lastKind());
+        assertEquals(0L, ScanAdmission.rejections(ScanAdmission.Kind.FTS_FLAT));
+
+        // One indexed and one flat column in one shape: the indexed
+        // path is judged first (and refused here); with the memory to
+        // hold it the flat path is judged next under its own kind.
+        ScanAdmission.Shape mixed = new ScanAdmission.Shape(true, true, 0L, 2, 0, new LinkedHashSet<>(List.of("body", "title")));
+        CircuitBreakingException first = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admit("demo", 1_000L, mixed, Set.of("body"), Optional.empty(), null)
+        );
+        assertTrue(first.getMessage(), first.getMessage().contains("fts estimate"));
+        long ftsEstimate = ScanAdmission.lastEstimateBytes();
+        ScanAdmission.setHeadroom(new ByteSizeValue(8, ByteSizeUnit.GB));
+        // The first reading holds the indexed estimate exactly; the
+        // second, read for the flat path, leaves nothing after the
+        // headroom.
+        AtomicInteger reads = new AtomicInteger();
+        ScanAdmission.setMemoryProbeForTests(() -> reads.getAndIncrement() == 0 ? 8 * GB + ftsEstimate : 8 * GB);
+        CircuitBreakingException second = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admit("demo", 1_000L, mixed, Set.of("body"), Optional.empty(), null)
+        );
+        assertEquals("one reading per path", 2, reads.get());
+        assertTrue(second.getMessage(), second.getMessage().contains("fts_flat estimate"));
+        assertTrue(second.getMessage(), second.getMessage().contains("on column [title]"));
+        assertEquals("fts_flat", ScanAdmission.lastKind());
+    }
+
+    public void testPartlyCoveredColumnChargesItsUnindexedRowsOnTopOfTheDocumentSet() {
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(1, ByteSizeUnit.BYTES));
+        ScanAdmission.setHeadroom(new ByteSizeValue(Long.MAX_VALUE / 2, ByteSizeUnit.BYTES));
+        ScanAdmission.Shape shape = new ScanAdmission.Shape(true, true, 0L, 1, 0, Set.of("body"));
+        // The statistics say the inverted index covers 600 of the 1000
+        // rows: the other 400 are read through the flat path and
+        // charged at 100 bytes each next to the document set.
+        ColumnStatistics.IndexSummary inverted = new ColumnStatistics.IndexSummary(
+            "body_fts",
+            Optional.of(IndexType.INVERTED),
+            1,
+            2,
+            OptionalLong.of(4096L),
+            OptionalLong.of(600L),
+            OptionalLong.of(400L),
+            OptionalLong.empty(),
+            true
+        );
+        TableStatistics statistics = new TableStatistics(
+            1_000L,
+            0L,
+            List.of(new TableStatistics.FragmentStats(0, 600L, 1), new TableStatistics.FragmentStats(1, 400L, 1)),
+            Map.of("body", new ColumnStatistics("body", List.of(inverted))),
+            1L,
+            Instant.EPOCH
+        );
+        assertEquals(400L, ScanAdmission.flatFtsUnindexedRows("body", Optional.of(statistics)));
+        assertEquals(0L, ScanAdmission.flatFtsUnindexedRows("title", Optional.of(statistics)));
+        assertEquals(0L, ScanAdmission.flatFtsUnindexedRows("body", Optional.empty()));
+        CircuitBreakingException rejection = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admit("demo", 1_000L, shape, Set.of("body"), Optional.of(statistics), null)
+        );
+        String message = rejection.getMessage();
+        assertTrue(message, message.contains("fts estimate"));
+        assertTrue(message, message.contains("plus the flat BM25 scan of 400 rows the index does not cover at [100b] each"));
+        long expected = NativeMemoryLimit.invertedIndexEntryEstimateBytes(1_000L) + ScanAdmission.scanBufferEstimateBytes(1_000L, shape)
+            + 400L * ScanAdmission.FLAT_FTS_BYTES_PER_ROW;
+        assertEquals(expected, ScanAdmission.lastEstimateBytes());
+        assertEquals("fts", ScanAdmission.lastKind());
+
+        // Statistics that carry no row figures for the inverted index
+        // (the collector reads them for other index types) charge
+        // nothing extra, so the estimate is the document set alone.
+        ColumnStatistics.IndexSummary withoutFigures = new ColumnStatistics.IndexSummary(
+            "body_fts",
+            Optional.of(IndexType.INVERTED),
+            1,
+            2,
+            OptionalLong.of(4096L),
+            OptionalLong.empty(),
+            OptionalLong.empty(),
+            OptionalLong.empty(),
+            false
+        );
+        TableStatistics silent = new TableStatistics(
+            1_000L,
+            0L,
+            List.of(new TableStatistics.FragmentStats(0, 600L, 1), new TableStatistics.FragmentStats(1, 400L, 1)),
+            Map.of("body", new ColumnStatistics("body", List.of(withoutFigures))),
+            1L,
+            Instant.EPOCH
+        );
+        expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admit("demo", 1_000L, shape, Set.of("body"), Optional.of(silent), null)
+        );
+        assertEquals(
+            NativeMemoryLimit.invertedIndexEntryEstimateBytes(1_000L) + ScanAdmission.scanBufferEstimateBytes(1_000L, shape),
+            ScanAdmission.lastEstimateBytes()
+        );
     }
 
     public void testScriptedReadingsAreHandedOutOnePerReadWithTheLastRepeating() {
@@ -2250,7 +2438,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         assertEquals("none", ScanAdmission.lastKind());
         Map<String, Long> zero = ScanAdmission.rejectionsByKind();
         assertEquals(
-            List.of("fts", "scalar_index", "vector_index", "filter_scan", "aggregate_scan", "column_load", "fetch_take"),
+            List.of("fts", "fts_flat", "scalar_index", "vector_index", "filter_scan", "aggregate_scan", "column_load", "fetch_take"),
             List.copyOf(zero.keySet())
         );
         for (long count : zero.values()) {

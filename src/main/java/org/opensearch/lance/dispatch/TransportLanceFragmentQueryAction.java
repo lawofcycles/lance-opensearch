@@ -733,13 +733,20 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 // bounded page whose exact match count would run the
                 // unbounded count-only scan) and the bounded top-k
                 // pages alike, because Lance rebuilds the whole set
-                // whatever the page size. Refuse the request with 429
+                // whatever the page size. A full text clause on a
+                // column without an inverted index (a `type: lance_text`
+                // override) makes Lance tokenise and score every scanned
+                // row instead, judged as its own kind by the same gate.
+                // Refuse the request with 429
                 // before any Lance scan of it is created when the
                 // node's free memory cannot hold the estimated rebuild
                 // plus the scan buffers. The estimate is per table, so
                 // it is judged on the table's physical rows, not this
                 // executor's share: Lance rebuilds the whole document
-                // set whichever fragments the scan keeps.
+                // set whichever fragments the scan keeps. The snapshot
+                // knows which columns carry an index; the table
+                // statistics, when this node holds them, say how many
+                // rows an index leaves uncovered.
                 ScanAdmission.Shape ftsShape = ScanAdmission.classify(
                     query,
                     request.trackTotalHitsUpTo() == SearchContext.TRACK_TOTAL_HITS_ACCURATE
@@ -749,7 +756,14 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     for (LanceWarmCache.FragmentMeta fragment : snapshot.fragments()) {
                         tableRows += fragment.physicalRows();
                     }
-                    ScanAdmission.admit(request.indexName(), tableRows, ftsShape, LanceHitsAccounting.of(searcher));
+                    ScanAdmission.admit(
+                        request.indexName(),
+                        tableRows,
+                        ftsShape,
+                        snapshot.ftsColumns(),
+                        ScanAdmission.statisticsOf(dataset),
+                        LanceHitsAccounting.of(searcher)
+                    );
                 }
 
                 // A bare Lance clause at the top level (LanceFtsQuery,
