@@ -897,9 +897,10 @@ public class RestAttachAction extends BaseRestHandler {
             }
             java.util.LinkedHashMap<String, String> subs = new java.util.LinkedHashMap<>();
             for (java.util.Map.Entry<?, ?> subEntry : subMap.entrySet()) {
-                if (!(subEntry.getKey() instanceof String subName) || subName.isEmpty()) {
+                if (!(subEntry.getKey() instanceof String subName)) {
                     throw new IllegalArgumentException("[" + clauseName + "." + baseName + "] sub-field names must be non-empty strings");
                 }
+                LanceOverrides.validateSubFieldName(clauseName + "." + baseName, subName);
                 if (!(subEntry.getValue() instanceof java.util.Map<?, ?> subDefMap)) {
                     throw new IllegalArgumentException("[" + clauseName + "." + baseName + "." + subName + "] must be an object");
                 }

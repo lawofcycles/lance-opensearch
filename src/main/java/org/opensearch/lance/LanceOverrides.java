@@ -420,6 +420,42 @@ public final class LanceOverrides {
         return columns.isEmpty() ? EMPTY : new LanceOverrides(columns);
     }
 
+    /**
+     * Refuse a sub-field name the mapping cannot carry. The name is
+     * joined to its base column with a dot ({@code body.raw}) and
+     * resolved by splitting on that dot wherever a search body names a
+     * field, so it must be non-empty and free of {@code .}; OpenSearch's
+     * own mapping parser refuses a multi-field name with a dot for the
+     * same reason. Whitespace and control characters are refused too:
+     * they have no use in a field name and in an attach body they mark
+     * a typo that would otherwise surface only as a field no query
+     * resolves. Both attach clauses that declare sub-fields
+     * ({@code multi_fields} and {@code overrides.[col].fields}) call this
+     * so the two agree.
+     *
+     * @param clausePath the attach body path of the enclosing object,
+     *     for the message ({@code multi_fields.body} or
+     *     {@code overrides.body.fields})
+     * @param subName the declared sub-field name
+     * @throws IllegalArgumentException naming the clause and the name
+     */
+    public static void validateSubFieldName(String clausePath, String subName) {
+        if (subName == null || subName.isEmpty()) {
+            throw new IllegalArgumentException("[" + clausePath + "] sub-field names must be non-empty strings");
+        }
+        if (subName.indexOf('.') >= 0) {
+            throw new IllegalArgumentException("[" + clausePath + "] sub-field name [" + subName + "] must not contain [.]");
+        }
+        for (int i = 0; i < subName.length(); i++) {
+            char c = subName.charAt(i);
+            if (Character.isWhitespace(c) || Character.isISOControl(c)) {
+                throw new IllegalArgumentException(
+                    "[" + clausePath + "] sub-field name [" + subName + "] must not contain whitespace or control characters"
+                );
+            }
+        }
+    }
+
     private static Column parseColumn(String baseName, Object rawSpec) {
         if (!(rawSpec instanceof Map<?, ?> spec)) {
             throw new IllegalArgumentException("[overrides." + baseName + "] must be an object");
@@ -503,9 +539,10 @@ public final class LanceOverrides {
                 throw new IllegalArgumentException("[overrides." + baseName + ".fields] must be an object");
             }
             for (Map.Entry<?, ?> subEntry : fieldsMap.entrySet()) {
-                if (!(subEntry.getKey() instanceof String subName) || subName.isEmpty()) {
+                if (!(subEntry.getKey() instanceof String subName)) {
                     throw new IllegalArgumentException("[overrides." + baseName + ".fields] sub-field names must be non-empty strings");
                 }
+                validateSubFieldName("overrides." + baseName + ".fields", subName);
                 if (!(subEntry.getValue() instanceof Map<?, ?> subDefMap)) {
                     throw new IllegalArgumentException("[overrides." + baseName + ".fields." + subName + "] must be an object");
                 }
