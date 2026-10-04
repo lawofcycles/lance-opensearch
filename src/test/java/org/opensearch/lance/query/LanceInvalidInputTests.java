@@ -21,6 +21,7 @@ import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.lance.LanceTableFactory;
+import org.opensearch.lance.StorageOptions;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.transport.RemoteTransportException;
 
@@ -128,6 +129,29 @@ public class LanceInvalidInputTests extends OpenSearchTestCase {
         // A message without a credential is reported as the exception itself.
         IllegalArgumentException clean = new IllegalArgumentException(LANCE_MESSAGE);
         assertSame(clean, LanceInvalidInput.unwrap(new IOException(clean)));
+    }
+
+    /**
+     * A failure whose chain holds no Lance invalid input is redacted all
+     * the same: the redaction lives in {@code unwrap}, not in the choice
+     * of exception class, so a caller that routes an
+     * {@link IllegalStateException} quoting an S3 error body through it
+     * does not leak the access key id to the client or the log.
+     */
+    public void testUnwrapRedactsTheAccessKeyIdOfANonIllegalArgumentFailure() {
+        // A temporary key id shape, assembled so the source carries no scanner matching literal.
+        String keyId = "ASIA" + "Q".repeat(16);
+        String message = "object store rejected the request: <Error><Code>InvalidAccessKeyId</Code><AWSAccessKeyId>"
+            + keyId
+            + "</AWSAccessKeyId></Error>";
+        IllegalStateException failure = new IllegalStateException(message);
+        Exception reported = LanceInvalidInput.unwrap(failure);
+        assertNotSame(failure, reported);
+        assertFalse("the key id must not be reported: " + reported.getMessage(), reported.getMessage().contains(keyId));
+        assertTrue("the redaction marker replaces it: " + reported.getMessage(), reported.getMessage().contains(StorageOptions.REDACTED));
+        assertTrue("the S3 error code stays: " + reported.getMessage(), reported.getMessage().contains("InvalidAccessKeyId"));
+        assertEquals(ExceptionsHelper.status(failure), ExceptionsHelper.status(reported));
+        assertEquals(message, failure.getMessage());
     }
 
     /**
