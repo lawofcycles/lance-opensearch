@@ -425,6 +425,187 @@ public class LanceTextOverrideIT extends LanceRestTestCase {
         }
     }
 
+    public void testHidingWrapperFiltersTheFlatPathHidesAColumnAndWithholdsStats() throws Exception {
+        // The test hook installs a reader wrapper shaped like the security
+        // plugin's DLS / FLS reader on the indexes under the prefix: rows
+        // whose rating is below 200 are hidden and the body column is
+        // dropped from the field infos. The hint fixture's rating is
+        // (i * 37) % 1000 with a null every fifth row, so of twelve rows
+        // the visible ones are 6, 7, 8, 10 and 11; category is "c" + (i % 3)
+        // with a null every fourth row, so the visible rows with a
+        // category are 6 (c0), 8 (c2) and 10 (c1). The same table attached
+        // outside the prefix answers unfiltered next to it.
+        String suffix = "lancetextdls-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        String tableUri = LanceTableFactory.writeHintFixtureTable(scratchDir, tableName, 2, 6);
+        String wrapped = "wrapped-" + suffix;
+        String plain = "plain-" + suffix;
+        String overrides = "{\"category\":{\"type\":\"lance_text\"}}";
+        String matchAll = "{\"size\":10,\"query\":{\"match_all\":{}}}";
+        String flatMatch = "{\"size\":10,\"profile\":true,\"query\":{\"match\":{\"category\":\"c0 c1 c2\"}}}";
+        String termVisible = "{\"size\":10,\"query\":{\"term\":{\"rating\":222}}}";
+        String termHidden = "{\"size\":10,\"query\":{\"term\":{\"rating\":37}}}";
+        String termCategory = "{\"size\":10,\"query\":{\"term\":{\"category\":\"c0\"}}}";
+        String matchHiddenColumn = "{\"size\":10,\"query\":{\"match\":{\"body\":\"hello\"}}}";
+        String countOnly = "{\"size\":0,\"query\":{\"match_all\":{}}}";
+        updateClusterSetting("plugins.lance.test.hiding_wrapper_index_prefix", "\"" + wrapped + ":body:rating:200\"");
+        try {
+            attach(tableUri, wrapped, overrides);
+            attach(tableUri, plain, overrides);
+            String wrappedMapping = readAll(client().performRequest(new Request("GET", "/" + wrapped + "/_mapping")));
+            assertTrue(wrappedMapping, wrappedMapping.contains("\"category\":{\"type\":\"lance_text\""));
+
+            // The DLS shaped filter: the page and the total count only the
+            // visible rows, on every path a wrapper changes.
+            String wrappedAll = readAll(postJson("/" + wrapped + "/_search?request_cache=false", matchAll));
+            assertEquals("match_all sees the visible rows only: " + wrappedAll, 5, extractIntPath(wrappedAll, "hits", "total", "value"));
+            assertEquals(List.of(6, 7, 8, 10, 11), sortedSourceIds(wrappedAll));
+            String plainAll = readAll(postJson("/" + plain + "/_search?request_cache=false", matchAll));
+            assertEquals(12, extractIntPath(plainAll, "hits", "total", "value"));
+            String wrappedCount = readAll(client().performRequest(new Request("GET", "/" + wrapped + "/_count")));
+            assertEquals("_count sees the visible rows only: " + wrappedCount, 5, extractIntPath(wrappedCount, "count"));
+
+            // The flat BM25 scan of the declared column runs over every
+            // row of the table; the wrapper hides its hits afterwards, so
+            // the match answers the visible rows with a category. The
+            // single node renders the page on the query round (no fetch
+            // round trip) and the gate judged the flat kind.
+            Map<String, Object> fetchBefore = fetchCacheStats();
+            assertEquals(fetchBefore.toString(), true, fetchBefore.get("enabled"));
+            String wrappedFlat = readAll(postJson("/" + wrapped + "/_search?request_cache=false", flatMatch));
+            assertEquals(
+                "the flat match sees the visible rows only: " + wrappedFlat,
+                3,
+                extractIntPath(wrappedFlat, "hits", "total", "value")
+            );
+            assertEquals(List.of(6, 8, 10), sortedSourceIds(wrappedFlat));
+            assertEquals(List.of("fts_flat"), admissionKinds(wrappedFlat));
+            assertEquals(0, fetchRoundTrips(wrappedFlat));
+            String plainFlat = readAll(postJson("/" + plain + "/_search?request_cache=false", flatMatch));
+            assertEquals(9, extractIntPath(plainFlat, "hits", "total", "value"));
+            // The rows behind the wrapped page bypass the fetch cache: a
+            // row rendered under one wrapper must not serve the next
+            // request from the cache.
+            Map<String, Object> fetchAfter = fetchCacheStats();
+            assertTrue(
+                "the wrapped rows are counted as skipped by the fetch cache: " + fetchBefore + " -> " + fetchAfter,
+                ((Number) fetchAfter.get("skipped")).longValue() > ((Number) fetchBefore.get("skipped")).longValue()
+            );
+
+            // A term on a visible row answers it, a term on a hidden row
+            // answers nothing, and a term on the declared column (a Lance
+            // match) sees the visible rows only.
+            assertEquals(List.of(6), sortedSourceIds(readAll(postJson("/" + wrapped + "/_search?request_cache=false", termVisible))));
+            String hidden = readAll(postJson("/" + wrapped + "/_search?request_cache=false", termHidden));
+            assertEquals("a hidden row is not found: " + hidden, 0, extractIntPath(hidden, "hits", "total", "value"));
+            assertEquals(List.of(1), sortedSourceIds(readAll(postJson("/" + plain + "/_search?request_cache=false", termHidden))));
+            assertEquals(List.of(6), sortedSourceIds(readAll(postJson("/" + wrapped + "/_search?request_cache=false", termCategory))));
+            assertEquals(List.of(0, 6, 9), sortedSourceIds(readAll(postJson("/" + plain + "/_search?request_cache=false", termCategory))));
+
+            // The FLS shaped hiding: a full text clause on the column the
+            // wrapper drops from the field infos contributes no hit, so
+            // the clause cannot probe the hidden data, while the plain
+            // index answers every row.
+            String hiddenColumn = readAll(postJson("/" + wrapped + "/_search?request_cache=false", matchHiddenColumn));
+            assertEquals(
+                "a match on the hidden column finds nothing: " + hiddenColumn,
+                0,
+                extractIntPath(hiddenColumn, "hits", "total", "value")
+            );
+            String visibleColumn = readAll(postJson("/" + plain + "/_search?request_cache=false", matchHiddenColumn));
+            assertEquals(12, extractIntPath(visibleColumn, "hits", "total", "value"));
+
+            // The coordinator result cache does not take an answer the
+            // wrapper shaped: a size 0 body against the wrapped index is
+            // skipped, the same body against the plain index is stored,
+            // and explain names the reason.
+            Map<String, Object> cacheBefore = requestCacheStats();
+            String wrappedCountOnly = readAll(postJson("/" + wrapped + "/_search", countOnly));
+            assertEquals(5, extractIntPath(wrappedCountOnly, "hits", "total", "value"));
+            Map<String, Object> cacheAfterWrapped = requestCacheStats();
+            assertEquals(
+                "the wrapped request is skipped: " + cacheAfterWrapped,
+                ((Number) cacheBefore.get("skipped")).longValue() + 1,
+                ((Number) cacheAfterWrapped.get("skipped")).longValue()
+            );
+            assertEquals(((Number) cacheBefore.get("misses")).longValue(), ((Number) cacheAfterWrapped.get("misses")).longValue());
+            readAll(postJson("/" + plain + "/_search", countOnly));
+            Map<String, Object> cacheAfterPlain = requestCacheStats();
+            assertEquals(((Number) cacheAfterWrapped.get("skipped")).longValue(), ((Number) cacheAfterPlain.get("skipped")).longValue());
+            assertEquals(
+                "the plain request is a miss that stores: " + cacheAfterPlain,
+                ((Number) cacheAfterWrapped.get("misses")).longValue() + 1,
+                ((Number) cacheAfterPlain.get("misses")).longValue()
+            );
+            String explained = explain(wrapped, countOnly);
+            assertEquals(explained, "false", String.valueOf(parseJson(explained).get("cacheable")));
+            assertEquals(explained, "dls", stringPath(explained, "cacheable_reason"));
+
+            // The stats report withholds the figures the wrapper filters
+            // for the wrapped index and keeps them for the plain one.
+            Map<String, Object> wrappedStats = indexStats(wrapped);
+            assertFalse("rows are withheld: " + wrappedStats, wrappedStats.containsKey("rows"));
+            assertFalse("shard_reader_rows are withheld: " + wrappedStats, wrappedStats.containsKey("shard_reader_rows"));
+            assertFalse("index types are withheld: " + wrappedStats, wrappedStats.containsKey("index_types"));
+            assertEquals(wrappedStats.toString(), false, wrappedStats.get("lucene_bound_exceeded"));
+            Map<String, Object> plainStats = indexStats(plain);
+            assertEquals(plainStats.toString(), 12, ((Number) plainStats.get("rows")).intValue());
+            assertEquals(plainStats.toString(), 12, ((Number) plainStats.get("shard_reader_rows")).intValue());
+        } finally {
+            updateClusterSetting("plugins.lance.test.hiding_wrapper_index_prefix", null);
+            for (String index : List.of(wrapped, plain)) {
+                try {
+                    client().performRequest(new Request("DELETE", "/" + index));
+                } catch (Exception ignored) {
+                    // best-effort cleanup; the base class wipes indices too
+                }
+            }
+            deleteRecursively(scratchDir);
+        }
+    }
+
+    /** {@code profile.lance.coordinator.fetch_round_trips} of a response. */
+    @SuppressWarnings("unchecked")
+    private static int fetchRoundTrips(String searchBody) {
+        Map<String, Object> profile = (Map<String, Object>) parseJson(searchBody).get("profile");
+        assertNotNull("the response carries a profile: " + searchBody, profile);
+        Map<String, Object> lance = (Map<String, Object>) profile.get("lance");
+        Map<String, Object> coordinator = (Map<String, Object>) lance.get("coordinator");
+        assertNotNull("the profile carries the coordinator: " + searchBody, coordinator);
+        return ((Number) coordinator.get("fetch_round_trips")).intValue();
+    }
+
+    /** The single node's {@code indices.<index>} stats block. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> indexStats(String indexName) throws IOException {
+        Map<String, Object> indices = (Map<String, Object>) nodeStats().get("indices");
+        Map<String, Object> stats = (Map<String, Object>) indices.get(indexName);
+        assertNotNull("stats for " + indexName + ": " + indices.keySet(), stats);
+        return stats;
+    }
+
+    /** The single node's {@code request_cache} stats block. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> requestCacheStats() throws IOException {
+        return (Map<String, Object>) nodeStats().get("request_cache");
+    }
+
+    /** The single node's {@code fetch_cache} stats block. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> fetchCacheStats() throws IOException {
+        return (Map<String, Object>) nodeStats().get("fetch_cache");
+    }
+
+    /** The single node's stats object. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> nodeStats() throws IOException {
+        String stats = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
+        Map<String, Object> nodes = (Map<String, Object>) parseJson(stats).get("nodes");
+        assertEquals("single node cluster: " + stats, 1, nodes.size());
+        return (Map<String, Object>) nodes.values().iterator().next();
+    }
+
     private static String explain(String indexName, String body) throws IOException {
         Request request = new Request("GET", "/_plugins/_lance/explain/" + indexName);
         request.setJsonEntity(body);
@@ -495,11 +676,7 @@ public class LanceTextOverrideIT extends LanceRestTestCase {
     /** The single node's {@code admission} stats block. */
     @SuppressWarnings("unchecked")
     private static Map<String, Object> admissionStats() throws IOException {
-        String stats = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
-        Map<String, Object> nodes = (Map<String, Object>) parseJson(stats).get("nodes");
-        assertEquals("single node cluster: " + stats, 1, nodes.size());
-        Map<String, Object> node = (Map<String, Object>) nodes.values().iterator().next();
-        return (Map<String, Object>) node.get("admission");
+        return (Map<String, Object>) nodeStats().get("admission");
     }
 
     @SuppressWarnings("unchecked")
