@@ -37,7 +37,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.lance.LanceOverrides;
-import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
@@ -124,6 +124,37 @@ public final class LanceNamespaceService implements Closeable {
     private final Scheduler.Cancellable pollTask;
     /** The applier listener as registered, so {@link #close} can take it off the cluster service again. */
     private final ClusterStateListener stateListener = this::onClusterStateChanged;
+
+    /**
+     * The node's service at the poll cadence
+     * {@link LanceSettings#NAMESPACE_POLL_CADENCE_SETTING} names and the
+     * grace {@link LanceSettings#NAMESPACE_RESURFACE_GRACE_SETTING} names,
+     * registered for the grace's dynamic updates. The settings are the
+     * node's, read from {@code clusterService}.
+     */
+    public static LanceNamespaceService fromSettings(
+        Client client,
+        ClusterService clusterService,
+        ThreadPool threadPool,
+        LanceWarmCache warmCache,
+        AllowedTableRoots allowedRoots,
+        AllowedCatalogEndpoints allowedEndpoints
+    ) {
+        Settings settings = clusterService.getSettings();
+        LanceNamespaceService service = new LanceNamespaceService(
+            client,
+            clusterService,
+            threadPool,
+            LanceSettings.NAMESPACE_POLL_CADENCE_SETTING.get(settings),
+            LanceSettings.NAMESPACE_RESURFACE_GRACE_SETTING.get(settings),
+            warmCache,
+            allowedRoots,
+            allowedEndpoints
+        );
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(LanceSettings.NAMESPACE_RESURFACE_GRACE_SETTING, service::setResurfaceGrace);
+        return service;
+    }
 
     public LanceNamespaceService(Client client, ClusterService clusterService, ThreadPool threadPool, TimeValue cadence) {
         this(client, clusterService, threadPool, cadence, TimeValue.timeValueHours(1));
@@ -761,7 +792,7 @@ public final class LanceNamespaceService implements Closeable {
     ) {
         IndexMetadata existing = state.metadata().index(indexName);
         if (existing != null) {
-            String existingTable = LancePlugin.TABLE_SETTING.get(existing.getSettings());
+            String existingTable = LanceSettings.TABLE_SETTING.get(existing.getSettings());
             if (existingTable.equals(table)) {
                 // Present again after a restore or a rebuild: a tombstone
                 // recorded for the name no longer describes anything.

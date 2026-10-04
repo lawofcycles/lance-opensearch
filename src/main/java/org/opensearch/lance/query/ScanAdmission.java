@@ -37,11 +37,14 @@ import org.apache.lucene.search.QueryVisitor;
 import org.lance.Dataset;
 import org.lance.index.IndexType;
 import org.lance.ipc.FullTextQuery;
+import org.opensearch.common.settings.ClusterSettings;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.lance.LanceCircuitBreaker;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.plan.metadata.ColumnStatistics;
@@ -679,6 +682,36 @@ public final class ScanAdmission {
     }
 
     // ---- settings holders, probes and overrides ----
+
+    /**
+     * Read the gate's settings from the node settings and register for
+     * their dynamic updates: the enabled flag, the headroom, the bounded
+     * shapes flag and the two test overrides. Called once by the plugin
+     * at start; the table statistics the estimators read are installed
+     * separately through {@link #setTableStatistics}, once the cache
+     * exists.
+     */
+    public static void bindSettings(Settings settings, ClusterSettings clusterSettings) {
+        setEnabled(LanceSettings.ADMISSION_ENABLED_SETTING.get(settings));
+        clusterSettings.addSettingsUpdateConsumer(LanceSettings.ADMISSION_ENABLED_SETTING, ScanAdmission::setEnabled);
+        setHeadroom(LanceSettings.ADMISSION_HEADROOM_SETTING.get(settings));
+        clusterSettings.addSettingsUpdateConsumer(LanceSettings.ADMISSION_HEADROOM_SETTING, ScanAdmission::setHeadroom);
+        setBoundedShapesGated(LanceSettings.ADMISSION_BOUNDED_SHAPES_GATED_SETTING.get(settings));
+        clusterSettings.addSettingsUpdateConsumer(
+            LanceSettings.ADMISSION_BOUNDED_SHAPES_GATED_SETTING,
+            ScanAdmission::setBoundedShapesGated
+        );
+        setIndexCacheShardShareOverride(LanceSettings.TEST_INDEX_CACHE_SHARD_SHARE_SETTING.get(settings));
+        clusterSettings.addSettingsUpdateConsumer(
+            LanceSettings.TEST_INDEX_CACHE_SHARD_SHARE_SETTING,
+            ScanAdmission::setIndexCacheShardShareOverride
+        );
+        setAvailableMemoryOverride(LanceSettings.TEST_ADMISSION_AVAILABLE_MEMORY_SETTING.get(settings));
+        clusterSettings.addSettingsUpdateConsumer(
+            LanceSettings.TEST_ADMISSION_AVAILABLE_MEMORY_SETTING,
+            ScanAdmission::setAvailableMemoryOverride
+        );
+    }
 
     /** Current value of the {@code plugins.lance.admission.enabled} setting. */
     public static boolean enabled() {

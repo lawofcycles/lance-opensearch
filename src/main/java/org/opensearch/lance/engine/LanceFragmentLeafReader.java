@@ -8,6 +8,7 @@ package org.opensearch.lance.engine;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VarCharVector;
@@ -93,14 +94,14 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * structure; a keyword sub-field of a Utf8 column holds the same
      * values as the column, so a second ord map would be a copy.
      */
-    private final java.util.Map<String, String> keywordSubFields;
+    private final Map<String, String> keywordSubFields;
     /**
      * Base column names that carry at least one keyword sub-field.
      * {@link LanceColumnLoader#ensureTextLoaded} consults this set so a TEXT_FTS column
      * with a sub-field still builds the ord data structure that
      * TEXT_KEYWORD would build by default.
      */
-    private final java.util.Set<String> basesWithKeywordSub;
+    private final Set<String> basesWithKeywordSub;
     /** Dotted child path → nested column, for children served on child docs. */
     private final Map<String, String> nestedChildToParent;
     /**
@@ -166,7 +167,7 @@ public final class LanceFragmentLeafReader extends LeafReader {
      * Resolve which Utf8 columns of {@code dataset} carry an FTS
      * (inverted) index; see {@link LanceFragmentSchema#resolveFtsColumns}.
      */
-    static java.util.Set<String> resolveFtsColumns(Dataset dataset) throws IOException {
+    static Set<String> resolveFtsColumns(Dataset dataset) throws IOException {
         return LanceFragmentSchema.resolveFtsColumns(dataset);
     }
 
@@ -217,9 +218,9 @@ public final class LanceFragmentLeafReader extends LeafReader {
         long physicalRows,
         boolean hasDeletionFile,
         String intField,
-        org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType pkType,
+        LanceEngineFactory.LancePrimaryKeyType pkType,
         LanceOverrides overrides,
-        java.util.Set<String> ftsColumns,
+        Set<String> ftsColumns,
         String filterSql
     ) throws IOException {
         this(

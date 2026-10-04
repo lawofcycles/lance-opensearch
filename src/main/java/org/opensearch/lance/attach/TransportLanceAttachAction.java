@@ -44,7 +44,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.lance.LanceInternalHeaders;
-import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.StorageOptions;
@@ -255,7 +255,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
             }
         }
         warnIfInvertedIndexExceedsShardShare(indexName, derivation);
-        long maxDocs = clusterService.getClusterSettings().get(LancePlugin.MAX_DOCS_PER_READER_SETTING);
+        long maxDocs = clusterService.getClusterSettings().get(LanceSettings.MAX_DOCS_PER_READER_SETTING);
         boolean luceneBoundExceeded = checkLuceneBound(
             indexName,
             table,

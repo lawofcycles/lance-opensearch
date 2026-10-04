@@ -60,7 +60,7 @@ import org.opensearch.index.query.Rewriteable;
 import org.opensearch.index.search.NestedHelper;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LanceOverrides;
-import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.execute.LanceAggregateResults;
 import org.opensearch.lance.engine.ColumnStore;
@@ -231,7 +231,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
      * buffers) scales with concurrency rather than shard fan-out;
      * the semaphore keeps allocation from racing the
      * {@code lance_native} circuit breaker into an OOM. Backed by
-     * {@link LancePlugin#FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING},
+     * {@link LanceSettings#FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING},
      * read once at construction so the permit count is fixed for
      * the life of the node. Threads waiting for a permit are
      * SEARCH threadpool threads, which is the same pool the
@@ -300,7 +300,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         this.circuitBreakerService = circuitBreakerService;
         this.warmCache = warmCache;
         this.scriptService = scriptService;
-        int permits = LancePlugin.FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING.get(clusterService.getSettings());
+        int permits = LanceSettings.FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING.get(clusterService.getSettings());
         this.concurrencyLimit = new java.util.concurrent.Semaphore(permits, /*fair*/ false);
         this.intraRequestExecutor = transportService.getThreadPool().executor(INTRA_REQUEST_POOL);
     }
@@ -419,14 +419,14 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         if (indexMetadata == null) {
             throw new IllegalStateException("Fragment path cannot resolve OpenSearch index [" + request.indexName() + "] on this node");
         }
-        String pkField = LancePlugin.PRIMARY_KEY_FIELD_SETTING.get(indexMetadata.getSettings());
+        String pkField = LanceSettings.PRIMARY_KEY_FIELD_SETTING.get(indexMetadata.getSettings());
         // Parse the type setting through the same fromSetting helper the
         // engine uses so unknown values fall back to LONG. Empty pkField
         // overrides whatever the type says (see the schema derivation
         // for the canonicalisation).
         LancePrimaryKeyType pkType = pkField.isEmpty()
             ? LancePrimaryKeyType.NONE
-            : LancePrimaryKeyType.fromSetting(LancePlugin.PRIMARY_KEY_TYPE_SETTING.get(indexMetadata.getSettings()));
+            : LancePrimaryKeyType.fromSetting(LanceSettings.PRIMARY_KEY_TYPE_SETTING.get(indexMetadata.getSettings()));
         // Per-column mapping overrides are persisted as JSON in a single
         // setting (with a fallback to the legacy multi_fields setting for
         // indexes created before it existed). Empty leaves the reader
@@ -561,7 +561,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
         // the index_searcher pool under the request's cancellation.
         FragmentGroupScan groupScan = new FragmentGroupScan(
             intraRequestExecutor,
-            clusterService.getClusterSettings().get(LancePlugin.FRAGMENT_PATH_PARALLELISM_SETTING),
+            clusterService.getClusterSettings().get(LanceSettings.FRAGMENT_PATH_PARALLELISM_SETTING),
             cancellation
         );
 
@@ -639,7 +639,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                 // collection at the bound has one collector to reduce.
                 int slices = request.terminateAfter() > 0
                     ? 1
-                    : clusterService.getClusterSettings().get(LancePlugin.FRAGMENT_PATH_SLICES_SETTING);
+                    : clusterService.getClusterSettings().get(LanceSettings.FRAGMENT_PATH_SLICES_SETTING);
                 searchContext.withTargetMaxSliceCount(slices).withScriptService(scriptService);
                 LanceFragmentIndexSearcher searcher = new LanceFragmentIndexSearcher(
                     dr,
@@ -681,7 +681,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     request.projection().explain()
                 );
                 CollectorKnobs knobs = FragmentHitsPages.knobsOf(request);
-                int maxGroups = LancePlugin.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING.get(qsc.getIndexSettings().getNodeSettings());
+                int maxGroups = LanceSettings.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING.get(qsc.getIndexSettings().getNodeSettings());
                 // The column store guard asks whether this node holds the
                 // columns the aggregators would read for every fragment
                 // of this request; without a cached snapshot no store
@@ -948,7 +948,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                             dataset,
                             effectiveFragmentIds,
                             effective.filterSql(),
-                            clusterService.getClusterSettings().get(LancePlugin.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING),
+                            clusterService.getClusterSettings().get(LanceSettings.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING),
                             intraRequestExecutor,
                             cancellation,
                             name -> emptyTopLevelAggregation(request, searchContext, qsc, name)

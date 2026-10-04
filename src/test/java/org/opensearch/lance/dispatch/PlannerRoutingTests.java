@@ -33,6 +33,7 @@ import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
@@ -107,7 +108,7 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
 
     @Override
     protected Settings nodeSettings() {
-        return Settings.builder().put(super.nodeSettings()).put(LancePlugin.FRAGMENT_PATH_SLICES_SETTING.getKey(), 1).build();
+        return Settings.builder().put(super.nodeSettings()).put(LanceSettings.FRAGMENT_PATH_SLICES_SETTING.getKey(), 1).build();
     }
 
     public void testWiderShapesPlanAgainstTheTableSchema() throws Exception {
@@ -722,9 +723,9 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
     private void setBins(Integer value) {
         Settings.Builder settings = Settings.builder();
         if (value == null) {
-            settings.putNull(LancePlugin.AGGREGATION_PERCENTILES_BINS_SETTING.getKey());
+            settings.putNull(LanceSettings.AGGREGATION_PERCENTILES_BINS_SETTING.getKey());
         } else {
-            settings.put(LancePlugin.AGGREGATION_PERCENTILES_BINS_SETTING.getKey(), value);
+            settings.put(LanceSettings.AGGREGATION_PERCENTILES_BINS_SETTING.getKey(), value);
         }
         client().admin().cluster().updateSettings(new ClusterUpdateSettingsRequest().transientSettings(settings)).actionGet();
     }
@@ -806,7 +807,7 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
                 .field("category")
                 .size(1000)
                 .subAggregation(AggregationBuilders.terms("r").field("rating").size(1000));
-            assertEquals(1_000_000, (int) LancePlugin.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING.get(Settings.EMPTY));
+            assertEquals(1_000_000, (int) LanceSettings.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING.get(Settings.EMPTY));
             assertNull("group estimate above pushdown_max_groups", planned(dataset, noMultiFields, qsc, wide));
             assertNotNull(
                 "group estimate under an explicit bound",
@@ -1897,7 +1898,7 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
         QueryShardContext qsc,
         AggregatorFactories.Builder tree
     ) {
-        int maxGroups = LancePlugin.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING.get(qsc.getIndexSettings().getNodeSettings());
+        int maxGroups = LanceSettings.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING.get(qsc.getIndexSettings().getNodeSettings());
         return planned(dataset, multiFields, qsc, tree, maxGroups);
     }
 
@@ -1998,9 +1999,9 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
     private void setPushdown(Boolean value) {
         Settings.Builder settings = Settings.builder();
         if (value == null) {
-            settings.putNull(LancePlugin.AGGREGATION_PUSHDOWN_SETTING.getKey());
+            settings.putNull(LanceSettings.AGGREGATION_PUSHDOWN_SETTING.getKey());
         } else {
-            settings.put(LancePlugin.AGGREGATION_PUSHDOWN_SETTING.getKey(), value);
+            settings.put(LanceSettings.AGGREGATION_PUSHDOWN_SETTING.getKey(), value);
         }
         client().admin().cluster().updateSettings(new ClusterUpdateSettingsRequest().transientSettings(settings)).actionGet();
     }
@@ -2008,9 +2009,9 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
     private void setParallelism(Integer value) {
         Settings.Builder settings = Settings.builder();
         if (value == null) {
-            settings.putNull(LancePlugin.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING.getKey());
+            settings.putNull(LanceSettings.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING.getKey());
         } else {
-            settings.put(LancePlugin.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING.getKey(), value);
+            settings.put(LanceSettings.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING.getKey(), value);
         }
         client().admin().cluster().updateSettings(new ClusterUpdateSettingsRequest().transientSettings(settings)).actionGet();
     }
@@ -2018,9 +2019,9 @@ public class PlannerRoutingTests extends OpenSearchSingleNodeTestCase {
     private void setSlack(Integer value) {
         Settings.Builder settings = Settings.builder();
         if (value == null) {
-            settings.putNull(LancePlugin.AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING.getKey());
+            settings.putNull(LanceSettings.AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING.getKey());
         } else {
-            settings.put(LancePlugin.AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING.getKey(), value);
+            settings.put(LanceSettings.AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING.getKey(), value);
         }
         client().admin().cluster().updateSettings(new ClusterUpdateSettingsRequest().transientSettings(settings)).actionGet();
     }

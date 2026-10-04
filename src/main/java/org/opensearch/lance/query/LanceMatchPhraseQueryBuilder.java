@@ -11,6 +11,7 @@ import java.util.Objects;
 import java.util.Set;
 
 import org.apache.lucene.search.Query;
+import org.lance.ipc.FullTextQuery;
 import org.opensearch.core.common.ParsingException;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
@@ -170,7 +171,7 @@ public class LanceMatchPhraseQueryBuilder extends AbstractQueryBuilder<LanceMatc
     }
 
     @Override
-    public org.lance.ipc.FullTextQuery toLanceFullTextQuery(QueryShardContext context) {
+    public FullTextQuery toLanceFullTextQuery(QueryShardContext context) {
         MappedFieldType fieldType = context.fieldMapper(field);
         if (fieldType == null) {
             throw new IllegalArgumentException("[lance_match_phrase] no such field [" + field + "]");
@@ -187,18 +188,18 @@ public class LanceMatchPhraseQueryBuilder extends AbstractQueryBuilder<LanceMatc
                     + "] no longer exists in the underlying Lance table; recreate the OpenSearch index to drop it"
             );
         }
-        return org.lance.ipc.FullTextQuery.phrase(query, textType.name(), slop);
+        return FullTextQuery.phrase(query, textType.name(), slop);
     }
 
     @Override
-    public java.util.Set<String> referencedFields() {
-        return java.util.Set.of(field);
+    public Set<String> referencedFields() {
+        return Set.of(field);
     }
 
     @Override
     protected Query doToQuery(QueryShardContext context) {
-        org.lance.ipc.FullTextQuery ftq = toLanceFullTextQuery(context);
-        return new LanceFtsQuery(ftq, java.util.Set.of(field));
+        FullTextQuery ftq = toLanceFullTextQuery(context);
+        return new LanceFtsQuery(ftq, Set.of(field));
     }
 
     @Override

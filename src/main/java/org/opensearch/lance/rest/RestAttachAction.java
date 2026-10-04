@@ -5,8 +5,12 @@
 
 package org.opensearch.lance.rest;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -20,7 +24,10 @@ import org.lance.schema.LanceSchema;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.core.xcontent.MediaTypeRegistry;
+import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.attach.LanceAttachAction;
@@ -168,8 +175,8 @@ public class RestAttachAction extends BaseRestHandler {
     }
 
     public record Derivation(String mappingJson, String keyField, String keyFieldType, String overridesJson, long version, long rows,
-        int fragments, List<String> notes, java.util.Set<String> ftsColumns, java.util.Set<String> scalarColumns, java.util.Set<
-            String> vectorColumns, java.util.Set<String> nestedColumns) {
+        int fragments, List<String> notes, Set<String> ftsColumns, Set<String> scalarColumns, Set<String> vectorColumns, Set<
+            String> nestedColumns) {
     }
 
     public static Derivation derive(Dataset dataset) throws Exception {
@@ -224,11 +231,11 @@ public class RestAttachAction extends BaseRestHandler {
         // ignored by the engine when keyField is empty, so the default
         // "long" is harmless for tables that never declared a PK.
         String keyFieldType = "long";
-        java.util.List<String> notes = new java.util.ArrayList<>();
-        java.util.Set<String> ftsColumns = new java.util.LinkedHashSet<>();
-        java.util.Set<String> scalarColumns = new java.util.LinkedHashSet<>();
-        java.util.Set<String> vectorColumns = new java.util.LinkedHashSet<>();
-        java.util.Set<String> nestedColumns = new java.util.LinkedHashSet<>();
+        List<String> notes = new ArrayList<>();
+        Set<String> ftsColumns = new LinkedHashSet<>();
+        Set<String> scalarColumns = new LinkedHashSet<>();
+        Set<String> vectorColumns = new LinkedHashSet<>();
+        Set<String> nestedColumns = new LinkedHashSet<>();
 
         XContentBuilder mapping = XContentFactory.jsonBuilder();
         mapping.startObject().startObject("properties");
@@ -236,9 +243,9 @@ public class RestAttachAction extends BaseRestHandler {
         LanceOverrides effective = validateOverrides(overrides, lanceSchema, lenient, notes);
         multiFields = effective.subFields();
         Map<String, String> dateOverrides = effective.dateColumns();
-        java.util.Set<String> keywordOverrides = effective.keywordColumns();
-        java.util.Set<String> ipOverrides = effective.ipColumns();
-        java.util.Set<String> wildcardOverrides = effective.wildcardColumns();
+        Set<String> keywordOverrides = effective.keywordColumns();
+        Set<String> ipOverrides = effective.ipColumns();
+        Set<String> wildcardOverrides = effective.wildcardColumns();
         Set<String> lanceTextOverrides = effective.lanceTextColumns();
         Map<String, String> geoPointOverrides = effective.geoPointColumns();
         for (LanceField field : lanceSchema.fields()) {
@@ -491,10 +498,8 @@ public class RestAttachAction extends BaseRestHandler {
                 // inspect the element type.
                 Field arrow = field.asArrowField();
                 ArrowType childType = arrow.getChildren().isEmpty() ? null : arrow.getChildren().get(0).getType();
-                boolean float32 = childType instanceof ArrowType.FloatingPoint fp
-                    && fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE;
-                boolean float64 = childType instanceof ArrowType.FloatingPoint fp
-                    && fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE;
+                boolean float32 = childType instanceof ArrowType.FloatingPoint fp && fp.getPrecision() == FloatingPointPrecision.SINGLE;
+                boolean float64 = childType instanceof ArrowType.FloatingPoint fp && fp.getPrecision() == FloatingPointPrecision.DOUBLE;
                 if (geoPointOverrides.containsKey(name) && fsl.getListSize() == 2 && float64) {
                     // FixedSizeList<Float64>[2] declared as a geo_point.
                     // The operator names the storage order through
@@ -589,7 +594,7 @@ public class RestAttachAction extends BaseRestHandler {
                             // no `order`; validation already refused the
                             // shape if the children are not two Float64s.
                             LanceField c0 = field.getChildren().get(0);
-                            String n0 = c0.getName().toLowerCase(java.util.Locale.ROOT);
+                            String n0 = c0.getName().toLowerCase(Locale.ROOT);
                             String storedOrder = (n0.equals("lat") || n0.equals("latitude") || n0.equals("y"))
                                 ? LanceOverrides.ORDER_LAT_LON
                                 : LanceOverrides.ORDER_LON_LAT;
@@ -793,8 +798,8 @@ public class RestAttachAction extends BaseRestHandler {
                         && c1.getType() instanceof ArrowType.FloatingPoint fp1
                         && fp1.getPrecision() == FloatingPointPrecision.DOUBLE;
                     if (bothFloat64) {
-                        String n0 = c0.getName().toLowerCase(java.util.Locale.ROOT);
-                        String n1 = c1.getName().toLowerCase(java.util.Locale.ROOT);
+                        String n0 = c0.getName().toLowerCase(Locale.ROOT);
+                        String n1 = c1.getName().toLowerCase(Locale.ROOT);
                         structShape = (n0.equals("lat") && n1.equals("lon"))
                             || (n0.equals("lon") && n1.equals("lat"))
                             || (n0.equals("latitude") && n1.equals("longitude"))
@@ -870,7 +875,7 @@ public class RestAttachAction extends BaseRestHandler {
      *   }
      * </pre>
      */
-    public static java.util.Map<String, java.util.LinkedHashMap<String, String>> parseMultiFields(Object raw) {
+    public static Map<String, LinkedHashMap<String, String>> parseMultiFields(Object raw) {
         return parseSubFieldsBody(raw, "multi_fields");
     }
 
@@ -880,28 +885,28 @@ public class RestAttachAction extends BaseRestHandler {
      * Kept as one helper so the two clauses agree on validation rules
      * without duplicating the loop.
      */
-    private static java.util.Map<String, java.util.LinkedHashMap<String, String>> parseSubFieldsBody(Object raw, String clauseName) {
+    private static Map<String, LinkedHashMap<String, String>> parseSubFieldsBody(Object raw, String clauseName) {
         if (raw == null) {
-            return java.util.Collections.emptyMap();
+            return Collections.emptyMap();
         }
-        if (!(raw instanceof java.util.Map<?, ?> rawMap)) {
+        if (!(raw instanceof Map<?, ?> rawMap)) {
             throw new IllegalArgumentException("[" + clauseName + "] must be an object; per-column key → per-sub-field type mapping");
         }
-        java.util.LinkedHashMap<String, java.util.LinkedHashMap<String, String>> out = new java.util.LinkedHashMap<>();
-        for (java.util.Map.Entry<?, ?> entry : rawMap.entrySet()) {
+        LinkedHashMap<String, LinkedHashMap<String, String>> out = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> entry : rawMap.entrySet()) {
             if (!(entry.getKey() instanceof String baseName) || baseName.isEmpty()) {
                 throw new IllegalArgumentException("[" + clauseName + "] keys must be non-empty column names");
             }
-            if (!(entry.getValue() instanceof java.util.Map<?, ?> subMap)) {
+            if (!(entry.getValue() instanceof Map<?, ?> subMap)) {
                 throw new IllegalArgumentException("[" + clauseName + "." + baseName + "] must be an object of sub-field definitions");
             }
-            java.util.LinkedHashMap<String, String> subs = new java.util.LinkedHashMap<>();
-            for (java.util.Map.Entry<?, ?> subEntry : subMap.entrySet()) {
+            LinkedHashMap<String, String> subs = new LinkedHashMap<>();
+            for (Map.Entry<?, ?> subEntry : subMap.entrySet()) {
                 if (!(subEntry.getKey() instanceof String subName)) {
                     throw new IllegalArgumentException("[" + clauseName + "." + baseName + "] sub-field names must be non-empty strings");
                 }
                 LanceOverrides.validateSubFieldName(clauseName + "." + baseName, subName);
-                if (!(subEntry.getValue() instanceof java.util.Map<?, ?> subDefMap)) {
+                if (!(subEntry.getValue() instanceof Map<?, ?> subDefMap)) {
                     throw new IllegalArgumentException("[" + clauseName + "." + baseName + "." + subName + "] must be an object");
                 }
                 Object typeValue = subDefMap.get("type");
@@ -930,14 +935,14 @@ public class RestAttachAction extends BaseRestHandler {
     private static void writeMultiFieldsBlock(
         XContentBuilder mapping,
         String baseName,
-        java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields
+        Map<String, LinkedHashMap<String, String>> multiFields
     ) throws Exception {
-        java.util.LinkedHashMap<String, String> subs = multiFields.get(baseName);
+        LinkedHashMap<String, String> subs = multiFields.get(baseName);
         if (subs == null || subs.isEmpty()) {
             return;
         }
         mapping.startObject("fields");
-        for (java.util.Map.Entry<String, String> sub : subs.entrySet()) {
+        for (Map.Entry<String, String> sub : subs.entrySet()) {
             mapping.startObject(sub.getKey());
             mapping.field("type", sub.getValue());
             mapping.field("index", false);
@@ -953,15 +958,15 @@ public class RestAttachAction extends BaseRestHandler {
      * strings). Empty on empty input so the caller can decide whether
      * to write the setting at all.
      */
-    public static String serialiseMultiFields(java.util.Map<String, java.util.LinkedHashMap<String, String>> multiFields) {
+    public static String serialiseMultiFields(Map<String, LinkedHashMap<String, String>> multiFields) {
         if (multiFields.isEmpty()) {
             return "";
         }
         try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
             builder.startObject();
-            for (java.util.Map.Entry<String, java.util.LinkedHashMap<String, String>> entry : multiFields.entrySet()) {
+            for (Map.Entry<String, LinkedHashMap<String, String>> entry : multiFields.entrySet()) {
                 builder.startObject(entry.getKey());
-                for (java.util.Map.Entry<String, String> sub : entry.getValue().entrySet()) {
+                for (Map.Entry<String, String> sub : entry.getValue().entrySet()) {
                     builder.field(sub.getKey(), sub.getValue());
                 }
                 builder.endObject();
@@ -979,22 +984,19 @@ public class RestAttachAction extends BaseRestHandler {
      * throws {@link IllegalArgumentException} on malformed JSON so the
      * engine startup path can surface it as a shard-open failure.
      */
-    public static java.util.Map<String, java.util.LinkedHashMap<String, String>> deserialiseMultiFields(String stringified) {
+    public static Map<String, LinkedHashMap<String, String>> deserialiseMultiFields(String stringified) {
         if (stringified == null || stringified.isEmpty()) {
-            return java.util.Collections.emptyMap();
+            return Collections.emptyMap();
         }
-        try (
-            org.opensearch.core.xcontent.XContentParser parser = org.opensearch.core.xcontent.MediaTypeRegistry.JSON.xContent()
-                .createParser(org.opensearch.core.xcontent.NamedXContentRegistry.EMPTY, null, stringified)
-        ) {
-            java.util.Map<String, Object> raw = parser.map();
-            java.util.LinkedHashMap<String, java.util.LinkedHashMap<String, String>> out = new java.util.LinkedHashMap<>();
-            for (java.util.Map.Entry<String, Object> entry : raw.entrySet()) {
-                if (!(entry.getValue() instanceof java.util.Map<?, ?> subs)) {
+        try (XContentParser parser = MediaTypeRegistry.JSON.xContent().createParser(NamedXContentRegistry.EMPTY, null, stringified)) {
+            Map<String, Object> raw = parser.map();
+            LinkedHashMap<String, LinkedHashMap<String, String>> out = new LinkedHashMap<>();
+            for (Map.Entry<String, Object> entry : raw.entrySet()) {
+                if (!(entry.getValue() instanceof Map<?, ?> subs)) {
                     throw new IllegalArgumentException("multi_fields[" + entry.getKey() + "] is not an object");
                 }
-                java.util.LinkedHashMap<String, String> flattened = new java.util.LinkedHashMap<>();
-                for (java.util.Map.Entry<?, ?> sub : subs.entrySet()) {
+                LinkedHashMap<String, String> flattened = new LinkedHashMap<>();
+                for (Map.Entry<?, ?> sub : subs.entrySet()) {
                     flattened.put(String.valueOf(sub.getKey()), String.valueOf(sub.getValue()));
                 }
                 out.put(entry.getKey(), flattened);

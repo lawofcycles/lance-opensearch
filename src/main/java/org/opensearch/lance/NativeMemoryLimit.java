@@ -6,6 +6,7 @@
 package org.opensearch.lance;
 
 import org.opensearch.OpenSearchParseException;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.monitor.jvm.JvmInfo;
@@ -267,5 +268,74 @@ public final class NativeMemoryLimit {
      */
     public static String humanReadable(long bytes) {
         return new ByteSizeValue(bytes, ByteSizeUnit.BYTES).toString();
+    }
+
+    /**
+     * The split of {@link LanceSettings#NATIVE_MEMORY_LIMIT_SETTING} into
+     * the three caches, as the plugin installs it at startup: the column
+     * cache takes {@link LanceSettings#CACHE_COLUMN_SHARE_SETTING} of the
+     * limit, the Session gets the rest, and within the Session the index
+     * cache is sized by {@link #sizeIndexCache} and the metadata cache by
+     * {@link #metadataCacheBytes}.
+     *
+     * @param rawLimit the setting value as written, for the log line
+     * @param columnShare the column share as written, for the log line
+     * @param totalBytes the resolved limit
+     * @param columnCacheBytes the off heap column cache's budget
+     * @param sessionBytes the Session's part of the limit
+     * @param metadataCacheBytes the metadata cache's budget
+     * @param indexCache the index cache's capacity and sharding
+     * @param cpus the CPU count the sharding was computed with
+     */
+    public record Budget(String rawLimit, double columnShare, long totalBytes, long columnCacheBytes, long sessionBytes,
+        long metadataCacheBytes, IndexCacheSizing indexCache, int cpus) {
+
+        /** Resolve the budget from the node settings. */
+        public static Budget fromSettings(Settings settings) {
+            String rawLimit = LanceSettings.NATIVE_MEMORY_LIMIT_SETTING.get(settings);
+            long totalBytes = parse(rawLimit, LanceSettings.NATIVE_MEMORY_LIMIT_SETTING.getKey());
+            double columnShare = LanceSettings.CACHE_COLUMN_SHARE_SETTING.get(settings);
+            long sessionBytes = sessionCacheBytes(totalBytes, columnShare);
+            int cpus = availableCpus();
+            return new Budget(
+                rawLimit,
+                columnShare,
+                totalBytes,
+                NativeMemoryLimit.columnCacheBytes(totalBytes, columnShare),
+                sessionBytes,
+                NativeMemoryLimit.metadataCacheBytes(sessionBytes),
+                sizeIndexCache(indexCacheBudgetBytes(sessionBytes), cpus),
+                cpus
+            );
+        }
+
+        /** One line naming every figure of the split, for the startup log. */
+        public String describe() {
+            return "limit ["
+                + humanReadable(totalBytes)
+                + "] -> index cache ["
+                + humanReadable(indexCache.capacityBytes())
+                + "] (shards "
+                + indexCache.shards()
+                + ", share "
+                + humanReadable(indexCache.shardShareBytes())
+                + " per shard), metadata cache ["
+                + humanReadable(metadataCacheBytes)
+                + "], column cache ["
+                + humanReadable(columnCacheBytes)
+                + "], unused ["
+                + humanReadable(indexCache.unusedBytes())
+                + "] (from "
+                + LanceSettings.NATIVE_MEMORY_LIMIT_SETTING.getKey()
+                + " ["
+                + rawLimit
+                + "], "
+                + LanceSettings.CACHE_COLUMN_SHARE_SETTING.getKey()
+                + " ["
+                + columnShare
+                + "], "
+                + cpus
+                + " cpus)";
+        }
     }
 }

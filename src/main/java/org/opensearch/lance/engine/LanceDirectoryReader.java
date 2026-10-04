@@ -12,6 +12,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
+import java.util.HashSet;
+import java.util.Set;
 
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.DirectoryReader;
@@ -232,7 +234,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
         // One describeIndices sweep for the whole reader; every leaf's
         // schema pass reads the resulting set instead of calling into
         // Lance per (leaf, Utf8 column).
-        java.util.Set<String> ftsColumns = LanceFragmentLeafReader.resolveFtsColumns(dataset);
+        Set<String> ftsColumns = LanceFragmentLeafReader.resolveFtsColumns(dataset);
         List<Fragment> fragments = dataset.getFragments();
         long[] physicalRows = new long[fragments.size()];
         for (int i = 0; i < fragments.size(); i++) {
@@ -375,13 +377,13 @@ public final class LanceDirectoryReader extends DirectoryReader {
         List<Integer> fragmentIds,
         String filterSql
     ) throws IOException {
-        java.util.Set<Integer> wanted = new java.util.HashSet<>(fragmentIds);
+        Set<Integer> wanted = new HashSet<>(fragmentIds);
         List<LeafReader> leaves = new ArrayList<>(wanted.size());
         List<LanceFragmentLeafReader> rawLeaves = new ArrayList<>(wanted.size());
         // One describeIndices sweep and one schema pass for the whole
         // reader; every leaf shares the result instead of calling into
         // Lance per (leaf, Utf8 column).
-        java.util.Set<String> ftsColumns = LanceFragmentSchema.resolveFtsColumns(dataset);
+        Set<String> ftsColumns = LanceFragmentSchema.resolveFtsColumns(dataset);
         LanceFragmentSchema schema = LanceFragmentSchema.derive(dataset, intField, pkType, overrides, ftsColumns);
         for (Fragment fragment : dataset.getFragments()) {
             if (!wanted.contains(fragment.getId())) {
@@ -468,7 +470,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
         CircuitBreaker requestBreaker,
         FragmentGroupScan groupScan
     ) throws IOException {
-        java.util.Set<Integer> wanted = new java.util.HashSet<>(fragmentIds);
+        Set<Integer> wanted = new HashSet<>(fragmentIds);
         List<LeafReader> leaves = new ArrayList<>(wanted.size());
         List<LanceFragmentLeafReader> rawLeaves = new ArrayList<>(wanted.size());
         Dataset dataset = snapshot.dataset();

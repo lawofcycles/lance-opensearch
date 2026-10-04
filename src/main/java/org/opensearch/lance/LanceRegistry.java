@@ -5,6 +5,9 @@
 
 package org.opensearch.lance;
 
+import java.util.Map;
+import java.util.Optional;
+
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.lance.Dataset;
@@ -149,7 +152,7 @@ public final class LanceRegistry {
      * the shared Session.
      */
     public static Dataset openDataset(String uri, StorageOptions storageOptions) {
-        return openDataset(uri, storageOptions, java.util.Optional.empty());
+        return openDataset(uri, storageOptions, Optional.empty());
     }
 
     /**
@@ -167,13 +170,13 @@ public final class LanceRegistry {
      * {@link StorageOptions#toReadOptionsOrNull} (which would drop
      * the version silently).
      */
-    public static Dataset openDataset(String uri, StorageOptions storageOptions, java.util.Optional<Long> pinnedVersion) {
+    public static Dataset openDataset(String uri, StorageOptions storageOptions, Optional<Long> pinnedVersion) {
         OpenDatasetBuilder builder = Dataset.open().allocator(ALLOCATOR).uri(uri);
         Session session = SESSION;
         if (session != null && !session.isClosed()) {
             builder = builder.session(session);
         }
-        java.util.Map<String, String> storageMap = storageOptions == null ? null : storageOptions.asMap();
+        Map<String, String> storageMap = storageOptions == null ? null : storageOptions.asMap();
         boolean hasStorage = storageMap != null && !storageMap.isEmpty();
         if (hasStorage || pinnedVersion.isPresent()) {
             ReadOptions.Builder roBuilder = new ReadOptions.Builder();

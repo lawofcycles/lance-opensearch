@@ -20,6 +20,7 @@ import org.opensearch.core.index.Index;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.indices.cluster.IndicesClusterStateService.AllocatedIndices.IndexRemovalReason;
 import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.attach.LanceAttachAction;
@@ -64,7 +65,7 @@ public class TempIndexServiceReaderWrapperTests extends OpenSearchSingleNodeTest
     protected Settings nodeSettings() {
         return Settings.builder()
             .put(super.nodeSettings())
-            .put(LancePlugin.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.getKey(), "wrapped:body:id:" + FIRST_VISIBLE_ID)
+            .put(LanceSettings.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.getKey(), "wrapped:body:id:" + FIRST_VISIBLE_ID)
             .build();
     }
 

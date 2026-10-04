@@ -6,18 +6,23 @@
 package org.opensearch.lance.query;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.lucene.index.IndexReaderContext;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.Query;
 import org.apache.lucene.search.QueryVisitor;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
@@ -57,7 +62,7 @@ import org.opensearch.lance.engine.LanceFragmentLeafReader;
  * {@link org.opensearch.lance.dispatch.LanceFragmentQueryRequest}; each data
  * node instantiates its own {@code LanceScanFilterQuery} from them.
  */
-public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
+public final class LanceScanFilterQuery extends Query {
 
     /** Sentinel that disables top-k pushdown; the scan is bounded only by fragment maxDoc. */
     public static final int SCAN_LIMIT_UNBOUNDED = 0;
@@ -171,8 +176,7 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
      */
     private static final class LanceScanFilterWeight extends Weight {
 
-        private final java.util.concurrent.atomic.AtomicReference<Map<Integer, FixedBitSet>> shardMatches =
-            new java.util.concurrent.atomic.AtomicReference<>();
+        private final AtomicReference<Map<Integer, FixedBitSet>> shardMatches = new AtomicReference<>();
         // The request's accounting: the admission gate counts the
         // request in flight on it and judges the bit sets' heap against
         // its breaker's room.
@@ -245,13 +249,13 @@ public final class LanceScanFilterQuery extends org.apache.lucene.search.Query {
             // fragment coordinator's searcher wraps exactly the leaves
             // this per-node executor was assigned, so the sibling set
             // is the fragment subset the request was fanned out with.
-            org.apache.lucene.index.IndexReaderContext topCtx = context;
+            IndexReaderContext topCtx = context;
             while (!topCtx.isTopLevel) {
                 topCtx = topCtx.parent;
             }
             Map<Integer, FixedBitSet> matchesByFragment = new HashMap<>();
             Map<Integer, LanceFragmentLeafReader> leavesByFragment = new HashMap<>();
-            java.util.List<Integer> fragmentIds = new java.util.ArrayList<>();
+            List<Integer> fragmentIds = new ArrayList<>();
             for (LeafReaderContext sibling : topCtx.leaves()) {
                 LanceFragmentLeafReader sl = LanceFragmentLeafReader.unwrap(sibling.reader());
                 if (sl != null) {

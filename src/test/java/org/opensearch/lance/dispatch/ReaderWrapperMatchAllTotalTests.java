@@ -21,6 +21,7 @@ import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.attach.LanceAttachAction;
@@ -76,7 +77,7 @@ public class ReaderWrapperMatchAllTotalTests extends OpenSearchSingleNodeTestCas
     protected Settings nodeSettings() {
         return Settings.builder()
             .put(super.nodeSettings())
-            .put(LancePlugin.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.getKey(), "wrapped:body:id:" + FIRST_VISIBLE_ID)
+            .put(LanceSettings.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.getKey(), "wrapped:body:id:" + FIRST_VISIBLE_ID)
             .build();
     }
 

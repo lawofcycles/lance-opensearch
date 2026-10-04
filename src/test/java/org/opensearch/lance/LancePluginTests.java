@@ -124,9 +124,9 @@ public class LancePluginTests extends OpenSearchTestCase {
         // as before and reading an old key logs a deprecation. A setting
         // introduced after the rename has no old key and no twin.
         Set<String> introducedAfterRename = Set.of(
-            LancePlugin.FRAGMENT_PATH_DEFER_FETCH_SETTING.getKey(),
-            LancePlugin.ALLOWED_CATALOG_ENDPOINTS_SETTING.getKey(),
-            LancePlugin.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.getKey()
+            LanceSettings.FRAGMENT_PATH_DEFER_FETCH_SETTING.getKey(),
+            LanceSettings.ALLOWED_CATALOG_ENDPOINTS_SETTING.getKey(),
+            LanceSettings.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.getKey()
         );
         List<Setting<?>> settings = plugin.getSettings();
         List<Setting<?>> current = settings.stream().filter(s -> s.isDeprecated() == false).collect(java.util.stream.Collectors.toList());
@@ -177,39 +177,39 @@ public class LancePluginTests extends OpenSearchTestCase {
             .put("lance.fragment_path.slices", 7)
             .put("plugins.lance.fragment_path.slices", 9)
             .build();
-        assertEquals(TimeValue.timeValueSeconds(3), LancePlugin.NAMESPACE_POLL_CADENCE_SETTING.get(settings));
-        assertEquals(List.of("/a", "/b"), LancePlugin.ALLOWED_TABLE_ROOTS_SETTING.get(settings));
-        assertEquals("7gb", LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.get(settings));
-        assertEquals(0.25, LancePlugin.CACHE_COLUMN_SHARE_SETTING.get(settings), 0.0);
-        assertEquals(new ByteSizeValue(3, ByteSizeUnit.MB), LancePlugin.REQUEST_CACHE_SIZE_SETTING.get(settings));
-        assertEquals(new ByteSizeValue(9, ByteSizeUnit.GB), LancePlugin.ADMISSION_HEADROOM_SETTING.get(settings));
-        assertEquals(LanceIndexWarmer.Mode.ALL, LancePlugin.ATTACH_WARM_INDEXES_SETTING.get(settings));
-        assertEquals(List.of("1gb", "2gb"), LancePlugin.TEST_ADMISSION_AVAILABLE_MEMORY_SETTING.get(settings));
-        assertEquals(Integer.valueOf(9), LancePlugin.FRAGMENT_PATH_SLICES_SETTING.get(settings));
+        assertEquals(TimeValue.timeValueSeconds(3), LanceSettings.NAMESPACE_POLL_CADENCE_SETTING.get(settings));
+        assertEquals(List.of("/a", "/b"), LanceSettings.ALLOWED_TABLE_ROOTS_SETTING.get(settings));
+        assertEquals("7gb", LanceSettings.NATIVE_MEMORY_LIMIT_SETTING.get(settings));
+        assertEquals(0.25, LanceSettings.CACHE_COLUMN_SHARE_SETTING.get(settings), 0.0);
+        assertEquals(new ByteSizeValue(3, ByteSizeUnit.MB), LanceSettings.REQUEST_CACHE_SIZE_SETTING.get(settings));
+        assertEquals(new ByteSizeValue(9, ByteSizeUnit.GB), LanceSettings.ADMISSION_HEADROOM_SETTING.get(settings));
+        assertEquals(LanceIndexWarmer.Mode.ALL, LanceSettings.ATTACH_WARM_INDEXES_SETTING.get(settings));
+        assertEquals(List.of("1gb", "2gb"), LanceSettings.TEST_ADMISSION_AVAILABLE_MEMORY_SETTING.get(settings));
+        assertEquals(Integer.valueOf(9), LanceSettings.FRAGMENT_PATH_SLICES_SETTING.get(settings));
         // Defaults still apply when neither key is set.
-        assertEquals(Boolean.TRUE, LancePlugin.CACHE_ENABLED_SETTING.get(settings));
+        assertEquals(Boolean.TRUE, LanceSettings.CACHE_ENABLED_SETTING.get(settings));
         // Every old key present in the settings is reported as deprecated,
         // including the one a current key overrides.
         assertSettingDeprecationsAndWarnings(
             new Setting<?>[] {
-                LancePlugin.NAMESPACE_POLL_CADENCE_SETTING_DEPRECATED,
-                LancePlugin.ALLOWED_TABLE_ROOTS_SETTING_DEPRECATED,
-                LancePlugin.NATIVE_MEMORY_LIMIT_SETTING_DEPRECATED,
-                LancePlugin.CACHE_COLUMN_SHARE_SETTING_DEPRECATED,
-                LancePlugin.REQUEST_CACHE_SIZE_SETTING_DEPRECATED,
-                LancePlugin.ADMISSION_HEADROOM_SETTING_DEPRECATED,
-                LancePlugin.ATTACH_WARM_INDEXES_SETTING_DEPRECATED,
-                LancePlugin.TEST_ADMISSION_AVAILABLE_MEMORY_SETTING_DEPRECATED,
-                LancePlugin.FRAGMENT_PATH_SLICES_SETTING_DEPRECATED }
+                LanceSettings.NAMESPACE_POLL_CADENCE_SETTING_DEPRECATED,
+                LanceSettings.ALLOWED_TABLE_ROOTS_SETTING_DEPRECATED,
+                LanceSettings.NATIVE_MEMORY_LIMIT_SETTING_DEPRECATED,
+                LanceSettings.CACHE_COLUMN_SHARE_SETTING_DEPRECATED,
+                LanceSettings.REQUEST_CACHE_SIZE_SETTING_DEPRECATED,
+                LanceSettings.ADMISSION_HEADROOM_SETTING_DEPRECATED,
+                LanceSettings.ATTACH_WARM_INDEXES_SETTING_DEPRECATED,
+                LanceSettings.TEST_ADMISSION_AVAILABLE_MEMORY_SETTING_DEPRECATED,
+                LanceSettings.FRAGMENT_PATH_SLICES_SETTING_DEPRECATED }
         );
     }
 
     public void testHidingWrapperSettingTakesFourPartsOrNothing() {
         // The empty default installs no wrapper; a value is the prefix,
         // the hidden column, the filter column and an integer minimum.
-        assertNull(HidingReaderWrapper.Rule.parse(LancePlugin.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.get(Settings.EMPTY)));
+        assertNull(HidingReaderWrapper.Rule.parse(LanceSettings.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.get(Settings.EMPTY)));
         Settings valid = Settings.builder().put("plugins.lance.test.hiding_wrapper_index_prefix", "wrapped-:body:rating:200").build();
-        HidingReaderWrapper.Rule rule = HidingReaderWrapper.Rule.parse(LancePlugin.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.get(valid));
+        HidingReaderWrapper.Rule rule = HidingReaderWrapper.Rule.parse(LanceSettings.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.get(valid));
         assertEquals(new HidingReaderWrapper.Rule("wrapped-", "body", "rating", 200L), rule);
         assertTrue(rule.appliesTo("wrapped-demo"));
         assertFalse(rule.appliesTo("plain-demo"));
@@ -217,7 +217,7 @@ public class LancePluginTests extends OpenSearchTestCase {
             Settings settings = Settings.builder().put("plugins.lance.test.hiding_wrapper_index_prefix", bad).build();
             IllegalArgumentException refused = expectThrows(
                 IllegalArgumentException.class,
-                () -> LancePlugin.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.get(settings)
+                () -> LanceSettings.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.get(settings)
             );
             assertTrue(refused.getMessage(), refused.getMessage().contains("plugins.lance.test.hiding_wrapper_index_prefix"));
         }
@@ -235,12 +235,12 @@ public class LancePluginTests extends OpenSearchTestCase {
         }
         ClusterSettings clusterSettings = new ClusterSettings(Settings.EMPTY, nodeSettings);
         List<Boolean> seen = new java.util.ArrayList<>();
-        clusterSettings.addSettingsUpdateConsumer(LancePlugin.CACHE_ENABLED_SETTING, seen::add);
+        clusterSettings.addSettingsUpdateConsumer(LanceSettings.CACHE_ENABLED_SETTING, seen::add);
         clusterSettings.applySettings(Settings.builder().put("lance.cache.enabled", false).build());
         assertEquals(List.of(false), seen);
         clusterSettings.applySettings(Settings.builder().put("plugins.lance.cache.enabled", true).build());
         assertEquals(List.of(false, true), seen);
-        assertSettingDeprecationsAndWarnings(new Setting<?>[] { LancePlugin.CACHE_ENABLED_SETTING_DEPRECATED });
+        assertSettingDeprecationsAndWarnings(new Setting<?>[] { LanceSettings.CACHE_ENABLED_SETTING_DEPRECATED });
     }
 
     public void testIndexCreatedUnderTheDeprecatedKeysIsALanceIndex() {
@@ -257,11 +257,11 @@ public class LancePluginTests extends OpenSearchTestCase {
             .build();
         assertTrue(LanceEngineFactory.isLanceIndex(settings));
         assertEquals("s3://bucket/old.lance", LanceEngineFactory.tableOf(settings));
-        assertEquals("id", LancePlugin.PRIMARY_KEY_FIELD_SETTING.get(settings));
-        assertEquals("keyword", LancePlugin.PRIMARY_KEY_TYPE_SETTING.get(settings));
-        assertEquals(Long.valueOf(4L), LancePlugin.VERSION_SETTING.get(settings));
-        assertEquals("wait", LancePlugin.UNCOVERED_FRAGMENT_POLICY_SETTING.get(settings));
-        assertEquals("", LancePlugin.TAG_SETTING.get(settings));
+        assertEquals("id", LanceSettings.PRIMARY_KEY_FIELD_SETTING.get(settings));
+        assertEquals("keyword", LanceSettings.PRIMARY_KEY_TYPE_SETTING.get(settings));
+        assertEquals(Long.valueOf(4L), LanceSettings.VERSION_SETTING.get(settings));
+        assertEquals("wait", LanceSettings.UNCOVERED_FRAGMENT_POLICY_SETTING.get(settings));
+        assertEquals("", LanceSettings.TAG_SETTING.get(settings));
         assertEquals(java.util.Map.of("aws_region", "eu-west-1"), StorageOptions.fromIndexSettings(settings).asMap());
         IndexSettings indexSettings = IndexSettingsModule.newIndexSettings(
             "legacy",
@@ -291,11 +291,11 @@ public class LancePluginTests extends OpenSearchTestCase {
         assertEquals("s3://bucket/old.lance", copied.get("index.plugins.lance.table"));
         assertSettingDeprecationsAndWarnings(
             new Setting<?>[] {
-                LancePlugin.TABLE_SETTING_DEPRECATED,
-                LancePlugin.PRIMARY_KEY_FIELD_SETTING_DEPRECATED,
-                LancePlugin.PRIMARY_KEY_TYPE_SETTING_DEPRECATED,
-                LancePlugin.VERSION_SETTING_DEPRECATED,
-                LancePlugin.UNCOVERED_FRAGMENT_POLICY_SETTING_DEPRECATED }
+                LanceSettings.TABLE_SETTING_DEPRECATED,
+                LanceSettings.PRIMARY_KEY_FIELD_SETTING_DEPRECATED,
+                LanceSettings.PRIMARY_KEY_TYPE_SETTING_DEPRECATED,
+                LanceSettings.VERSION_SETTING_DEPRECATED,
+                LanceSettings.UNCOVERED_FRAGMENT_POLICY_SETTING_DEPRECATED }
         );
     }
 
@@ -368,13 +368,13 @@ public class LancePluginTests extends OpenSearchTestCase {
         assertTrue(setting.isDynamic());
         assertEquals(
             LanceIndexWarmer.Mode.ALL,
-            LancePlugin.ATTACH_WARM_INDEXES_SETTING.get(
+            LanceSettings.ATTACH_WARM_INDEXES_SETTING.get(
                 org.opensearch.common.settings.Settings.builder().put("plugins.lance.attach.warm_indexes", "ALL").build()
             )
         );
         IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
-            () -> LancePlugin.ATTACH_WARM_INDEXES_SETTING.get(
+            () -> LanceSettings.ATTACH_WARM_INDEXES_SETTING.get(
                 org.opensearch.common.settings.Settings.builder().put("plugins.lance.attach.warm_indexes", "pages").build()
             )
         );

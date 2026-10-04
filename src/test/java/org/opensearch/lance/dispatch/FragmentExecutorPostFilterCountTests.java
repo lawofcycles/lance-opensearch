@@ -28,6 +28,7 @@ import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.attach.LanceAttachAction;
@@ -72,7 +73,7 @@ public class FragmentExecutorPostFilterCountTests extends OpenSearchSingleNodeTe
      */
     @Override
     protected Settings nodeSettings() {
-        return Settings.builder().put(super.nodeSettings()).put(LancePlugin.FRAGMENT_PATH_SLICES_SETTING.getKey(), 1).build();
+        return Settings.builder().put(super.nodeSettings()).put(LanceSettings.FRAGMENT_PATH_SLICES_SETTING.getKey(), 1).build();
     }
 
     private String attach(String indexName) throws Exception {

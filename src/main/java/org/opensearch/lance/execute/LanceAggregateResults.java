@@ -15,9 +15,10 @@ import java.util.function.Function;
 
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.lance.Dataset;
+import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.query.QueryShardContext;
-import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.plan.rel.LanceAggregate;
 import org.opensearch.lance.plan.rel.MetricSpec;
@@ -112,7 +113,7 @@ public final class LanceAggregateResults {
      * {@code plugins.lance.aggregation.percentiles_bins}; the plugin stores the
      * node setting here at start and every dynamic update after.
      */
-    private static volatile int defaultPercentilesBins = LancePlugin.AGGREGATION_PERCENTILES_BINS_SETTING.getDefault(Settings.EMPTY);
+    private static volatile int defaultPercentilesBins = LanceSettings.AGGREGATION_PERCENTILES_BINS_SETTING.getDefault(Settings.EMPTY);
 
     public static void setPercentilesBins(int bins) {
         defaultPercentilesBins = bins;
@@ -124,10 +125,28 @@ public final class LanceAggregateResults {
      * {@code plugins.lance.aggregation.pushdown_topk_slack}; the plugin stores
      * the node setting here at start and every dynamic update after.
      */
-    private static volatile int defaultTopkSlack = LancePlugin.AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING.getDefault(Settings.EMPTY);
+    private static volatile int defaultTopkSlack = LanceSettings.AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING.getDefault(Settings.EMPTY);
 
     public static void setTopkSlack(int slack) {
         defaultTopkSlack = slack;
+    }
+
+    /**
+     * Read the two planning parameters from the node settings and
+     * register for their dynamic updates. Called once by the plugin at
+     * start.
+     */
+    public static void bindSettings(Settings settings, ClusterSettings clusterSettings) {
+        setPercentilesBins(LanceSettings.AGGREGATION_PERCENTILES_BINS_SETTING.get(settings));
+        clusterSettings.addSettingsUpdateConsumer(
+            LanceSettings.AGGREGATION_PERCENTILES_BINS_SETTING,
+            LanceAggregateResults::setPercentilesBins
+        );
+        setTopkSlack(LanceSettings.AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING.get(settings));
+        clusterSettings.addSettingsUpdateConsumer(
+            LanceSettings.AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING,
+            LanceAggregateResults::setTopkSlack
+        );
     }
 
     /**

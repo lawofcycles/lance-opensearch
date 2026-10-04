@@ -37,9 +37,10 @@ import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterStateListener;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.lance.LanceCircuitBreaker;
-import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.NativeMemoryLimit;
@@ -216,14 +217,14 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
             this.indexUuid = metadata.getIndexUUID();
             this.table = LanceEngineFactory.tableOf(settings);
             this.storageOptions = StorageOptions.fromIndexSettings(settings);
-            long versionSetting = LancePlugin.VERSION_SETTING.get(settings);
+            long versionSetting = LanceSettings.VERSION_SETTING.get(settings);
             this.pinnedVersion = versionSetting >= 0 ? Optional.of(versionSetting) : Optional.empty();
-            String tagSetting = LancePlugin.TAG_SETTING.get(settings);
+            String tagSetting = LanceSettings.TAG_SETTING.get(settings);
             this.tag = tagSetting.isEmpty() ? null : tagSetting;
-            this.pkField = LancePlugin.PRIMARY_KEY_FIELD_SETTING.get(settings);
+            this.pkField = LanceSettings.PRIMARY_KEY_FIELD_SETTING.get(settings);
             this.pkType = pkField.isEmpty()
                 ? LancePrimaryKeyType.NONE
-                : LancePrimaryKeyType.fromSetting(LancePlugin.PRIMARY_KEY_TYPE_SETTING.get(settings));
+                : LancePrimaryKeyType.fromSetting(LanceSettings.PRIMARY_KEY_TYPE_SETTING.get(settings));
             this.overrides = LanceOverrides.of(settings);
             this.mode = mode;
         }
@@ -265,6 +266,23 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
 
     /** How long {@link #close} waits for a warm-up that is inside a Lance scan. */
     static final long CLOSE_WAIT_MILLIS = 60_000L;
+
+    /**
+     * The node's warmer in the mode {@link LanceSettings#ATTACH_WARM_INDEXES_SETTING}
+     * names, registered for the setting's dynamic updates. The caller adds
+     * the warmer as a cluster state listener; that registration is paired
+     * with its removal at close.
+     */
+    public static LanceIndexWarmer fromSettings(
+        Settings settings,
+        ClusterSettings clusterSettings,
+        LanceWarmCache warmCache,
+        ExecutorService executor
+    ) {
+        LanceIndexWarmer warmer = new LanceIndexWarmer(warmCache, executor, LanceSettings.ATTACH_WARM_INDEXES_SETTING.get(settings));
+        clusterSettings.addSettingsUpdateConsumer(LanceSettings.ATTACH_WARM_INDEXES_SETTING, warmer::setMode);
+        return warmer;
+    }
 
     /**
      * @param warmCache the node's snapshot cache the warm-up leases the

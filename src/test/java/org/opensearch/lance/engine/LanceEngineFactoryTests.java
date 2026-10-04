@@ -28,7 +28,7 @@ import org.opensearch.index.shard.DocsStats;
 import org.opensearch.index.store.Store;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.lance.LanceOverrides;
-import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
@@ -128,7 +128,7 @@ public class LanceEngineFactoryTests extends EngineTestCase {
             .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
             .put(LanceEngineFactory.TABLE_SETTING, missingTable.toString())
             .build();
-        IndexSettings lanceSettings = IndexSettingsModule.newIndexSettings("lance", settings, LancePlugin.TABLE_SETTING);
+        IndexSettings lanceSettings = IndexSettingsModule.newIndexSettings("lance", settings, LanceSettings.TABLE_SETTING);
         Path translogPath = createTempDir("translog-lance");
 
         try (Store lanceStore = createStore(lanceSettings, newDirectory())) {
@@ -177,9 +177,9 @@ public class LanceEngineFactoryTests extends EngineTestCase {
         IndexSettings lanceSettings = IndexSettingsModule.newIndexSettings(
             "lance",
             settings,
-            LancePlugin.TABLE_SETTING,
-            LancePlugin.PRIMARY_KEY_FIELD_SETTING,
-            LancePlugin.PRIMARY_KEY_TYPE_SETTING
+            LanceSettings.TABLE_SETTING,
+            LanceSettings.PRIMARY_KEY_FIELD_SETTING,
+            LanceSettings.PRIMARY_KEY_TYPE_SETTING
         );
         Path translogPath = createTempDir("translog-lance-cache");
 
@@ -286,7 +286,7 @@ public class LanceEngineFactoryTests extends EngineTestCase {
             .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
             .put(LanceEngineFactory.TABLE_SETTING, uri)
             .build();
-        IndexSettings lanceSettings = IndexSettingsModule.newIndexSettings("lance", settings, LancePlugin.TABLE_SETTING);
+        IndexSettings lanceSettings = IndexSettingsModule.newIndexSettings("lance", settings, LanceSettings.TABLE_SETTING);
         Path translogPath = createTempDir("translog-lance-nocache");
         try (Store lanceStore = createStore(lanceSettings, newDirectory())) {
             lanceStore.createEmpty(Version.CURRENT.luceneVersion);

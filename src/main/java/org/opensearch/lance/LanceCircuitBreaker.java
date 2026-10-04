@@ -5,11 +5,22 @@
 
 package org.opensearch.lance;
 
+import java.io.Closeable;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.lance.Session;
+import org.opensearch.common.settings.ClusterSettings;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.CircuitBreakingException;
+import org.opensearch.indices.breaker.BreakerSettings;
+import org.opensearch.threadpool.Scheduler.Cancellable;
+import org.opensearch.threadpool.ThreadPool;
 
 /**
  * Node-scoped bridge between the Lance {@link org.lance.Session} native
@@ -160,6 +171,108 @@ public final class LanceCircuitBreaker {
                 + limit
                 + "] bytes.";
             throw new CircuitBreakingException(message, used, limit, CircuitBreaker.Durability.TRANSIENT);
+        }
+    }
+
+    /**
+     * The breaker the plugin registers through
+     * {@code CircuitBreakerPlugin.getCircuitBreaker}: named {@link #NAME},
+     * limited to {@link LanceSettings#NATIVE_MEMORY_LIMIT_SETTING} so an
+     * operator configures one number, with an overhead of 1.0 because the
+     * sampler pushes measured usage rather than an estimate, and
+     * {@link CircuitBreaker.Durability#TRANSIENT} because an LRU eviction
+     * or the next sample is expected to clear the condition without an
+     * operator, which OpenSearch surfaces as a 429.
+     */
+    public static BreakerSettings breakerSettings(Settings settings) {
+        String rawLimit = LanceSettings.NATIVE_MEMORY_LIMIT_SETTING.get(settings);
+        long limitBytes = NativeMemoryLimit.parse(rawLimit, LanceSettings.NATIVE_MEMORY_LIMIT_SETTING.getKey());
+        return new BreakerSettings(NAME, limitBytes, 1.0, CircuitBreaker.Type.MEMORY, CircuitBreaker.Durability.TRANSIENT);
+    }
+
+    /**
+     * The loop that keeps the breaker's accounting aligned with the
+     * native footprint: at {@link LanceSettings#NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING}
+     * it reads {@code Session.sizeBytes()} and the column cache's bytes
+     * and hands their sum to {@link #updateUsage(long, long)}. It runs on
+     * the generic pool so it takes no capacity from the search or write
+     * executors. {@link LanceSettings#NATIVE_MEMORY_CB_ENABLED_SETTING}
+     * and the interval are dynamic; the sampler registers for both and
+     * reschedules itself when the interval changes.
+     */
+    public static final class Sampler implements Closeable {
+
+        private static final Logger LOGGER = LogManager.getLogger(Sampler.class);
+
+        private final ThreadPool threadPool;
+        private final LongSupplier columnCacheBytes;
+        private volatile Cancellable task;
+        private volatile TimeValue interval;
+
+        private Sampler(ThreadPool threadPool, LongSupplier columnCacheBytes, TimeValue interval) {
+            this.threadPool = threadPool;
+            this.columnCacheBytes = columnCacheBytes;
+            this.interval = interval;
+            this.task = schedule(interval);
+        }
+
+        /**
+         * Apply the enabled flag, start sampling at the configured
+         * interval and register for changes of both.
+         *
+         * @param columnCacheBytes the column cache's current bytes, read
+         *        on every sample
+         */
+        public static Sampler start(
+            ThreadPool threadPool,
+            Settings settings,
+            ClusterSettings clusterSettings,
+            LongSupplier columnCacheBytes
+        ) {
+            setEnabled(LanceSettings.NATIVE_MEMORY_CB_ENABLED_SETTING.get(settings));
+            clusterSettings.addSettingsUpdateConsumer(LanceSettings.NATIVE_MEMORY_CB_ENABLED_SETTING, LanceCircuitBreaker::setEnabled);
+            Sampler sampler = new Sampler(threadPool, columnCacheBytes, LanceSettings.NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING.get(settings));
+            clusterSettings.addSettingsUpdateConsumer(LanceSettings.NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING, sampler::setInterval);
+            return sampler;
+        }
+
+        private Cancellable schedule(TimeValue every) {
+            Runnable sample = () -> {
+                try {
+                    Session session = LanceRegistry.currentSession();
+                    if (session == null || session.isClosed()) {
+                        return;
+                    }
+                    updateUsage(session.sizeBytes(), columnCacheBytes.getAsLong());
+                } catch (Throwable t) {
+                    // A failed reading leaves the accounting as it was for
+                    // one more cycle; the scheduler must not see the throw.
+                    LOGGER.warn("lance_native circuit breaker poll iteration failed", t);
+                }
+            };
+            return threadPool.scheduleWithFixedDelay(sample, every, ThreadPool.Names.GENERIC);
+        }
+
+        private synchronized void setInterval(TimeValue newInterval) {
+            if (newInterval.equals(interval)) {
+                return;
+            }
+            Cancellable current = task;
+            if (current != null) {
+                current.cancel();
+            }
+            interval = newInterval;
+            task = schedule(newInterval);
+            LOGGER.info("lance_native circuit breaker poll interval updated to [{}]", newInterval);
+        }
+
+        @Override
+        public void close() {
+            Cancellable current = task;
+            if (current != null) {
+                current.cancel();
+                task = null;
+            }
         }
     }
 }
