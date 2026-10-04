@@ -26,8 +26,10 @@ Every message that crosses nodes carries a `WIRE_VERSION` constant and is writte
    request or a per node response it follows the fields the OpenSearch base class writes (the
    parent task id, the cluster manager timeout, the node), which OpenSearch versions itself.
 2. The base fields: the fields the message had at version 1, inline, in that order, forever.
-3. One block per version above 1, in ascending order: a flag, then the fields that version added
-   as a length prefixed byte array. The flag says whether the block is critical.
+3. One block per version above 1, in ascending order, no gaps in the sequence: a flag, then the
+   fields that version added as a length prefixed byte array. The flag says whether the block is
+   critical. A version that removes fields without adding any still writes its block, empty, so
+   the block index stays contiguous.
 
 A reader opens with `WireVersion.read`, which returns the marker in a `Reader`, reads the base
 fields itself, then calls `Reader.block(version, parser, fallback)` once for every version above
