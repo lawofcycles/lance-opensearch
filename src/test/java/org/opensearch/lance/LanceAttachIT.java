@@ -134,7 +134,7 @@ public class LanceAttachIT extends LanceRestTestCase {
         // A key the parser never reads answers 400 naming it and the
         // accepted list, in core's illegal_argument_exception shape,
         // instead of creating the index as if the key were absent.
-        String accepted = "accepted keys are table, name, number_of_shards, version, tag, storage_options, overrides, multi_fields";
+        String accepted = "accepted keys are table, name, version, tag, storage_options, overrides, multi_fields";
         for (String key : new String[] { "indexes", "fts_columns" }) {
             String payload = "{\"table\":\"/tmp/does-not-matter.lance\",\"" + key + "\":[\"body\"]}";
             ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_plugins/_lance/attach", payload));

@@ -43,7 +43,7 @@ public class RestBodyKeysTests extends OpenSearchTestCase {
 
     public void testAttachAcceptedKeysArePinned() {
         assertEquals(
-            List.of("table", "name", "number_of_shards", "version", "tag", "storage_options", "overrides", "multi_fields"),
+            List.of("table", "name", "version", "tag", "storage_options", "overrides", "multi_fields"),
             RestAttachAction.ACCEPTED_KEYS
         );
     }
@@ -60,7 +60,7 @@ public class RestBodyKeysTests extends OpenSearchTestCase {
             assertEquals(
                 "[lance_attach] unknown key ["
                     + key
-                    + "]; accepted keys are table, name, number_of_shards, version, tag, storage_options, overrides, multi_fields",
+                    + "]; accepted keys are table, name, version, tag, storage_options, overrides, multi_fields",
                 e.getMessage()
             );
         }
@@ -86,8 +86,6 @@ public class RestBodyKeysTests extends OpenSearchTestCase {
             "\"/tmp/t.lance\"",
             "name",
             "\"t\"",
-            "number_of_shards",
-            "1",
             "version",
             "3",
             "tag",
