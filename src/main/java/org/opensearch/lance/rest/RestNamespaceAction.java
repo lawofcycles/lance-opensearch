@@ -57,12 +57,29 @@ import org.opensearch.transport.client.node.NodeClient;
  * </ul>
  *
  * <p>The handler only parses the body and hands the request to the
- * transport action. Allowlist and path existence checks live in the
- * transport action so they run after a security plugin has evaluated
- * the caller's privileges, and nothing about the path (whether it is
- * registered, whether it exists) is revealed to a caller who lacks them.
+ * transport action. A body is checked against the top level keys of its
+ * shape ({@link #REGISTER_KEYS} or {@link #IDENTIFIER_KEYS}) before it is
+ * read, and an unknown key answers 400. Allowlist and path existence
+ * checks live in the transport action so they run after a security
+ * plugin has evaluated the caller's privileges, and nothing about the
+ * path (whether it is registered, whether it exists) is revealed to a
+ * caller who lacks them.
  */
 public class RestNamespaceAction extends BaseRestHandler {
+
+    /**
+     * The top level keys the register body ({@code POST /_plugins/_lance/namespace})
+     * is read for, in the order {@link #prepareRequest} reads them. Any
+     * other key is a 400 naming it and this list.
+     */
+    static final List<String> REGISTER_KEYS = List.of("path", "type", "name", "config", "storage_options", "overrides");
+
+    /**
+     * The top level keys of the bodies that only identify a registration
+     * ({@code POST /_plugins/_lance/namespace/tables} and
+     * {@code DELETE /_plugins/_lance/namespace}), in the order they are read.
+     */
+    static final List<String> IDENTIFIER_KEYS = List.of("path", "name");
 
     @Override
     public String getName() {
@@ -101,8 +118,14 @@ public class RestNamespaceAction extends BaseRestHandler {
             );
         }
         Map<String, Object> body = request.hasContent()
-            ? XContentHelper.convertToMap(request.content(), false, request.getMediaType()).v2()
+            ? XContentHelper.convertToMap(request.content(), true, request.getMediaType()).v2()
             : Map.of();
+        boolean identifierOnly = request.path().endsWith("/tables") || request.method() == RestRequest.Method.DELETE;
+        // Thrown, not caught: the REST controller turns it into a 400
+        // illegal_argument_exception, the shape core uses for an unknown
+        // field in a request body. The body is read in document order so
+        // the key named is the first unknown one the caller wrote.
+        RestBodyKeys.rejectUnknown(getName(), body, identifierOnly ? IDENTIFIER_KEYS : REGISTER_KEYS);
         String path;
         try {
             path = optionalString(body, "path");

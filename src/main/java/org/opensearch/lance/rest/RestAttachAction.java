@@ -47,7 +47,9 @@ import org.opensearch.transport.client.node.NodeClient;
  * <p>Attach always creates a single-shard index because the fragment path
  * (see {@code LanceDispatchActionFilter}) is the only search implementation
  * left, and it fans out to fragments regardless of shard count. Requests
- * carrying {@code number_of_shards} are rejected with 400.
+ * carrying {@code number_of_shards} are rejected with 400 naming the
+ * reason, before the key check; any other top level key outside
+ * {@link #ACCEPTED_KEYS} is a 400 naming the key and the list.
  *
  * <p>The handler parses the body and hands a {@link LanceAttachRequest} to
  * {@link LanceAttachAction}; opening the table, deriving the mapping, and
@@ -59,6 +61,12 @@ import org.opensearch.transport.client.node.NodeClient;
 public class RestAttachAction extends BaseRestHandler {
 
     private static final String PK_METADATA_KEY = "lance-schema:unenforced-primary-key";
+
+    /**
+     * The top level keys {@link #prepareRequest} reads, in the order it
+     * reads them. Any other key is a 400 naming it and this list.
+     */
+    static final List<String> ACCEPTED_KEYS = List.of("table", "name", "version", "tag", "storage_options", "overrides", "multi_fields");
 
     @Override
     public String getName() {
@@ -73,8 +81,26 @@ public class RestAttachAction extends BaseRestHandler {
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) {
         Map<String, Object> body = request.hasContent()
-            ? XContentHelper.convertToMap(request.content(), false, request.getMediaType()).v2()
+            ? XContentHelper.convertToMap(request.content(), true, request.getMediaType()).v2()
             : Map.of();
+        if (body.containsKey("number_of_shards")) {
+            // Lance-backed indices are single-shard and fan-out happens
+            // per fragment, so a shard count has nothing to control.
+            // Answered before the key check so the operator reads why,
+            // not just that the key is unknown.
+            return channel -> channel.sendResponse(
+                new BytesRestResponse(
+                    RestStatus.BAD_REQUEST,
+                    "[number_of_shards] is no longer accepted by /_plugins/_lance/attach; the fragment path fans out at the fragment "
+                        + "level regardless of shard count, and Lance-backed indices are always single-shard"
+                )
+            );
+        }
+        // Thrown, not caught: the REST controller turns it into a 400
+        // illegal_argument_exception, the shape core uses for an unknown
+        // field in a request body. The body is read in document order so
+        // the key named is the first unknown one the caller wrote.
+        RestBodyKeys.rejectUnknown(getName(), body, ACCEPTED_KEYS);
 
         String table;
         String explicitName;
@@ -88,20 +114,6 @@ public class RestAttachAction extends BaseRestHandler {
                 return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, "[table] is required"));
             }
             explicitName = readOptionalString(body, "name");
-            if (body.containsKey("number_of_shards")) {
-                // Lance-backed indices are single-shard and fan-out happens
-                // per fragment, so a shard count has nothing to control.
-                // Reject rather than silently ignore so an operator setting
-                // `number_of_shards: 5` is not left wondering why fan-out
-                // did not widen.
-                return channel -> channel.sendResponse(
-                    new BytesRestResponse(
-                        RestStatus.BAD_REQUEST,
-                        "[number_of_shards] is no longer accepted by /_plugins/_lance/attach; the fragment path fans out at the fragment "
-                            + "level regardless of shard count, and Lance-backed indices are always single-shard"
-                    )
-                );
-            }
             pinnedVersion = readOptionalLong(body, "version");
             if (pinnedVersion != null && pinnedVersion < 0) {
                 return channel -> channel.sendResponse(
