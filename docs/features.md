@@ -122,7 +122,7 @@ Distribution over the cluster is automatic: fragments are spread over every data
 
 ### Authorization
 
-Every `/_plugins/_lance/*` endpoint runs through a transport action, so a security plugin evaluates the caller before the plugin opens a table, probes a path, or lists anything. Grant these action names to roles:
+Every `/_plugins/_lance/*` endpoint runs through a transport action, so a security plugin evaluates the caller before the plugin opens a table, probes a path, or lists anything. The index-level permissions below are evaluated against the one index named in the request path, so a role whose `index_patterns` matches that index grants them (`["perf20m*"]` grants `GET /_plugins/_lance/refs/perf20m`); the pattern is not expanded to other indexes. Grant these action names to roles:
 
 - `cluster:admin/lance/attach` for `POST /_plugins/_lance/attach` (operator roles that may create Lance-backed indexes). The internal create-index call runs under a stashed thread context with the plugin's internal header, so the role is expected not to need `indices:admin/create` in addition; this is still to be confirmed with the security plugin installed.
 - `cluster:admin/lance/namespace/update` for `POST` / `DELETE /_plugins/_lance/namespace` (the same operator roles).
