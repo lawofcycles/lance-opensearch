@@ -12,6 +12,10 @@ Every `_search` over a Lance backed target runs on the fragment executors. A bod
 
 A request Lance refuses as invalid input (for example `lance_match_phrase` on an FTS index built without positions) answers 400 `illegal_argument_exception` with Lance's message; [design/lance-error-mapping.md](design/lance-error-mapping.md) records how Lance's exceptions map onto the status.
 
+## Search pipelines
+
+A search pipeline (`search_pipeline` parameter or `index.search.default_pipeline`) is not applied to a search whose targets are all Lance backed: the fragment path takes the request before `TransportSearchAction` resolves the pipeline, and no request, response or phase results processor runs ([features.md](features.md#hybrid-search), issue #422). A search that mixes a Lance backed index with an ordinary one stays on the stock search action and runs its pipeline as usual. Search templates are rendered before dispatch and are not affected.
+
 ## Query types the field types refuse
 
 Refused with 400 on both paths, by the field types themselves, with the same message on OpenSearch's stock search action over the whole table reader. The fragment leaves carry doc values, the Lance full text and vector indexes, and the parent join of nested columns, but no postings, positions, term statistics or points ([features.md](features.md#query-dsl-matrix) lists every query type and what evaluates it), and these query types read what the leaves do not carry:
