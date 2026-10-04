@@ -147,6 +147,7 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 | `LanceStatisticsPrefetchNodeRequest` | 1 | Base: the index name, the table URI the statistics cache keys on, the version to collect |
 | `LanceStatisticsPrefetchNodeResponse` | 1 | Base: the outcome (`STARTED`, `HELD` or `PENDING`) |
 | `LanceIndexSyncRequest` | 1 | Base: nothing after the marker (the index travels in the OpenSearch base class) |
+| | 2 | Block, optional: the manifest version the asking search coordinator read the table at (one long; fallback `-1`, the manual trigger, which checks unconditionally) |
 | `LanceIndexSyncResponse` | 1 | Base: the freshness outcome (index, checked, reason, moved, served and target version, mapping changed, rebuilt) |
 | | 2 | Block, optional: the message of the mapping update the check sent and the cluster manager refused (optional string; fallback absent) |
 | `LanceNamespacePollRequest` | 1 | Base: optional namespace name |

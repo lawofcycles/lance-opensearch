@@ -157,6 +157,106 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
         assertEquals(1, client.count(PutMappingAction.NAME));
     }
 
+    public void testCheckDerivesTheMappingWhenTheReaderAdvancedOnItsOwn() throws Exception {
+        // The engine refreshes before every read, so the served version
+        // can reach a new version before any check saw it. The check
+        // still derives the mapping of that version: it keys on the
+        // version it last derived at, not on the served version, and
+        // sends no refresh for a reader that is there already.
+        String tableUri = writeTable("selfadvance");
+        FakeShard shard = FakeShard.overTable("selfadvance", tableUri, Settings.EMPTY);
+        LanceIndexFreshnessService.Tracked entry = service.track(shard);
+        LanceIndexFreshnessService.Outcome first = service.check(entry);
+        assertFalse(first.moved());
+        assertEquals(0, client.count(PutMappingAction.NAME));
+
+        try (Dataset dataset = LanceRegistry.openDataset(tableUri, StorageOptions.empty())) {
+            dataset.addColumns(List.of(new Field("score", FieldType.nullable(new ArrowType.Int(64, true)), null)));
+        }
+        // A read advanced the reader to the new version before the check.
+        shard.refresh("read");
+        assertEquals(currentVersion(tableUri), shard.servedVersion());
+        assertEquals(1, shard.refreshes.get());
+
+        LanceIndexFreshnessService.Outcome outcome = service.check(entry);
+        assertTrue("a version the mapping was not derived at is a move", outcome.moved());
+        assertEquals("the reader was there already", outcome.targetVersion(), outcome.servedVersion());
+        assertTrue(outcome.mappingChanged());
+        assertEquals(1, client.count(PutMappingAction.NAME));
+        assertEquals("no refresh for a reader at the target version", 1, shard.refreshes.get());
+        assertEquals(1, service.stats().moves());
+
+        // The same version again: nothing to derive, not a move.
+        LanceIndexFreshnessService.Outcome again = service.check(entry);
+        assertFalse(again.moved());
+        assertFalse(again.mappingChanged());
+        assertEquals(1, client.count(PutMappingAction.NAME));
+    }
+
+    public void testFirstCheckAfterTheReaderAdvancedOnItsOwnIsAMove() throws Exception {
+        // The table moves after the shard started and a read advances the
+        // reader before the first check runs. The check compares with the
+        // version the shard opened at, so the move is seen and broadcast,
+        // and the reader, already there, is not refreshed.
+        String tableUri = writeTable("firstmove");
+        FakeShard shard = FakeShard.overTable("firstmove", tableUri, Settings.EMPTY);
+        long opened = shard.servedVersion();
+        LanceIndexFreshnessService.Tracked entry = service.track(shard);
+        LanceTableFactory.appendRows(tableUri, 6, 4);
+        shard.refresh("read");
+        assertTrue(shard.servedVersion() > opened);
+
+        LanceIndexFreshnessService.Outcome first = service.check(entry);
+        assertTrue("the table moved since the shard opened", first.moved());
+        assertEquals(shard.servedVersion(), first.servedVersion());
+        assertEquals(shard.servedVersion(), first.targetVersion());
+        assertEquals("the reader was there already", 1, shard.refreshes.get());
+        assertEquals("the move is broadcast", 1, client.count(LanceStatisticsPrefetchAction.NAME));
+        assertFalse("same schema, no mapping update", first.mappingChanged());
+
+        assertFalse(service.check(entry).moved());
+        assertEquals(1, client.count(LanceStatisticsPrefetchAction.NAME));
+    }
+
+    public void testAnObservedVersionTheMappingWasDerivedAtIsSkipped() throws Exception {
+        String tableUri = writeTable("observed");
+        FakeShard shard = FakeShard.overTable("observed", tableUri, Settings.EMPTY);
+        LanceIndexFreshnessService.Tracked entry = service.track(shard);
+        long first = currentVersion(tableUri);
+        assertFalse("nothing derived yet", service.alreadyDerivedAt(entry, first));
+
+        service.check(entry);
+        assertTrue(service.alreadyDerivedAt(entry, first));
+        assertTrue(
+            "a latest following index derived at a later version covers an older observation",
+            service.alreadyDerivedAt(entry, first - 1)
+        );
+        assertFalse(service.alreadyDerivedAt(entry, first + 1));
+
+        LanceTableFactory.appendRows(tableUri, 6, 2);
+        long second = currentVersion(tableUri);
+        assertFalse(service.alreadyDerivedAt(entry, second));
+        service.check(entry);
+        assertTrue(service.alreadyDerivedAt(entry, second));
+        assertTrue(service.alreadyDerivedAt(entry, first));
+
+        // A tag following index is checked whenever the versions differ:
+        // the tag can point back at an older version.
+        try (Dataset dataset = LanceRegistry.openDataset(tableUri, StorageOptions.empty())) {
+            dataset.tags().create("release", second);
+        }
+        FakeShard tagged = FakeShard.overTable(
+            "observedtag",
+            tableUri,
+            Settings.builder().put(LanceEngineFactory.TAG_SETTING, "release").build()
+        );
+        LanceIndexFreshnessService.Tracked taggedEntry = service.track(tagged);
+        service.check(taggedEntry);
+        assertTrue(service.alreadyDerivedAt(taggedEntry, second));
+        assertFalse(service.alreadyDerivedAt(taggedEntry, first));
+        assertFalse(service.alreadyDerivedAt(taggedEntry, second + 1));
+    }
+
     public void testTagMovingBackwardsIsAMove() throws Exception {
         String tableUri = writeTable("tagback");
         long versionA = currentVersion(tableUri);

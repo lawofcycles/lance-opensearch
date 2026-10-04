@@ -28,7 +28,9 @@ import org.opensearch.transport.TransportService;
  * (a Lance backed index has one shard and no replica), where the
  * {@link LanceIndexFreshnessService} that checks the index lives. The
  * check opens the table and may send a mapping update, so it runs on
- * the generic pool.
+ * the generic pool. A request carrying the version the search
+ * coordinator observed is answered without a check when the mapping
+ * was derived at that version already.
  */
 public final class TransportLanceIndexSyncAction extends TransportSingleShardAction<LanceIndexSyncRequest, LanceIndexSyncResponse> {
 
@@ -62,7 +64,7 @@ public final class TransportLanceIndexSyncAction extends TransportSingleShardAct
     @Override
     protected LanceIndexSyncResponse shardOperation(LanceIndexSyncRequest request, ShardId shardId) throws IOException {
         IndexShard shard = indicesService.indexServiceSafe(shardId.getIndex()).getShard(shardId.id());
-        return new LanceIndexSyncResponse(freshnessService.syncNow(shard));
+        return new LanceIndexSyncResponse(freshnessService.syncNow(shard, request.observedVersion()));
     }
 
     @Override

@@ -302,6 +302,136 @@ public class LanceEngineFactoryTests extends EngineTestCase {
         }
     }
 
+    public void testEveryReadSeesTheTableVersionAndKeepsTheReaderWhenItDidNotMove() throws Exception {
+        // GET and docStats refresh the reader before they read: a row
+        // committed to the table is answered by the next GET with no
+        // refresh call, and a read at an unchanged version opens nothing
+        // (the snapshot build count and the dataset open count of the
+        // cache stand still). A pinned engine never refreshes.
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeStringPkTable(scratchDir, "engine-fresh-" + getTestName(), 4, 2);
+        long attached;
+        try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
+            attached = dataset.version();
+        }
+        try (
+            RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+            LanceWarmCache cache = new LanceWarmCache(allocator, 64L * 1024 * 1024, 64, true)
+        ) {
+            Settings following = stringPkSettings(uri, "engine-fresh-uuid", -1L);
+            IndexSettings followingSettings = stringPkIndexSettings(following);
+            Path translogPath = createTempDir("translog-lance-fresh");
+            try (Store lanceStore = createStore(followingSettings, newDirectory())) {
+                lanceStore.createEmpty(Version.CURRENT.luceneVersion);
+                String translogUuid = Translog.createEmptyTranslog(
+                    translogPath,
+                    SequenceNumbers.NO_OPS_PERFORMED,
+                    shardId,
+                    primaryTerm.get()
+                );
+                lanceStore.associateIndexWithNewTranslog(translogUuid);
+                EngineConfig config = config(followingSettings, lanceStore, translogPath, newMergePolicy(), null);
+                try (Engine engine = new LanceEngineFactory(cache).newReadWriteEngine(config)) {
+                    assertEquals(1L, cache.snapshotBuildCount());
+                    long opensAfterOpen = cache.datasetOpenCount();
+                    assertEquals(4, engine.docStats().getCount());
+                    try (
+                        Engine.GetResult hit = engine.get(
+                            new Engine.Get(true, true, "alpha-3", new Term("_id", "alpha-3")),
+                            engine::acquireSearcher
+                        )
+                    ) {
+                        assertTrue(hit.exists());
+                    }
+                    try (
+                        Engine.GetResult miss = engine.get(
+                            new Engine.Get(true, true, "alpha-5", new Term("_id", "alpha-5")),
+                            engine::acquireSearcher
+                        )
+                    ) {
+                        assertFalse(miss.exists());
+                    }
+                    assertEquals("reads at an unchanged version swap no reader", 1L, cache.snapshotBuildCount());
+                    assertEquals("reads at an unchanged version build no snapshot", opensAfterOpen, cache.datasetOpenCount());
+                    assertEquals(attached, ((LanceEngineFactory.LanceReadOnlyEngine) engine).servedVersion());
+
+                    // alpha-4 and alpha-5 are committed: the next GET answers
+                    // alpha-5 and the next docStats counts six, no refresh call.
+                    LanceTableFactory.appendStringPkRows(uri, 4, 2);
+                    try (
+                        Engine.GetResult hit = engine.get(
+                            new Engine.Get(true, true, "alpha-5", new Term("_id", "alpha-5")),
+                            engine::acquireSearcher
+                        )
+                    ) {
+                        assertTrue("the committed row is read on the next GET", hit.exists());
+                    }
+                    assertEquals("the GET swapped the reader to the new version", 2L, cache.snapshotBuildCount());
+                    assertEquals(attached + 1, ((LanceEngineFactory.LanceReadOnlyEngine) engine).servedVersion());
+                    assertEquals(6, engine.docStats().getCount());
+                    assertEquals(2L, cache.snapshotBuildCount());
+                }
+            }
+
+            // Pinned to the version attached at: the appended rows stay out
+            // and nothing is opened per read.
+            Settings pinned = stringPkSettings(uri, "engine-pinned-uuid", attached);
+            IndexSettings pinnedSettings = stringPkIndexSettings(pinned);
+            Path pinnedTranslog = createTempDir("translog-lance-pinned");
+            try (Store lanceStore = createStore(pinnedSettings, newDirectory())) {
+                lanceStore.createEmpty(Version.CURRENT.luceneVersion);
+                String translogUuid = Translog.createEmptyTranslog(
+                    pinnedTranslog,
+                    SequenceNumbers.NO_OPS_PERFORMED,
+                    shardId,
+                    primaryTerm.get()
+                );
+                lanceStore.associateIndexWithNewTranslog(translogUuid);
+                EngineConfig config = config(pinnedSettings, lanceStore, pinnedTranslog, newMergePolicy(), null);
+                try (Engine engine = new LanceEngineFactory(cache).newReadWriteEngine(config)) {
+                    long builds = cache.snapshotBuildCount();
+                    long opens = cache.datasetOpenCount();
+                    assertEquals(4, engine.docStats().getCount());
+                    try (
+                        Engine.GetResult miss = engine.get(
+                            new Engine.Get(true, true, "alpha-5", new Term("_id", "alpha-5")),
+                            engine::acquireSearcher
+                        )
+                    ) {
+                        assertFalse("a pinned engine does not see the appended row", miss.exists());
+                    }
+                    assertEquals(builds, cache.snapshotBuildCount());
+                    assertEquals(opens, cache.datasetOpenCount());
+                    assertEquals(attached, ((LanceEngineFactory.LanceReadOnlyEngine) engine).servedVersion());
+                }
+            }
+        }
+    }
+
+    private static Settings stringPkSettings(String uri, String indexUuid, long pinnedVersion) {
+        Settings.Builder settings = Settings.builder()
+            .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+            .put(IndexMetadata.SETTING_INDEX_UUID, indexUuid)
+            .put(LanceEngineFactory.TABLE_SETTING, uri)
+            .put(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING, "key")
+            .put(LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING, "keyword");
+        if (pinnedVersion >= 0) {
+            settings.put(LanceEngineFactory.VERSION_SETTING, pinnedVersion);
+        }
+        return settings.build();
+    }
+
+    private static IndexSettings stringPkIndexSettings(Settings settings) {
+        return IndexSettingsModule.newIndexSettings(
+            "lance",
+            settings,
+            LanceSettings.TABLE_SETTING,
+            LanceSettings.PRIMARY_KEY_FIELD_SETTING,
+            LanceSettings.PRIMARY_KEY_TYPE_SETTING,
+            LanceSettings.VERSION_SETTING
+        );
+    }
+
     private static void assertLanceNotFound(String attempt, RuntimeException e) {
         String chain = describe(e);
         assertFalse(

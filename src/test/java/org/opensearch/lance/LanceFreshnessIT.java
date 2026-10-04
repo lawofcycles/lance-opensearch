@@ -8,12 +8,14 @@ package org.opensearch.lance;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
+import org.opensearch.client.ResponseException;
 import org.opensearch.core.rest.RestStatus;
 
 /**
@@ -22,7 +24,8 @@ import org.opensearch.core.rest.RestStatus;
  * the engine reader without a mapping update, a new column is a move
  * that updates the mapping, a check at the table's version does nothing,
  * a pinned index is never checked, and {@code GET /_plugins/_lance/stats} counts
- * all of it under {@code freshness}.
+ * all of it under {@code freshness}. Without a sync, the engine reads
+ * the table's current version on every read.
  */
 public class LanceFreshnessIT extends LanceRestTestCase {
 
@@ -133,6 +136,71 @@ public class LanceFreshnessIT extends LanceRestTestCase {
                 }
             });
             client().performRequest(new Request("DELETE", "/" + indexName));
+        }
+    }
+
+    public void testEngineReadsSeeACommitOnTheNextCallWithoutASyncOrACadence() throws Exception {
+        // The engine refreshes before every read of its own, so a row
+        // committed to the table is answered by GET and _mget, counted by
+        // _stats and read by a mixed target _search on the call right
+        // after the commit, with no sync and no wait for the scheduled
+        // check. A string PK table gives GET something to look up.
+        String suffix = "engine-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        String tableUri = LanceTableFactory.writeStringPkTable(scratchDir, tableName, 4);
+        String indexName = tableName;
+        String plain = "plain-" + suffix;
+        try {
+            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
+            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
+            ensureGreen(indexName);
+            Request create = new Request("PUT", "/" + plain);
+            create.setJsonEntity(
+                "{\"settings\":{\"number_of_shards\":1,\"number_of_replicas\":0},"
+                    + "\"mappings\":{\"properties\":{\"key\":{\"type\":\"keyword\"},\"label\":{\"type\":\"keyword\"}}}}"
+            );
+            client().performRequest(create);
+            Request doc = new Request("PUT", "/" + plain + "/_doc/1?refresh=true");
+            doc.setJsonEntity("{\"key\":\"plain-1\",\"label\":\"row-1\"}");
+            client().performRequest(doc);
+            assertEquals(4, engineDocCount(indexName));
+            ResponseException missing = expectThrows(
+                ResponseException.class,
+                () -> client().performRequest(new Request("GET", "/" + indexName + "/_doc/alpha-5"))
+            );
+            assertEquals(404, missing.getResponse().getStatusLine().getStatusCode());
+
+            // alpha-4 and alpha-5 are committed; the very next GET answers one.
+            LanceTableFactory.appendStringPkRows(tableUri, 4, 2);
+            Response hit = client().performRequest(new Request("GET", "/" + indexName + "/_doc/alpha-5"));
+            String hitBody = readAll(hit);
+            assertEquals(hitBody, 200, hit.getStatusLine().getStatusCode());
+            @SuppressWarnings("unchecked")
+            Map<String, Object> source = (Map<String, Object>) parseJson(hitBody).get("_source");
+            assertEquals(hitBody, "col-5", source.get("label"));
+            // _mget goes through the same searcher acquisition and finds the row too.
+            String mgetBody = readAll(postJson("/" + indexName + "/_mget", "{\"ids\":[\"alpha-5\"]}"));
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> mgetDocs = (List<Map<String, Object>>) parseJson(mgetBody).get("docs");
+            assertEquals(mgetBody, 1, mgetDocs.size());
+            assertEquals(mgetBody, Boolean.TRUE, mgetDocs.get(0).get("found"));
+            @SuppressWarnings("unchecked")
+            Map<String, Object> mgetSource = (Map<String, Object>) mgetDocs.get(0).get("_source");
+            assertEquals(mgetBody, "col-5", mgetSource.get("label"));
+            assertEquals("the next _stats counts the appended rows", 6, engineDocCount(indexName));
+
+            // A third commit, read by the stock search path over a mixed
+            // target (the Lance index next to a plain one) on its next call.
+            LanceTableFactory.appendStringPkRows(tableUri, 6, 1);
+            String mixed = readAll(postJson("/" + indexName + "," + plain + "/_search", "{\"size\":0,\"track_total_hits\":true}"));
+            assertEquals("the mixed target search read the shard reader", 2, extractIntPath(mixed, "_shards", "total"));
+            assertEquals(mixed, 7 + 1, extractIntPath(mixed, "hits", "total", "value"));
+            assertEquals(7, engineDocCount(indexName));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName + "," + plain));
+            } catch (Exception ignored) {}
         }
     }
 

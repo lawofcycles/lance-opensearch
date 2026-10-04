@@ -56,25 +56,34 @@ import org.opensearch.transport.client.Client;
  * when the shard closes; each tracked index gets its own task at the
  * namespace poll cadence on the generic pool.
  *
- * <p>A check opens the table's latest manifest and compares the version
+ * <p>A check opens the table's latest manifest and resolves the version
  * the index should serve (the latest, or the version the followed tag
- * points at) with the version the shard's engine serves, read from the
- * node's {@link LanceServedVersions} (the engine publishes its reader
- * manager's counter there, so no searcher is acquired and no reader
- * wrapper is looked past). When they differ,
- * the mapping is derived again from the schema of the version about to be
- * served, with the stored overrides followed across renames and resets,
- * and applied only when it differs from the mapping the index has: the
- * derived mapping is merged into the shard's own {@link MapperService} as
- * a preflight, and a {@code PutMapping} is sent only when the merged
- * mapping is not the current one. Then the shard is refreshed, which is
- * where the engine swaps its reader to the new version, and the snapshots
- * of the version left behind are retired. The planner's table statistics
- * of the version about to be served are collected in the background
- * from the first check and from every move, so the requests this node
- * coordinates find them; a move also asks every data node to collect
- * them, since no other node observes the move. A pinned index
- * ({@code index.plugins.lance.version}) never advances and is not tracked.
+ * points at). When that version is not the one the last check derived
+ * the mapping from, the mapping is derived again from the schema of that
+ * version, with the stored overrides followed across renames and
+ * resets, and applied only when it differs from the mapping the index
+ * has: the derived mapping is merged into the shard's own
+ * {@link MapperService} as a preflight, and a {@code PutMapping} is sent
+ * only when the merged mapping is not the current one. When the version
+ * the shard's engine serves, read from the node's
+ * {@link LanceServedVersions} (the engine publishes its reader manager's
+ * counter there, so no searcher is acquired and no reader wrapper is
+ * looked past), is behind that version, the shard is refreshed, which is
+ * where the engine swaps its reader; the engine also refreshes on its
+ * own before every read, so the reader is usually there already. Either
+ * way the snapshots of the version left behind are retired. The
+ * planner's table statistics of the version about to be served are
+ * collected in the background from the first check and from every
+ * move, so the requests this node coordinates find them; a move also
+ * asks every data node to collect them, since no other node observes
+ * the move. A pinned index ({@code index.plugins.lance.version}) never
+ * advances and is not tracked.
+ *
+ * <p>The search coordinator asks for a check whenever a request it
+ * coordinated read a version of the table the mapping may not have been
+ * derived at ({@link #syncNow(IndexShard, long)}), so the mapping follows the
+ * first request that reads a new version; the scheduled check at the
+ * cadence covers the indexes nobody queries.
  *
  * <p>The first check after a shard starts derives the mapping even when
  * the version did not move: the table may have changed while no node held
@@ -170,13 +179,32 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
     static final class Tracked {
         final TrackedShard shard;
         volatile Scheduler.Cancellable task;
-        /** Whether a check has derived the mapping since the shard started; guarded by the entry's monitor. */
-        boolean derivedOnce;
+        /**
+         * The manifest version the last check derived the mapping from,
+         * {@code -1} before the first check since the shard started;
+         * guarded by the entry's monitor. Kept apart from the version the
+         * shard serves because the engine advances its reader on its own
+         * before every read, so the served version can reach a new
+         * version before any check derived the mapping for it.
+         */
+        long derivedVersion = -1L;
+        /**
+         * The version the service last knew the table (or the followed
+         * tag) at: the version the shard served when tracking started,
+         * then the target of every completed check; guarded by the
+         * entry's monitor. A check whose target differs from it is a
+         * move. The served version cannot be that baseline because the
+         * engine advances its reader before every read, so by the time
+         * a check runs the reader may already serve the version the
+         * table moved to.
+         */
+        long knownVersion;
         /** Whether a check has started the table statistics collection since the shard started; guarded by the entry's monitor. */
         boolean statisticsRequested;
 
         Tracked(TrackedShard shard) {
             this.shard = shard;
+            this.knownVersion = shard.servedVersion();
         }
 
         void cancel() {
@@ -324,6 +352,21 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
      * depend on the applier's timing.
      */
     public Outcome syncNow(IndexShard indexShard) {
+        return syncNow(indexShard, LanceIndexSyncRequest.NO_OBSERVED_VERSION);
+    }
+
+    /**
+     * {@link #syncNow(IndexShard)} for a version a request observed: the
+     * search coordinator read {@code observedVersion} of the table while
+     * fanning a request out and asks for the mapping to be checked at
+     * it. The check is skipped, without opening the table, when the last
+     * check already derived the mapping at that version, or at a later
+     * one for an index that follows the latest version (a tag can move
+     * backwards, so a tag following index is checked whenever the
+     * versions differ). A negative {@code observedVersion} is the manual
+     * trigger and always checks.
+     */
+    public Outcome syncNow(IndexShard indexShard, long observedVersion) {
         String indexName = indexShard.shardId().getIndexName();
         Tracked entry = tracked.get(indexName);
         if (entry == null) {
@@ -336,7 +379,25 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
                 return Outcome.notChecked(indexName, "the index is not Lance backed");
             }
         }
+        if (observedVersion >= 0 && alreadyDerivedAt(entry, observedVersion)) {
+            return Outcome.notChecked(indexName, "the mapping was derived at version " + observedVersion + " already");
+        }
         return check(entry);
+    }
+
+    /**
+     * Whether a check derived the mapping at {@code observedVersion}
+     * already, or at a later version for an index that follows the
+     * latest. Package private for the tests.
+     */
+    boolean alreadyDerivedAt(Tracked entry, long observedVersion) {
+        boolean followsTag = !LanceSettings.TAG_SETTING.get(entry.shard.settings()).isEmpty();
+        synchronized (entry) {
+            if (entry.derivedVersion < 0) {
+                return false;
+            }
+            return followsTag ? entry.derivedVersion == observedVersion : entry.derivedVersion >= observedVersion;
+        }
     }
 
     /**
@@ -369,6 +430,15 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         String tag = tagSetting.isEmpty() ? null : tagSetting;
         long served = shard.servedVersion();
         long target;
+        // Whether the shard's reader is behind the version the index
+        // should serve and needs a refresh. The engine refreshes before
+        // every read of its own, so the reader is usually there already
+        // when the table moved between two checks.
+        boolean readerBehind;
+        // Whether the check found a version it had not seen: the reader
+        // is behind, or the table (or tag) is at another version than the
+        // one the last check left it at. The first check after the shard
+        // started compares with the version the shard opened at.
         boolean moved;
         // The table URI as Lance spells it, the key the statistics cache
         // and the coordinator's lookup share.
@@ -383,14 +453,15 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
             tableKey = latest.uri();
             if (tag == null) {
                 target = latestVersion;
-                moved = target > served;
+                readerBehind = target > served;
             } else {
                 target = latest.tags().getVersion(tag);
                 // A tag moves backwards as well as forwards, so any
                 // difference from the served version is a move.
-                moved = target != served;
+                readerBehind = target != served;
             }
-            boolean derive = moved || !entry.derivedOnce;
+            boolean derive = target != entry.derivedVersion;
+            moved = readerBehind || target != entry.knownVersion;
             if (derive) {
                 // Re-apply the overrides captured at attach or register
                 // so the re-derived mapping keeps the operator's type and
@@ -419,9 +490,9 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         if (moved) {
             moves.increment();
             if (tag == null) {
-                LOG.info("table {} moved to version {} (serving {}), refreshing {}", table, target, served, indexName);
+                LOG.info("table {} moved to version {} (serving {}), checking {}", table, target, served, indexName);
             } else {
-                LOG.info("tag {} on table {} now points at version {} (serving {}), refreshing {}", tag, table, target, served, indexName);
+                LOG.info("tag {} on table {} now points at version {} (serving {}), checking {}", tag, table, target, served, indexName);
             }
         }
         // The planner's statistics of the version the shard is about to
@@ -454,7 +525,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
                 // left to the table's writer.
                 warnWaitPolicyOnce(indexName);
             }
-            entry.derivedOnce = true;
+            entry.derivedVersion = target;
             MappingComparison comparison = shard.compareMapping(derivation.mappingJson());
             switch (comparison) {
                 case UNCHANGED -> {
@@ -510,12 +581,15 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
                 }
             }
         }
-        if (moved) {
+        if (readerBehind) {
             // The mapping is in place before the reader advances, so a
             // request that arrives between the two sees no column the
             // mapping does not know. Refreshing is where the engine
-            // opens the new version and swaps its reader.
+            // opens the new version and swaps its reader; a reader that
+            // advanced on its own before a read is there already.
             shard.refresh(REFRESH_SOURCE);
+        }
+        if (moved) {
             // Requests key on the new version from now on; let the
             // snapshots of the version left behind close as soon as no
             // request holds them instead of waiting for the size bound.
@@ -528,6 +602,9 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
             // rather than on their first request of it.
             broadcastStatisticsPrefetch(indexName, tableKey, target);
         }
+        // Recorded last, so a check that failed above sees the same move
+        // again and retries what it did not get to.
+        entry.knownVersion = target;
         return new Outcome(indexName, true, null, moved, served, target, mappingChanged, false, mappingError);
     }
 

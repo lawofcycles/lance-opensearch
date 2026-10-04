@@ -27,6 +27,7 @@ import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.search.ReferenceManager;
+import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.Bits;
@@ -75,13 +76,13 @@ import org.opensearch.lance.plan.explain.ReaderWrapperProbe;
  *       count, deletion count, and manifest-recorded data file total;
  *       {@link Engine#segmentsStats(boolean, boolean)} stays empty because
  *       there are no Lucene segments to describe.</li>
- *   <li>Refresh lifecycle: {@link Engine#refresh(String)} advances the
- *       shared reader when the Lance manifest version advances, so the
- *       fragment executors that open per-fragment leaves see the latest
- *       version. The reader also serves {@code GET /_doc/{id}},
+ *   <li>Refresh lifecycle: every searcher acquisition and
+ *       {@link Engine#refresh(String)} advance the shared reader when
+ *       the Lance manifest version advances, so {@code GET /_doc/{id}},
  *       {@code _stats}, and a {@code _search} whose target mixes a
- *       Lance backed index with an ordinary one, which the dispatch
- *       filter leaves to the stock search action.</li>
+ *       Lance backed index with an ordinary one (which the dispatch
+ *       filter leaves to the stock search action) read the table's
+ *       current version, as the fragment path does per request.</li>
  * </ul>
  *
  * <p>Under the hood, the empty Lucene commit created at shard bootstrap
@@ -688,6 +689,59 @@ public final class LanceEngineFactory implements EngineFactory {
         @Override
         protected ReferenceManager<OpenSearchDirectoryReader> getReferenceManager(SearcherScope scope) {
             return lanceReaderManager;
+        }
+
+        /**
+         * Every searcher of this engine reads the table's current
+         * version. This is the one method every acquisition funnels
+         * through ({@code Engine.acquireSearcher} and
+         * {@code IndexShard.acquireSearcherSupplier} both call it), so
+         * {@code GET /_doc/{id}}, {@code _mget}, {@code _stats} and a
+         * {@code _search} over a target that mixes this index with one
+         * that is not Lance backed all see the version the fragment path
+         * reads for its own request. {@code refreshToCurrentVersion()}
+         * calls {@code maybeRefreshBlocking()} on the reader manager,
+         * which costs one manifest read, the same the fragment path pays
+         * per request; when the version did not move, the
+         * {@link LanceReaderManager#refreshIfNeeded} it runs returns null
+         * and the reader stays. Both scopes refresh because the engine
+         * has one reader manager and the only internal scope caller is
+         * {@link #docStats()}.
+         */
+        @Override
+        public SearcherSupplier acquireSearcherSupplier(Function<Searcher, Searcher> wrapper, SearcherScope scope) throws EngineException {
+            refreshToCurrentVersion();
+            return super.acquireSearcherSupplier(wrapper, scope);
+        }
+
+        /**
+         * Bring the reader to the version the table is at now, waiting
+         * for a refresh another thread has under way rather than reading
+         * through the reader it is about to replace
+         * ({@link ReferenceManager#maybeRefreshBlocking}; the non blocking
+         * {@code maybeRefresh} returns at once in that case and the
+         * caller would read the previous version). A pinned index never
+         * moves, so it does not take the refresh lock. A manifest that
+         * cannot be read at this moment is logged and the read goes on
+         * with the reader the engine has, as {@link #refresh(String)}
+         * does, instead of failing the read.
+         */
+        private void refreshToCurrentVersion() {
+            if (pinnedVersion.isPresent()) {
+                return;
+            }
+            try {
+                lanceReaderManager.maybeRefreshBlocking();
+            } catch (AlreadyClosedException e) {
+                throw e;
+            } catch (IOException | RuntimeException e) {
+                LOG.warn(
+                    "Lance refresh before a read failed for shard {}, reading version {}",
+                    config().getShardId(),
+                    lanceReaderManager.servedVersion(),
+                    StorageOptions.redactCredentials(e)
+                );
+            }
         }
 
         @Override
