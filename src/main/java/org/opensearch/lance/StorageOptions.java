@@ -166,7 +166,7 @@ public final class StorageOptions {
      * so the match runs in DOTALL mode and stops at the element's own
      * closing tag.
      */
-    private static final Pattern XML_SIGNATURE_ELEMENTS = Pattern.compile(
+    private static final Pattern XML_SIGNING_ELEMENTS = Pattern.compile(
         "(<(StringToSign|SignatureProvided|CanonicalRequest)>).*?(</\\2>)",
         Pattern.DOTALL
     );
@@ -219,7 +219,7 @@ public final class StorageOptions {
             return message;
         }
         String out = message;
-        out = XML_SIGNATURE_ELEMENTS.matcher(out).replaceAll("$1" + REDACTED + "$3");
+        out = XML_SIGNING_ELEMENTS.matcher(out).replaceAll("$1" + REDACTED + "$3");
         out = XML_ACCESS_KEY_ID.matcher(out).replaceAll("$1" + REDACTED + "$2");
         out = ACCESS_KEY_ID.matcher(out).replaceAll(REDACTED);
         out = AUTHORIZATION_VALUE.matcher(out).replaceAll("$1" + REDACTED);
