@@ -681,6 +681,23 @@ public class LanceAttachIT extends LanceRestTestCase {
         assertTrue("expected message about must be a string: " + body, body.contains("must be a string"));
     }
 
+    public void testAttachRejectsStorageOptionsAboveTheEntryBound() throws IOException {
+        StringBuilder options = new StringBuilder();
+        for (int i = 0; i <= StorageOptions.MAX_ENTRIES; i++) {
+            if (i > 0) {
+                options.append(',');
+            }
+            options.append("\"key_").append(i).append("\":\"value\"");
+        }
+        String payload = "{\"table\":\"/tmp/does-not-matter.lance\",\"storage_options\":{" + options + "}}";
+        ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_plugins/_lance/attach", payload));
+        int status = failure.getResponse().getStatusLine().getStatusCode();
+        assertEquals("expected 400 for oversize storage_options, saw " + status, 400, status);
+        String body = readAll(failure.getResponse());
+        assertTrue("expected message about entries: " + body, body.contains("entries"));
+        assertTrue("expected message naming the limit: " + body, body.contains(String.valueOf(StorageOptions.MAX_ENTRIES)));
+    }
+
     public void testAttachRecreateAtSamePathServesNewContent() throws Exception {
         // Attach, delete the index, recreate the Lance table at the same
         // path with different rows, re-attach. GET must see the recreated

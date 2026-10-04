@@ -6,6 +6,7 @@
 package org.opensearch.lance;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -51,6 +52,30 @@ public final class StorageOptions {
      * its options; never written.
      */
     public static final String DEPRECATED_INDEX_SETTING_PREFIX = "index.lance.storage_options.";
+
+    /**
+     * The most entries a {@code storage_options} map or a namespace
+     * {@code config} map accepts. Both maps are persisted in the cluster
+     * state (index settings for an attach, the {@code lance.namespaces}
+     * custom for a namespace) and travel to every node with every state
+     * update, so a request cannot be allowed to make them arbitrarily
+     * large; the bound is a guard against a pasted file or a secret
+     * manager answering a blob, not a privilege boundary. 64 is well
+     * above the dozen or so keys the object stores and catalog clients
+     * read.
+     */
+    public static final int MAX_ENTRIES = 64;
+
+    /** The longest key, in UTF 8 bytes, a {@code storage_options} or namespace {@code config} map accepts. */
+    public static final int MAX_KEY_BYTES = 256;
+
+    /**
+     * The longest value, in UTF 8 bytes, a {@code storage_options} or
+     * namespace {@code config} map accepts. 4 KiB holds every documented
+     * AWS session token, GCS service account entry, Azure SAS token and
+     * REST catalog header.
+     */
+    public static final int MAX_VALUE_BYTES = 4096;
 
     /**
      * The words that mark a storage option or namespace config key as a
@@ -366,7 +391,9 @@ public final class StorageOptions {
     /**
      * Parse the {@code storage_options} field from a request body map.
      * Accepts a JSON object whose values are strings; rejects anything
-     * else. Returns {@link #empty()} when the caller omits the field.
+     * else, and a map outside the bounds of {@link #MAX_ENTRIES},
+     * {@link #MAX_KEY_BYTES} and {@link #MAX_VALUE_BYTES}. Returns
+     * {@link #empty()} when the caller omits the field.
      */
     public static StorageOptions parseFromRequestField(Object rawValue, String errorPrefix) {
         if (rawValue == null) {
@@ -375,6 +402,7 @@ public final class StorageOptions {
         if (!(rawValue instanceof Map<?, ?> rawMap)) {
             throw new IllegalArgumentException(errorPrefix + " [storage_options] must be a JSON object");
         }
+        checkEntryCount(rawMap.size(), errorPrefix, "storage_options");
         Map<String, String> parsed = new LinkedHashMap<>(rawMap.size());
         for (Map.Entry<?, ?> entry : rawMap.entrySet()) {
             Object key = entry.getKey();
@@ -390,9 +418,46 @@ public final class StorageOptions {
                         + "] must be a string (nested objects / arrays / numbers / booleans are not accepted)"
                 );
             }
+            checkEntryBytes(stringKey, stringValue, errorPrefix, "storage_options");
             parsed.put(stringKey, stringValue);
         }
         return of(parsed);
+    }
+
+    /**
+     * Refuse a {@code storage_options} or namespace {@code config} map of
+     * more than {@link #MAX_ENTRIES} entries with an
+     * {@link IllegalArgumentException} the REST layer answers with 400.
+     * {@code errorPrefix} is the handler's tag ({@code [lance_attach]}),
+     * {@code field} the name of the map in the request body.
+     */
+    public static void checkEntryCount(int count, String errorPrefix, String field) {
+        if (count > MAX_ENTRIES) {
+            throw new IllegalArgumentException(errorPrefix + " " + field + " has [" + count + "] entries, the limit is " + MAX_ENTRIES);
+        }
+    }
+
+    /**
+     * Refuse one entry of a {@code storage_options} or namespace
+     * {@code config} map whose key is longer than {@link #MAX_KEY_BYTES}
+     * or whose value is longer than {@link #MAX_VALUE_BYTES}, both in
+     * UTF 8 bytes, with an {@link IllegalArgumentException} the REST
+     * layer answers with 400. The message names the key and the length;
+     * it never quotes the value, which may be a credential.
+     */
+    public static void checkEntryBytes(String key, String value, String errorPrefix, String field) {
+        int keyBytes = key.getBytes(StandardCharsets.UTF_8).length;
+        if (keyBytes > MAX_KEY_BYTES) {
+            throw new IllegalArgumentException(
+                errorPrefix + " " + field + " key [" + key + "] is [" + keyBytes + "] bytes, the limit is " + MAX_KEY_BYTES
+            );
+        }
+        int valueBytes = value.getBytes(StandardCharsets.UTF_8).length;
+        if (valueBytes > MAX_VALUE_BYTES) {
+            throw new IllegalArgumentException(
+                errorPrefix + " " + field + " value for [" + key + "] is [" + valueBytes + "] bytes, the limit is " + MAX_VALUE_BYTES
+            );
+        }
     }
 
     /**

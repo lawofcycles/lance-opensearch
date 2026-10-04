@@ -289,15 +289,18 @@ public class RestNamespaceAction extends BaseRestHandler {
     /**
      * Parse the {@code config} object into a string-to-string map.
      * Keys the plugin does not know pass through to the catalog
-     * implementation untouched; only the shape is validated here.
+     * implementation untouched; only the shape and the bounds of
+     * {@link StorageOptions#MAX_ENTRIES}, {@link StorageOptions#MAX_KEY_BYTES}
+     * and {@link StorageOptions#MAX_VALUE_BYTES} are validated here.
      */
-    private static Map<String, String> parseConfig(Object raw) {
+    static Map<String, String> parseConfig(Object raw) {
         if (raw == null) {
             return Map.of();
         }
         if (!(raw instanceof Map<?, ?> rawMap)) {
             throw new IllegalArgumentException("[config] must be a JSON object of string values");
         }
+        StorageOptions.checkEntryCount(rawMap.size(), "[lance_namespace]", "config");
         Map<String, String> parsed = new LinkedHashMap<>(rawMap.size());
         for (Map.Entry<?, ?> entry : rawMap.entrySet()) {
             if (!(entry.getKey() instanceof String key) || key.isEmpty()) {
@@ -308,6 +311,7 @@ public class RestNamespaceAction extends BaseRestHandler {
                     "[config." + key + "] must be a string (nested objects / arrays / numbers / booleans are not accepted)"
                 );
             }
+            StorageOptions.checkEntryBytes(key, value, "[lance_namespace]", "config");
             parsed.put(key, value);
         }
         return parsed;
