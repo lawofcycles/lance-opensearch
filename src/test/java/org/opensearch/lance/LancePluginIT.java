@@ -48,8 +48,11 @@ public class LancePluginIT extends LanceRestTestCase {
 
     public void testOldPathsAreGone() throws IOException {
         // The paths from before the move under /_plugins/_lance/ are not
-        // registered, so the REST controller answers 400 (no handler) or
-        // 405 (the path exists for another method).
+        // registered. RestController.handleBadRequest answers such a call
+        // with 400 and a body whose "error" is the plain string below; a
+        // handler that is registered on the path would answer with an
+        // "error" object (type, reason) instead, even on a 400 for a
+        // missing "table", so the body is asserted and not only the status.
         for (String[] call : new String[][] {
             { "GET", "/_lance/stats" },
             { "GET", "/_lance/namespace" },
@@ -59,9 +62,12 @@ public class LancePluginIT extends LanceRestTestCase {
             { "GET", "/demo/_lance/explain" } }) {
             ResponseException refused = expectThrows(ResponseException.class, () -> client().performRequest(new Request(call[0], call[1])));
             int status = refused.getResponse().getStatusLine().getStatusCode();
-            assertTrue(
-                call[0] + " " + call[1] + " answered " + status,
-                status == RestStatus.BAD_REQUEST.getStatus() || status == RestStatus.METHOD_NOT_ALLOWED.getStatus()
+            String body = readAll(refused.getResponse());
+            assertEquals(call[0] + " " + call[1] + " answered " + status + " " + body, RestStatus.BAD_REQUEST.getStatus(), status);
+            assertEquals(
+                call[0] + " " + call[1] + " was answered by a handler: " + body,
+                "no handler found for uri [" + call[1] + "] and method [" + call[0] + "]",
+                stringPath(body, "error")
             );
         }
     }

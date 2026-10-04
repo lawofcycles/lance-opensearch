@@ -46,6 +46,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 /**
  * The plugin's registrations (queries, actions, mapper, settings) and its
@@ -71,9 +72,7 @@ public class LancePluginTests extends OpenSearchTestCase {
     public void testRegistersLanceKnnQuery() {
         List<QuerySpec<?>> queries = plugin.getQueries();
         assertEquals(6, queries.size());
-        java.util.Set<String> names = queries.stream()
-            .map(q -> q.getName().getPreferredName())
-            .collect(java.util.stream.Collectors.toSet());
+        Set<String> names = queries.stream().map(q -> q.getName().getPreferredName()).collect(Collectors.toSet());
         assertTrue("expected lance_knn in registered queries: " + names, names.contains(LanceKnnQueryBuilder.NAME));
         assertTrue("expected lance_match in registered queries: " + names, names.contains(LanceMatchQueryBuilder.NAME));
         assertTrue("expected lance_match_phrase in registered queries: " + names, names.contains(LanceMatchPhraseQueryBuilder.NAME));
@@ -85,7 +84,7 @@ public class LancePluginTests extends OpenSearchTestCase {
     public void testExposesLanceActionNames() {
         // The action names are the privileges operators grant to roles, so
         // a rename is a breaking change and has to show up in review.
-        Set<String> names = plugin.getActions().stream().map(h -> h.getAction().name()).collect(java.util.stream.Collectors.toSet());
+        Set<String> names = plugin.getActions().stream().map(h -> h.getAction().name()).collect(Collectors.toSet());
         assertTrue(names.toString(), names.contains("cluster:admin/lance/attach"));
         assertTrue(names.toString(), names.contains("indices:monitor/lance/refs"));
         assertTrue(names.toString(), names.contains("cluster:monitor/lance/namespace"));
@@ -100,7 +99,7 @@ public class LancePluginTests extends OpenSearchTestCase {
     }
 
     public void testExposesExpectedSettings() {
-        Set<String> settingKeys = plugin.getSettings().stream().map(Setting::getKey).collect(java.util.stream.Collectors.toSet());
+        Set<String> settingKeys = plugin.getSettings().stream().map(Setting::getKey).collect(Collectors.toSet());
         // The exact settings the RFC and the README expect users to see.
         assertTrue(settingKeys.contains(LanceEngineFactory.TABLE_SETTING));
         assertTrue(settingKeys.contains(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING));
@@ -119,7 +118,7 @@ public class LancePluginTests extends OpenSearchTestCase {
         List<Setting<?>> settings = plugin.getSettings();
         // 39 node settings and 9 index settings.
         assertEquals(48, settings.size());
-        assertEquals(settings.size(), settings.stream().map(Setting::getKey).collect(java.util.stream.Collectors.toSet()).size());
+        assertEquals(settings.size(), settings.stream().map(Setting::getKey).collect(Collectors.toSet()).size());
         int nodeScoped = 0;
         int indexScoped = 0;
         for (Setting<?> setting : settings) {
