@@ -103,6 +103,8 @@ OpenSearch's stock `match`, `match_phrase` and `multi_match` (type `best_fields`
 - Inside a compound the rewrite does not descend into (`function_score`, `nested`, `constant_score`, `boosting`; it descends into `bool` and `dis_max`) the field type answers the stock clause itself: `match` runs the whole text as one Lance match and its `operator` is not applied, `match_phrase` of two or more words runs as a Lance phrase with its `slop`, a one word `match_phrase` runs as a Lance match.
 - `match_phrase_prefix`, `query_string`, `simple_query_string`, `intervals` and the `span_*` queries are not rewritten.
 
+A `match` on a column declared `lance_text` without an inverted index ([mapping-overrides.md](mapping-overrides.md#type-lance_text)) makes Lance read and tokenise every row of the scanned fragments on each request, so its time grows with the row count where an indexed column's does not. The admission gate bounds the memory of that scan ([admission.md](admission.md#fts_flat)) and not its time. Set `search.default_search_timeout` on a cluster that serves Lance tables, or a `timeout` on the request: the plugin honours both, and a cancelled executor stops at the next Lance batch boundary ([Shard model and concurrency](#shard-model-and-concurrency)). The plugin adds no timeout setting of its own.
+
 ## regexp on `lance_text`
 
 `regexp` on a `lance_text` (or `keyword`) column is served with Rust regex syntax and semantics, not Lucene's `RegExp` grammar: DataFusion's `regexp_like`, that is the Rust `regex` crate, evaluates the pattern over the stored string. The plugin anchors the pattern (`^(?:...)$`) so it matches the whole value as in Lucene, and turns `case_insensitive: true` into a leading `(?i)`.

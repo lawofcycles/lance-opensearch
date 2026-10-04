@@ -104,7 +104,38 @@ public class LanceOverridesTests extends OpenSearchTestCase {
             () -> LanceOverrides.parseAttachClauses(Map.of("col", Map.of("type", "text")), null)
         );
         assertTrue(e.getMessage(), e.getMessage().contains("type=text"));
-        assertTrue(e.getMessage(), e.getMessage().contains("[date], [keyword], [ip], [wildcard], [geo_point]"));
+        assertTrue(e.getMessage(), e.getMessage().contains("[date], [keyword], [ip], [wildcard], [geo_point], [lance_text]"));
+    }
+
+    public void testLanceTextTypeParsesAndReportsThroughLanceTextColumns() {
+        LanceOverrides overrides = LanceOverrides.parseAttachClauses(
+            Map.of("body", Map.of("type", "lance_text", "fields", Map.of("raw", Map.of("type", "keyword")))),
+            null
+        );
+        assertEquals(Set.of("body"), overrides.lanceTextColumns());
+        // One `type` per column: a lance_text column is in none of the
+        // other type sets, which is what keeps it off the keyword,
+        // wildcard and ip paths.
+        assertTrue(overrides.keywordColumns().isEmpty());
+        assertTrue(overrides.wildcardColumns().isEmpty());
+        assertTrue(overrides.ipColumns().isEmpty());
+        assertEquals("keyword", overrides.subFields().get("body").get("raw"));
+        LanceOverrides restored = LanceOverrides.parse(overrides.toJson());
+        assertEquals(overrides, restored);
+        assertEquals(Set.of("body"), restored.lanceTextColumns());
+    }
+
+    public void testLanceTextTypeTakesNoFormatOrOrder() {
+        IllegalArgumentException format = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseAttachClauses(Map.of("body", Map.of("type", "lance_text", "format", "epoch_millis")), null)
+        );
+        assertTrue(format.getMessage(), format.getMessage().contains("only accepted together with [type: date]"));
+        IllegalArgumentException order = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseAttachClauses(Map.of("body", Map.of("type", "lance_text", "order", "lat_lon")), null)
+        );
+        assertTrue(order.getMessage(), order.getMessage().contains("only accepted together with [type: geo_point]"));
     }
 
     public void testIpTypeParsesAndReportsThroughIpColumns() {

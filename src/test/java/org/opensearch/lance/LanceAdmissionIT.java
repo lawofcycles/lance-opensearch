@@ -336,7 +336,7 @@ public class LanceAdmissionIT extends LanceRestTestCase {
         Map<String, Object> rejections = (Map<String, Object>) admission.get("rejections");
         assertEquals(
             admission.toString(),
-            Set.of("fts", "scalar_index", "vector_index", "filter_scan", "aggregate_scan", "column_load", "fetch_take"),
+            Set.of("fts", "fts_flat", "scalar_index", "vector_index", "filter_scan", "aggregate_scan", "column_load", "fetch_take"),
             rejections.keySet()
         );
         return ((Number) rejections.get(kind)).longValue();

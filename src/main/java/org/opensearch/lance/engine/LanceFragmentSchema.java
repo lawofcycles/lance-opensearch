@@ -199,9 +199,11 @@ public final class LanceFragmentSchema {
      *                    {@code intField} is empty
      * @param overrides   per-column mapping overrides from the index
      *                    settings, nullable; carries the keyword
-     *                    sub-fields and the {@code type: keyword}
+     *                    sub-fields, the {@code type: keyword}
      *                    overrides that force a Utf8 column with an FTS
-     *                    index onto the doc-values path
+     *                    index onto the doc-values path and the
+     *                    {@code type: lance_text} overrides that keep a
+     *                    Utf8 column without one on the full text path
      * @param ftsColumns  Utf8 columns with an FTS index, from
      *                    {@link #resolveFtsColumns}
      */
@@ -233,6 +235,15 @@ public final class LanceFragmentSchema {
             keywordOverridden.addAll(overrides.wildcardColumns());
         }
         Set<String> ipOverridden = overrides == null ? Set.of() : overrides.ipColumns();
+        // A `type: lance_text` override classifies its Utf8 column as
+        // TEXT_FTS whether or not the table carries an inverted index
+        // on it: the mapping is lance_text by declaration, and Lance
+        // answers the full text scan from the index where one covers
+        // the rows and from its flat BM25 path where none does.
+        // `ftsColumns` keeps its meaning of "columns with an index"
+        // (the admission gate tells the two paths apart by it), so the
+        // override joins the classification here rather than that set.
+        Set<String> lanceTextOverridden = overrides == null ? Set.of() : overrides.lanceTextColumns();
         // A `type: geo_point` override classifies its Struct or
         // FixedSizeList column as GEO_POINT: one field, encoded lat|lon
         // longs served through SortedNumericDocValues. The map value is
@@ -325,9 +336,10 @@ public final class LanceFragmentSchema {
                     continue;
                 }
                 if (kind == ColumnKind.TEXT_FTS) {
-                    kind = ftsColumns.contains(field.getName())
-                        && !keywordOverridden.contains(field.getName())
-                        && !ipOverridden.contains(field.getName()) ? ColumnKind.TEXT_FTS : ColumnKind.TEXT_KEYWORD;
+                    boolean fullText = ftsColumns.contains(field.getName()) || lanceTextOverridden.contains(field.getName());
+                    kind = fullText && !keywordOverridden.contains(field.getName()) && !ipOverridden.contains(field.getName())
+                        ? ColumnKind.TEXT_FTS
+                        : ColumnKind.TEXT_KEYWORD;
                 }
                 columnKind.put(field.getName(), kind);
                 topLevelOrder.add(field.getName());
