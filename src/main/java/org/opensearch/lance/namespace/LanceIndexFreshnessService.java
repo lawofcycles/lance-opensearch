@@ -85,7 +85,10 @@ import org.opensearch.transport.client.Client;
  * an inverted index on a Utf8 column) cannot be applied by
  * {@code PutMapping}. The index is rebuilt: deleted, then created again
  * with the same table, storage options, overrides and tag and the new
- * mapping. The service outlives its own index's deletion; the closing
+ * mapping. A column whose stored override declares {@code type: keyword}
+ * or {@code type: lance_text} never flips: the re-derivation maps it by
+ * the declaration, not by the index, so its mapping is the same at every
+ * version and such a check ends as unchanged. The service outlives its own index's deletion; the closing
  * shard unregisters itself and the new shard registers when it starts.
  * Any other refusal of the {@code PutMapping} leaves the index on the
  * mapping it has; the message is kept per index and reported by
