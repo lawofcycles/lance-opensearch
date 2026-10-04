@@ -372,6 +372,83 @@ public class LanceTextOverrideIT extends LanceRestTestCase {
         }
     }
 
+    public void testExplainAndProfileNameTheFlatScanAndThenTheIndex() throws Exception {
+        String suffix = "lancetextexp-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        String tableUri = LanceTableFactory.writeEnglishTextTable(scratchDir, tableName);
+        String declared = tableName;
+        String profiled = "{\"size\":10,\"profile\":true,\"query\":{\"match\":{\"body\":\"the\"}}}";
+        try {
+            attach(tableUri, declared, "{\"body\":{\"type\":\"lance_text\"}}");
+
+            // Without an index the pushed match says so in the plan text
+            // and in the fragment plan, and the executor reports the
+            // flat kind the gate judged the request under.
+            String flat = explain(declared, MATCH_THE);
+            String flatPhysical = stringPath(flat, "physical");
+            assertTrue("the pushed match names the missing index: " + flatPhysical, flatPhysical.contains("columns=[body], index=none,"));
+            assertEquals("lance_match", stringPath(flat, "fragment_plan", "lance_clause"));
+            assertEquals("none", stringPath(flat, "fragment_plan", "fts_index"));
+            String flatSearch = readAll(postJson("/" + declared + "/_search?request_cache=false", profiled));
+            assertEquals(5, extractIntPath(flatSearch, "hits", "total", "value"));
+            assertEquals(List.of("fts_flat"), admissionKinds(flatSearch));
+
+            // The writer builds the index; the declared index follows the
+            // table's new version on sync and the same body now reports
+            // the inverted index on both endpoints.
+            LanceTableFactory.createFtsIndex(tableUri, "body", "simple", true);
+            Map<String, Object> outcome = sync(declared);
+            assertEquals(outcome.toString(), true, outcome.get("checked"));
+            String indexed = explain(declared, MATCH_THE);
+            String indexedPhysical = stringPath(indexed, "physical");
+            assertTrue("the pushed match names the index: " + indexedPhysical, indexedPhysical.contains("columns=[body], index=inverted,"));
+            assertEquals("inverted", stringPath(indexed, "fragment_plan", "fts_index"));
+            String indexedSearch = readAll(postJson("/" + declared + "/_search?request_cache=false", profiled));
+            assertEquals(List.of("fts"), admissionKinds(indexedSearch));
+
+            // A body without a full text clause is gated by nothing and
+            // reports no kind.
+            String ungated = readAll(
+                postJson("/" + declared + "/_search?request_cache=false", "{\"size\":1,\"profile\":true,\"query\":{\"term\":{\"id\":1}}}")
+            );
+            assertEquals(List.of(), admissionKinds(ungated));
+            String noFts = explain(declared, "{\"size\":1,\"query\":{\"term\":{\"id\":1}}}");
+            assertFalse("no full text clause, no fts_index: " + noFts, noFts.contains("fts_index"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + declared));
+            } catch (Exception ignored) {
+                // best-effort cleanup; the base class wipes indices too
+            }
+            deleteRecursively(scratchDir);
+        }
+    }
+
+    private static String explain(String indexName, String body) throws IOException {
+        Request request = new Request("GET", "/_plugins/_lance/explain/" + indexName);
+        request.setJsonEntity(body);
+        return readAll(client().performRequest(request));
+    }
+
+    /** The {@code admission_kind} every node's {@code query} block of {@code profile.lance} reports, in node id order; a node without one adds nothing. */
+    @SuppressWarnings("unchecked")
+    private static List<String> admissionKinds(String searchBody) {
+        Map<String, Object> profile = (Map<String, Object>) parseJson(searchBody).get("profile");
+        assertNotNull("the response carries a profile: " + searchBody, profile);
+        Map<String, Object> lance = (Map<String, Object>) profile.get("lance");
+        Map<String, Object> nodes = (Map<String, Object>) lance.get("nodes");
+        assertNotNull("the profile carries the nodes: " + searchBody, nodes);
+        List<String> kinds = new ArrayList<>();
+        for (Object node : nodes.values()) {
+            Map<String, Object> query = (Map<String, Object>) ((Map<String, Object>) node).get("query");
+            if (query.containsKey("admission_kind")) {
+                kinds.add((String) query.get("admission_kind"));
+            }
+        }
+        return kinds;
+    }
+
     private static void attach(String tableUri, String indexName, String overridesJson) throws IOException {
         String body = "{\"table\":\""
             + tableUri

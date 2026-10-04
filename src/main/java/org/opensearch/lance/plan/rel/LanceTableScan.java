@@ -19,6 +19,7 @@ import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
 import org.opensearch.lance.plan.calcite.LanceConvention;
 import org.opensearch.lance.plan.calcite.LanceRel;
+import org.opensearch.lance.plan.calcite.LanceTable;
 import org.opensearch.lance.plan.cost.AggregateProfile;
 import org.opensearch.lance.plan.cost.CostInputs;
 import org.opensearch.lance.plan.cost.CostInputsHolder;
@@ -36,6 +37,7 @@ import org.lance.ipc.ColumnOrdering;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Scan of a Lance backed index, the leaf every plan over a Lance table
@@ -258,13 +260,17 @@ public class LanceTableScan extends TableScan implements LanceRel {
      * scan runs the inverted-index lookup with {@code filterSql} as a
      * prefilter (none when null), the scan's row type becomes the FTS
      * node's, and the plan above no longer contains the node. Only one
-     * operation may be pushed: the fuse rule matches bare scans.
+     * operation may be pushed: the fuse rule matches bare scans. The
+     * pushed match learns from the {@link LanceTable} which searched
+     * columns carry an inverted index, when the table knows.
      */
     public LanceTableScan withPushedFts(LanceFtsMatch fts, String filterSql) {
         if (!pushedOperations.isEmpty()) {
             throw new IllegalStateException("the scan already carries a pushed operation: " + pushedOperations);
         }
-        return new LanceTableScan(getCluster(), getTraitSet(), table, ImmutableList.of(new PushedFts(fts, filterSql)));
+        LanceTable lanceTable = table.unwrap(LanceTable.class);
+        Set<String> indexedColumns = lanceTable == null ? null : lanceTable.ftsIndexedColumns();
+        return new LanceTableScan(getCluster(), getTraitSet(), table, ImmutableList.of(new PushedFts(fts, filterSql, indexedColumns)));
     }
 
     /**

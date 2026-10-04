@@ -101,6 +101,18 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
      */
     public static final int WIRE_VERSION = 3;
 
+    /**
+     * The {@code Params} key under which the explain endpoint
+     * hands {@link #toXContent} the word it renders as {@code fts_index}
+     * next to {@code lance_clause}: whether the full text clause's
+     * columns carry an inverted index ({@code inverted}, {@code none} or
+     * {@code mixed}). The plan itself does not carry the word, because
+     * the executor reads the index from its own snapshot and the wire
+     * format stays as it is; a caller that sets no such param renders
+     * no {@code fts_index}.
+     */
+    public static final String FTS_INDEX_PARAM = "lance.fts_index";
+
     private static final int[] NO_EXCLUDED_FRAGMENTS = new int[0];
 
     /** Which physical root the plan came from, and so how the envelope executes. */
@@ -970,7 +982,9 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
      * {@code filter_substrait_bytes} (the length of the Substrait
      * encoding the scans evaluate, present only when the planner chose
      * it), {@code lance_clause}
-     * (the clause's query name), {@code top_k} ({@code orderings} with
+     * (the clause's query name), {@code fts_index} (the word the caller
+     * passed under {@link #FTS_INDEX_PARAM}, next to a clause; absent
+     * without the param), {@code top_k} ({@code orderings} with
      * {@code column} / {@code ascending} / {@code nulls_first},
      * {@code fetch}, {@code cursor_sql}), {@code aggregate}
      * ({@code group_count}, {@code metrics} with {@code name} /
@@ -991,6 +1005,10 @@ public final class FragmentPlan implements Writeable, ToXContentObject {
         }
         if (lanceClause != null) {
             builder.field("lance_clause", lanceClause.getWriteableName());
+            String ftsIndex = params.param(FTS_INDEX_PARAM);
+            if (ftsIndex != null) {
+                builder.field("fts_index", ftsIndex);
+            }
         }
         if (topK != null) {
             builder.startObject("top_k");

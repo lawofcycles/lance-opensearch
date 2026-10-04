@@ -30,7 +30,7 @@ import org.opensearch.transport.TransportResponseHandler;
  *   "lance": {
  *     "nodes": {
  *       "&lt;node id&gt;": {
- *         "query": {"millis": 12, "fts_scans": 1},
+ *         "query": {"millis": 12, "fts_scans": 1, "admission_kind": "fts"},
  *         "fetch": {"millis": 3, "take_count": 4, "take_rows": 47, "take_columns": 8, "take_millis": 9}
  *       }
  *     },
@@ -43,7 +43,11 @@ import org.opensearch.transport.TransportResponseHandler;
  * the count and the aggregations included), {@code query.fts_scans} the
  * Lance full text scans the request ran on that node (the hits scans of
  * its full text Weights and the count-only scans behind
- * {@code hits.total}), {@code fetch.millis} its
+ * {@code hits.total}), {@code query.admission_kind} the kind the node's
+ * full text admission gate judged the request under ({@code fts} when
+ * the searched columns carry an inverted index, {@code fts_flat} when
+ * one does not and Lance scans its rows flat; absent when the gate did
+ * not run, a request without a full text clause), {@code fetch.millis} its
  * fetch phase (the rows behind the hits materialised, on the query
  * round or on the fetch round of a page answered by several executors),
  * and the
@@ -187,6 +191,9 @@ final class LanceSearchProfile {
                     builder.startObject("query");
                     builder.field("millis", figures.queryMillis());
                     builder.field("fts_scans", figures.ftsScans());
+                    if (figures.admissionKind() != null) {
+                        builder.field("admission_kind", figures.admissionKind());
+                    }
                     builder.endObject();
                     builder.startObject("fetch");
                     builder.field("millis", figures.fetchMillis());

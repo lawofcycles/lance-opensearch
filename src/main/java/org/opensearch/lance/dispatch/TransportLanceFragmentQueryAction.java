@@ -751,6 +751,9 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     query,
                     request.trackTotalHitsUpTo() == SearchContext.TRACK_TOTAL_HITS_ACCURATE
                 );
+                // The kind the gate judged the request under, for the
+                // profile; null when the gate did not run.
+                String admissionKind = null;
                 if (ScanAdmission.gates(ftsShape)) {
                     long tableRows = 0L;
                     for (LanceWarmCache.FragmentMeta fragment : snapshot.fragments()) {
@@ -764,6 +767,7 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                         ScanAdmission.statisticsOf(dataset),
                         LanceHitsAccounting.of(searcher)
                     );
+                    admissionKind = FragmentExecutorSupport.ftsAdmissionKind(ftsShape, snapshot.ftsColumns());
                 }
 
                 // A bare Lance clause at the top level (LanceFtsQuery,
@@ -1041,7 +1045,8 @@ public final class TransportLanceFragmentQueryAction extends HandledTransportAct
                     // Every Lance full text scan of the request counted
                     // on the searcher's accounting: the Weights' hits
                     // scans and the count-only scans of computeMatched.
-                    LanceHitsAccounting.of(searcher).ftsScans()
+                    LanceHitsAccounting.of(searcher).ftsScans(),
+                    admissionKind
                 );
                 if (LOGGER.isDebugEnabled()) {
                     LOGGER.debug(

@@ -7,6 +7,7 @@ package org.opensearch.lance.dispatch;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Set;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -28,6 +29,7 @@ import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
 import org.opensearch.lance.engine.LanceFragmentSchema;
 import org.opensearch.lance.engine.LanceWarmCache;
+import org.opensearch.lance.query.ScanAdmission;
 import org.opensearch.search.fetch.subphase.FetchDocValuesContext;
 
 /**
@@ -50,6 +52,28 @@ final class FragmentExecutorSupport {
     private static final int INDEX_SERVICE_RACE_RETRIES = 2;
 
     private FragmentExecutorSupport() {}
+
+    /**
+     * The admission kind the full text gate judged {@code shape} under,
+     * for the request's profile. {@code ScanAdmission.admit} splits the
+     * searched columns by {@code indexedColumns} (the snapshot's columns
+     * with an inverted index), judges the indexed ones as
+     * {@link ScanAdmission.Kind#FTS} and then the rest as
+     * {@link ScanAdmission.Kind#FTS_FLAT}, and a shape that names no
+     * column as {@link ScanAdmission.Kind#FTS}; the gate keeps no per
+     * request record of that (its last kind is node wide), so the
+     * profile derives the kind from the same inputs. A request judged
+     * under both kinds reports the flat one, the one judged last and
+     * the one whose cost grows with the table.
+     */
+    static String ftsAdmissionKind(ScanAdmission.Shape shape, Set<String> indexedColumns) {
+        for (String column : shape.columns()) {
+            if (indexedColumns == null || !indexedColumns.contains(column)) {
+                return ScanAdmission.Kind.FTS_FLAT.key();
+            }
+        }
+        return ScanAdmission.Kind.FTS.key();
+    }
 
     /**
      * Run {@code body} against the {@link IndexService} of the index: the

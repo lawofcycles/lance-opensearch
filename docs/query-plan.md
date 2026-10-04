@@ -129,8 +129,15 @@ alone, or inside a `bool` whose `must` and `should` hold full text clauses only,
 `lance_fts_bool` when there are several, with scalar `filter` / `must_not` companions) and a top level
 `lance_knn` (optionally with its inner `filter`)
 plan as their own logical nodes and show on the scan as pushed `fts` / `knn` operations carrying
-every parameter and the filter's SQL. Do not parse the text; its shape will keep changing as the
-planner grows.
+every parameter and the filter's SQL. A pushed `fts` also carries `index=`: `index=inverted` when
+every searched column carries an inverted index the scan answers from, `index=none` when none
+does and Lance tokenises and scores every row of the column instead, and one word per column
+(`index=[body=inverted, title=none]`) when the columns split. A column without an index reaches
+the scan through a `type: lance_text` override ([mapping-overrides.md](mapping-overrides.md)). The flat path's time and memory
+grow with the row count where the indexed path's do not, so the term is what tells an operator
+that an index on the column would change the plan's cost; the set of indexed columns is the one
+the executors' admission gate splits the clause by. Do not parse the text; its shape will keep
+changing as the planner grows.
 
 `fragment_plan` is the `FragmentPlan` the coordinator would ship with every per node request, the
 same object a data node logs under `lance.plan` at debug level. `kind` is `PUSHED_SCAN` when the
@@ -148,7 +155,12 @@ the aggregate pushdown did not fold) chooses its encoding with the same cost com
 pushed forms compete under; a pushed page (`top_k`) and the prefilter of a full text or knn
 clause take SQL only. `lance_clause` is the query name of the full text or knn clause
 the executor builds its Lance query from (`lance_knn`, `lance_match`, ...), absent for a scalar
-shape. `top_k` describes a pushed page (`orderings` with `column`, `ascending`, `nulls_first`;
+shape. `fts_index` sits next to a full text `lance_clause` and says how it runs: `inverted` when
+every searched column carries an inverted index, `none` when none does and the scan is Lance's
+flat BM25 scan over the column, `mixed` when the columns split (the `physical` text then names
+each column's word). It is rendered by the explain endpoint from the snapshot the plan was built
+over and does not travel in the `FragmentPlan`: the executor reads the index from its own
+snapshot. `top_k` describes a pushed page (`orderings` with `column`, `ascending`, `nulls_first`;
 `fetch`; `cursor_sql` for a `search_after` page) and `aggregate` a pushed aggregate
 (`group_count`, `metrics` with the aggregation `name` and metric `kind`, `substrait_bytes`).
 `excluded_fragment_ids` lists, in ascending order, the fragments the coordinator's zone map
@@ -511,7 +523,7 @@ nobody: the data node logs it and executes it. `LanceExplainResponse` travels fr
 planned the explain body to the node that received the REST call when they differ.
 
 Both streams open with an integer `WIRE_VERSION` (`FragmentPlan.WIRE_VERSION` is `3` today,
-`LanceExplainResponse.WIRE_VERSION` is `3`), written first and read first through the
+`LanceExplainResponse.WIRE_VERSION` is `4`), written first and read first through the
 `WireVersion` helper. The marker is followed by the fields the message had at version 1, inline,
 and then by one block per later version: a flag and the fields that version added as a length
 prefixed byte array. A reader of a newer plugin version takes a fallback for every block an older
@@ -560,7 +572,26 @@ because a node that ignored it would scan without the predicate). `LanceExplainR
 the index, the route, the two optional plan texts, the optional fragment plan, the optional
 unplanned message, the predicted refinements and the optional traits object (the requested
 accuracy, whether a tie stability was demanded and which, the declared pair, and the enforcer
-text); on the unsupported route only the index, the route and the message are set. A reader of
+text); on the unsupported route only the index, the route and the message are set. Then come its
+two blocks, both optional: version 3 the cacheability and version 4 the `fts_index` word of the
+pushed full text clause (absent when the plan pushes none). A reader of
 this version still decodes the version 1 explain stream, which carried the retired shard path
 route: such an answer is read as an unsupported one whose message is
 `LanceExplainResponse.SHARD_PATH_RETIRED`.
+
+## Profile
+
+A search body with `"profile": true` renders `profile.lance.nodes.<node id>` with what each
+executor spent on the request ([features.md](features.md#hit-shape)); `query.millis` and
+`query.fts_scans` are the query phase's wall time and the Lance full text scans it ran, the
+`fetch` block the fetch phase and its take scans. `query.admission_kind` is the kind the node's
+admission gate judged the request under before any Lance scan of it was created, the same key
+`admission.rejections` and `admission.last_kind` in `GET /_plugins/_lance/stats` use
+([admission.md](admission.md)): `fts` when the searched columns carry an inverted index,
+`fts_flat` when one of them does not and Lance scans its rows flat. A request without a full text
+clause is gated by nothing on this path and carries no `admission_kind`. Where explain predicts
+the path from the snapshot the plan was built over, the profile reports the path the executor
+took, so a `fts_flat` next to a `took` that grows with the table is the figure to compare with
+the same body after the writer has built the index. The kind travels in the fragment response's
+version 6 block (`LanceFragmentQueryResponse.WIRE_VERSION`); an executor of an older plugin
+version reports none.
