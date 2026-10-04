@@ -273,6 +273,21 @@ Values must be strings. The plugin does not enumerate a fixed allowlist; whateve
 
 Options are persisted as `index.plugins.lance.storage_options.<key>` on the created index, so a single node can address two buckets with different credentials at the same time. The credential keys (any name containing `secret`, `password`, `token`, `key`, `authorization` or `credential`) are withheld from `GET /<index>/_settings`, `GET /<index>` and the cluster state API; region, endpoint and `allow_http` stay visible. A snapshot of the index still carries every option, credentials included ([limitations.md](limitations.md#storage-and-credentials)).
 
+The credentials handed to the plugin need read access only, because the plugin never writes to the table or the catalog. On S3 that is `s3:GetObject` and `s3:ListBucket` on the table's bucket; on GCS `storage.objects.get` and `storage.objects.list`; on Azure the Storage Blob Data Reader role; for a Glue namespace `glue:GetTable` and `glue:GetDatabase`. The write actions a Lance writer needs (`s3:PutObject`, `s3:DeleteObject`, `glue:UpdateTable`, `glue:CreateTable`, `glue:DeleteTable`) belong to the writer's credentials and can be left out of the plugin's policy. An S3 policy that covers one bucket:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["s3:GetObject", "s3:ListBucket"],
+    "Resource": ["arn:aws:s3:::my-bucket", "arn:aws:s3:::my-bucket/*"]
+  }]
+}
+```
+
+[limitations.md](limitations.md#storage-and-credentials) lists what the plugin does with the credentials once stored and which store errors an attach reports.
+
 ## 5. Verify: run the query shapes
 
 Each command below assumes the index name `demo` from step 4.
@@ -649,7 +664,7 @@ When Lance advances to a new version, the plugin exposes it as soon as the next 
 
 Lance's own scanner produces a mixed execution plan for FTS and knn: covered fragments use the existing index, uncovered fragments run a flat scan, and the results are unioned by the query engine, so an incremental append never slows down queries hitting the previously-covered fragments.
 
-The `index.plugins.lance.uncovered_fragment_policy` setting accepts `wait` alongside the default `immediate`. Both values expose the new version immediately; `wait` is reserved for a future async-optimize implementation, and setting it logs an informational message so operators are aware that the plugin does not optimise the table's indexes.
+The `index.plugins.lance.uncovered_fragment_policy` setting accepts `wait` alongside the default `immediate`. Both values expose the new version immediately; `wait` has no effect beyond one informational log line per index saying that the plugin never writes to the table. Index coverage of appended fragments is the writer's job (`ds.optimize.optimize_indices()` above).
 
 ### Serving an object store table from local NVMe
 

@@ -44,7 +44,7 @@ the whole closure, or the plugin class that uses it.
 
 | jar | size | needed by |
 |---|---|---|
-| lance-core 12.0.0 | 201.4 MB | The plugin: `Dataset`, `LanceScanner`, the index builders, `DirectoryNamespace` and `RestNamespace`. Contains the JNI library for three platforms and a shaded Guava. |
+| lance-core 12.0.0 | 201.4 MB | The plugin: `Dataset`, `LanceScanner`, `DirectoryNamespace` and `RestNamespace`. Contains the JNI library for three platforms and a shaded Guava. |
 | jar-jni 1.1.1 | 26 KB | lance-core's `JniLoader` delegates to `io.questdb.jar.jni.JarJniLoader` to extract and load `liblance_jni`. lance-core's POM declares it with unresolved `${arrow.version}` and `${opentelemetry.version}` properties, which makes Gradle drop the whole dependency block, so it is declared explicitly. |
 | arrow-vector 18.3.0 | 2.2 MB | The plugin (`org.apache.arrow.vector`, 104 imports) and lance-core: every column the plugin reads is an Arrow vector. |
 | arrow-memory-core 18.3.0 | 117 KB | `BufferAllocator`, `RootAllocator`, `ArrowBuf`; referenced by arrow-vector, lance-core and every namespace client. |

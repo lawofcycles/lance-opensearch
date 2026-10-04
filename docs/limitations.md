@@ -176,7 +176,7 @@ A bare full-text page returns `min(size, hits.total)` hits on one node and on ma
   - The engine path (GET, stats) follows the freshness check on the node holding the shard (default every 10s, `plugins.lance.namespace.poll_cadence`; `POST /_plugins/_lance/sync/{index}` runs it now).
 - The cadence also bounds how long a schema change takes to reach the mapping. Rows are fresh per request already, but a column added to the table is absent from `GET /{index}/_mapping` and `_field_caps` until the next freshness check derives the mapping again (or `POST /_plugins/_lance/sync/{index}` does), and the shard's own reader advances at the same moment.
 - One node checks each index: the one holding its shard. After a node restart or a shard relocation the first check on the new node derives the mapping again even when the table did not move, one cadence after the shard starts, so an operator who wants the mapping caught up at once after a restart calls `POST /_plugins/_lance/sync/{index}`.
-- `index.plugins.lance.uncovered_fragment_policy` (`wait` / `immediate`, default `immediate`) exists in settings but both values expose the new version at once. `wait` is reserved for a future async-optimize implementation.
+- `index.plugins.lance.uncovered_fragment_policy` (`wait` / `immediate`, default `immediate`) exists in settings but both values expose the new version at once. `wait` has no effect beyond one informational log line per index. Covering appended fragments with the table's indexes is the writer's job (pylance `ds.optimize.optimize_indices()`).
 
 ## Storage and credentials
 
