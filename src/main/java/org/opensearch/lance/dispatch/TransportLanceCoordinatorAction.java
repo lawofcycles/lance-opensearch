@@ -897,7 +897,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             statistics = tableStatistics.lookup(
                 dataset.uri(),
                 version,
-                () -> LanceRegistry.openDataset(target.tableUri(), target.storageOptions(), Optional.of(version))
+                () -> LanceRegistry.openDatasetAt(target.tableUri(), target.storageOptions(), version)
             );
             if (statistics == null) {
                 LOGGER.debug(
