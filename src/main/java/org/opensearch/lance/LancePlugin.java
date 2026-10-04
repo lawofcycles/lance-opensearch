@@ -946,7 +946,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      */
     public static final Setting<String> TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING = Setting.simpleString(
         "plugins.lance.test.hiding_wrapper_index_prefix",
-        HidingReaderWrapper.Rule::parse,
+        HidingReaderWrapper.Rule::validate,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );

@@ -473,9 +473,14 @@ public class LanceTextOverrideIT extends LanceRestTestCase {
             // row of the table; the wrapper hides its hits afterwards, so
             // the match answers the visible rows with a category. The
             // single node renders the page on the query round (no fetch
-            // round trip) and the gate judged the flat kind.
+            // round trip) and the gate judged the flat kind on both
+            // indexes; what the wrapper changes is the plan: the pushed
+            // full text clause moves to the Lucene side on the wrapped
+            // index (one security_wrapper refinement) and stays pushed on
+            // the plain one.
             Map<String, Object> fetchBefore = fetchCacheStats();
             assertEquals(fetchBefore.toString(), true, fetchBefore.get("enabled"));
+            long refinedBefore = securityWrapperRefinements();
             String wrappedFlat = readAll(postJson("/" + wrapped + "/_search?request_cache=false", flatMatch));
             assertEquals(
                 "the flat match sees the visible rows only: " + wrappedFlat,
@@ -485,8 +490,13 @@ public class LanceTextOverrideIT extends LanceRestTestCase {
             assertEquals(List.of(6, 8, 10), sortedSourceIds(wrappedFlat));
             assertEquals(List.of("fts_flat"), admissionKinds(wrappedFlat));
             assertEquals(0, fetchRoundTrips(wrappedFlat));
+            long refinedAfterWrapped = securityWrapperRefinements();
+            assertEquals("the wrapped request is refined for the wrapper", refinedBefore + 1, refinedAfterWrapped);
             String plainFlat = readAll(postJson("/" + plain + "/_search?request_cache=false", flatMatch));
             assertEquals(9, extractIntPath(plainFlat, "hits", "total", "value"));
+            assertEquals(List.of("fts_flat"), admissionKinds(plainFlat));
+            assertEquals(0, fetchRoundTrips(plainFlat));
+            assertEquals("the plain request is not refined", refinedAfterWrapped, securityWrapperRefinements());
             // The rows behind the wrapped page bypass the fetch cache: a
             // row rendered under one wrapper must not serve the next
             // request from the cache.
@@ -577,6 +587,14 @@ public class LanceTextOverrideIT extends LanceRestTestCase {
         Map<String, Object> coordinator = (Map<String, Object>) lance.get("coordinator");
         assertNotNull("the profile carries the coordinator: " + searchBody, coordinator);
         return ((Number) coordinator.get("fetch_round_trips")).intValue();
+    }
+
+    /** The single node's {@code plan.refinements.security_wrapper} counter. */
+    @SuppressWarnings("unchecked")
+    private static long securityWrapperRefinements() throws IOException {
+        Map<String, Object> plan = (Map<String, Object>) nodeStats().get("plan");
+        Map<String, Object> refinements = (Map<String, Object>) plan.get("refinements");
+        return ((Number) refinements.get("security_wrapper")).longValue();
     }
 
     /** The single node's {@code indices.<index>} stats block. */

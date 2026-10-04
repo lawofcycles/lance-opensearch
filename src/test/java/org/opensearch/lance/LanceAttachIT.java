@@ -8,6 +8,7 @@ package org.opensearch.lance;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Locale;
 
 import org.opensearch.client.Request;
@@ -867,6 +868,27 @@ public class LanceAttachIT extends LanceRestTestCase {
                 () -> client().performRequest(new Request("GET", "/" + wrapped + "/_doc/99"))
             );
             assertEquals(404, absent.getResponse().getStatusLine().getStatusCode());
+
+            // The FLS side: the wrapper drops meta.region from the leaves'
+            // field infos and answers no doc values for it, so a terms
+            // aggregation over it (run by the Lucene aggregators under a
+            // wrapper) has no bucket and a term on it finds no row, while
+            // the plain index answers east, west and south and the three
+            // east rows.
+            String termsAgg = "{\"size\":0,\"aggs\":{\"regions\":{\"terms\":{\"field\":\"meta.region\"}}}}";
+            String wrappedAgg = readAll(postJson("/" + wrapped + "/_search?request_cache=false", termsAgg));
+            assertEquals("the hidden column has no bucket through the wrapper: " + wrappedAgg, List.of(), bucketsOf(wrappedAgg, "regions"));
+            String plainAgg = readAll(postJson("/" + plain + "/_search?request_cache=false", termsAgg));
+            assertEquals(List.of("east=3", "west=2", "south=1"), bucketsOf(plainAgg, "regions"));
+            String termOnHidden = "{\"size\":10,\"query\":{\"term\":{\"meta.region\":\"east\"}}}";
+            String wrappedTerm = readAll(postJson("/" + wrapped + "/_search?request_cache=false", termOnHidden));
+            assertEquals(
+                "a term on the hidden column finds nothing: " + wrappedTerm,
+                0,
+                extractIntPath(wrappedTerm, "hits", "total", "value")
+            );
+            String plainTerm = readAll(postJson("/" + plain + "/_search?request_cache=false", termOnHidden));
+            assertEquals(plainTerm, 3, extractIntPath(plainTerm, "hits", "total", "value"));
         } finally {
             setHidingWrapperIndexPrefix(null);
             for (String index : new String[] { wrapped, plain }) {
