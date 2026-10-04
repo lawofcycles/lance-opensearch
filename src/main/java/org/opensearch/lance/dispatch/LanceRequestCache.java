@@ -315,11 +315,21 @@ public final class LanceRequestCache implements ClusterStateListener {
      * paired with its removal at close.
      */
     public static LanceRequestCache fromSettings(Settings settings, ClusterSettings clusterSettings) {
+        return fromSettings(settings, clusterSettings, System::currentTimeMillis);
+    }
+
+    /**
+     * {@link #fromSettings(Settings, ClusterSettings)} with the cache
+     * reading the time from {@code clock} (milliseconds), for tests that
+     * move the clock instead of waiting for an entry to expire.
+     */
+    static LanceRequestCache fromSettings(Settings settings, ClusterSettings clusterSettings, LongSupplier clock) {
         LanceRequestCache cache = new LanceRequestCache(
             LanceSettings.REQUEST_CACHE_SIZE_SETTING.get(settings).getBytes(),
             LanceSettings.REQUEST_CACHE_MAX_ENTRY_SIZE_SETTING.get(settings).getBytes(),
             LanceSettings.REQUEST_CACHE_ENABLED_SETTING.get(settings),
-            LanceSettings.REQUEST_CACHE_EXPIRE_SETTING.get(settings)
+            LanceSettings.REQUEST_CACHE_EXPIRE_SETTING.get(settings),
+            clock
         );
         clusterSettings.addSettingsUpdateConsumer(LanceSettings.REQUEST_CACHE_ENABLED_SETTING, cache::setEnabled);
         clusterSettings.addSettingsUpdateConsumer(LanceSettings.REQUEST_CACHE_EXPIRE_SETTING, cache::setExpire);

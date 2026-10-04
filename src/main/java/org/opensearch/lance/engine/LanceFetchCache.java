@@ -302,11 +302,21 @@ public final class LanceFetchCache implements ClusterStateListener {
      * with its removal at close.
      */
     public static LanceFetchCache fromSettings(Settings settings, ClusterSettings clusterSettings) {
+        return fromSettings(settings, clusterSettings, System::nanoTime);
+    }
+
+    /**
+     * {@link #fromSettings(Settings, ClusterSettings)} with the cache
+     * reading the age of its entries off {@code clock}, a monotonic
+     * nanosecond source, so a test can age an entry without waiting.
+     */
+    static LanceFetchCache fromSettings(Settings settings, ClusterSettings clusterSettings, LongSupplier clock) {
         LanceFetchCache cache = new LanceFetchCache(
             LanceSettings.FETCH_CACHE_SIZE_SETTING.get(settings).getBytes(),
             LanceSettings.FETCH_CACHE_MAX_ENTRY_SIZE_SETTING.get(settings).getBytes(),
             LanceSettings.FETCH_CACHE_ENABLED_SETTING.get(settings),
-            LanceSettings.FETCH_CACHE_EXPIRE_SETTING.get(settings)
+            LanceSettings.FETCH_CACHE_EXPIRE_SETTING.get(settings),
+            clock
         );
         clusterSettings.addSettingsUpdateConsumer(LanceSettings.FETCH_CACHE_ENABLED_SETTING, cache::setEnabled);
         clusterSettings.addSettingsUpdateConsumer(LanceSettings.FETCH_CACHE_EXPIRE_SETTING, cache::setExpire);

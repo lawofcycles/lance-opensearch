@@ -328,24 +328,22 @@ public class LanceFetchCacheTests extends OpenSearchTestCase {
             .put("plugins.lance.fetch_cache.enabled", true)
             .build();
         ClusterSettings clusterSettings = LanceTestSettings.clusterSettings(settings);
-        LanceFetchCache cache = LanceFetchCache.fromSettings(settings, clusterSettings);
+        AtomicLong nanos = new AtomicLong(1_000_000_000L);
+        LanceFetchCache cache = LanceFetchCache.fromSettings(settings, clusterSettings, nanos::get);
 
         assertTrue(cache.isEnabled());
         assertEquals(4096L, cache.stats().limitBytes());
         LanceFetchCache.Table table = cache.table("uuid", 1L);
         table.put(address(0, 1), List.of("id", "body"), new Object[] { 1L, "x".repeat(200) });
         assertEquals("the entry bound from the settings keeps the 200 character cell out", 1, cache.count());
+        nanos.addAndGet(TimeValue.timeValueHours(24).nanos());
         assertArrayEquals(
-            "no expiry from the settings keeps the small cell",
+            "no expiry from the settings keeps the small cell however old",
             new Object[] { 1L },
             table.lookup(address(0, 1), List.of("id"))
         );
 
         clusterSettings.applySettings(Settings.builder().put("plugins.lance.fetch_cache.expire", "1ms").build());
-        long start = System.nanoTime();
-        while (System.nanoTime() - start <= TimeValue.timeValueMillis(1).nanos()) {
-            Thread.sleep(1L);
-        }
         assertNull("the expire consumer is registered: the aged cell is dropped", table.lookup(address(0, 1), List.of("id")));
 
         clusterSettings.applySettings(

@@ -411,7 +411,8 @@ public class LanceRequestCacheTests extends OpenSearchTestCase {
             .put("plugins.lance.request_cache.enabled", true)
             .build();
         ClusterSettings clusterSettings = LanceTestSettings.clusterSettings(settings);
-        LanceRequestCache cache = LanceRequestCache.fromSettings(settings, clusterSettings);
+        AtomicLong now = new AtomicLong(1_000L);
+        LanceRequestCache cache = LanceRequestCache.fromSettings(settings, clusterSettings, now::get);
         IndexMetadata metadata = indexMetadata("demo", "uuid-1");
 
         assertTrue(cache.isEnabled());
@@ -430,13 +431,10 @@ public class LanceRequestCacheTests extends OpenSearchTestCase {
         assertNull(stored.find(1L));
         stored.complete(took -> response(1.0d, 1L, false));
         assertEquals("the one sum answer is within the bound", 1, cache.count());
-        assertNotNull("no expiry from the settings keeps the entry", begin(cache, oneSum, metadata, node("n1")).find(1L));
+        now.addAndGet(TimeUnit.DAYS.toMillis(1));
+        assertNotNull("no expiry from the settings keeps the entry however old", begin(cache, oneSum, metadata, node("n1")).find(1L));
 
         clusterSettings.applySettings(Settings.builder().put("plugins.lance.request_cache.expire", "1ms").build());
-        long start = System.currentTimeMillis();
-        while (System.currentTimeMillis() - start <= 5L) {
-            Thread.sleep(1L);
-        }
         assertNull("the expire consumer is registered: the aged entry is dropped", begin(cache, oneSum, metadata, node("n1")).find(1L));
 
         clusterSettings.applySettings(

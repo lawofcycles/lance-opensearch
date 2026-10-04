@@ -266,7 +266,7 @@ public class LanceWarmCacheTests extends OpenSearchTestCase {
         Settings settings = Settings.builder().put("plugins.lance.cache.enabled", true).put("plugins.lance.cache.max_snapshots", 1).build();
         ClusterSettings clusterSettings = LanceTestSettings.clusterSettings(settings);
         // The statistics collection runs on the executor handed in; inline
-        // here, so the build of a snapshot pays the collection and its delay.
+        // here, so the build of a snapshot pays the collection.
         cache = LanceWarmCache.fromSettings(settings, clusterSettings, allocator, 16L * 1024 * 1024, Runnable::run, null);
 
         assertTrue(cache.isEnabled());
@@ -282,26 +282,9 @@ public class LanceWarmCacheTests extends OpenSearchTestCase {
         assertEquals("max_snapshots from the settings keeps one snapshot", 1, cache.snapshotCount());
         assertTrue("the earlier snapshot was evicted", a.isClosed());
 
+        assertEquals("no delay from the settings", 0L, cache.tableStatistics().collectDelayMillis());
         clusterSettings.applySettings(Settings.builder().put("plugins.lance.test.statistics_collect_delay", "300ms").build());
-        String other = LanceTableFactory.writeHintFixtureTable(createTempDir(), "warm-other-" + getTestName(), 1, 50);
-        long start = System.nanoTime();
-        try (
-            Lease lease = cache.acquire(
-                "index-c-uuid",
-                other,
-                StorageOptions.empty(),
-                Optional.empty(),
-                "",
-                LancePrimaryKeyType.NONE,
-                LanceOverrides.EMPTY
-            )
-        ) {
-            assertNotNull(cache.tableStatistics().peek(lease.snapshot().dataset().uri(), lease.snapshot().dataset().version()));
-        }
-        assertTrue(
-            "the delay consumer is registered: the inline collection of the new table waited for it",
-            System.nanoTime() - start >= TimeValue.timeValueMillis(250).nanos()
-        );
+        assertEquals("the delay consumer is registered", 300L, cache.tableStatistics().collectDelayMillis());
 
         clusterSettings.applySettings(
             Settings.builder().put("plugins.lance.test.statistics_collect_delay", "300ms").put("plugins.lance.cache.enabled", false).build()
