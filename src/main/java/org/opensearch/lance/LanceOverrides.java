@@ -25,7 +25,8 @@ import org.opensearch.lance.rest.RestAttachAction;
  * or namespace-register body. One column may carry a base type override
  * ({@code type: date} on an integer column stored as epoch millis,
  * {@code type: keyword} on a Utf8 column that also has a Lance inverted
- * index, {@code type: ip} on a Utf8 column holding IP address strings),
+ * index, {@code type: ip} on a Utf8 column holding IP address strings,
+ * {@code type: lance_text} on a Utf8 column without an inverted index),
  * a {@code format} (with {@code type: date} only) and keyword
  * sub-field declarations ({@code fields}).
  *
@@ -57,6 +58,7 @@ public final class LanceOverrides {
     public static final String TYPE_IP = "ip";
     public static final String TYPE_WILDCARD = "wildcard";
     public static final String TYPE_GEO_POINT = "geo_point";
+    public static final String TYPE_LANCE_TEXT = "lance_text";
 
     /** Default mapping format of a {@code type: date} override on an integer column. */
     public static final String DEFAULT_DATE_FORMAT = "epoch_millis";
@@ -163,6 +165,30 @@ public final class LanceOverrides {
         Set<String> out = new LinkedHashSet<>();
         for (Map.Entry<String, Column> entry : columns.entrySet()) {
             if (TYPE_WILDCARD.equals(entry.getValue().type())) {
+                out.add(entry.getKey());
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Columns overridden to {@code lance_text}. A Utf8 column so
+     * declared maps to {@code lance_text} whether or not the table
+     * carries an inverted index on it: with one Lance searches the
+     * index, without one Lance tokenises the scanned rows and scores
+     * them with BM25 (its flat path), and with an index that covers
+     * some fragments only Lance unions the two. The mapping records
+     * the declaration in {@code meta.lance_override_type}, and the
+     * freshness check never flips the column between {@code keyword}
+     * and {@code lance_text} when the table gains or loses the index.
+     * A column may carry one {@code type}, so this set and
+     * {@link #keywordColumns()}, {@link #wildcardColumns()} and
+     * {@link #ipColumns()} never share a column.
+     */
+    public Set<String> lanceTextColumns() {
+        Set<String> out = new LinkedHashSet<>();
+        for (Map.Entry<String, Column> entry : columns.entrySet()) {
+            if (TYPE_LANCE_TEXT.equals(entry.getValue().type())) {
                 out.add(entry.getKey());
             }
         }
@@ -345,7 +371,7 @@ public final class LanceOverrides {
      * the table: per-column values must be objects whose keys come from
      * {@code type} / {@code format} / {@code order} / {@code fields},
      * {@code type} must be {@code date}, {@code keyword}, {@code ip},
-     * {@code wildcard} or {@code geo_point}, {@code format} needs
+     * {@code wildcard}, {@code geo_point} or {@code lance_text}, {@code format} needs
      * {@code type: date} and must parse through
      * {@link DateFormatter#forPattern}, and sub-field entries must be
      * objects with a string {@code type}.
@@ -415,13 +441,14 @@ public final class LanceOverrides {
                 && !TYPE_KEYWORD.equals(typeStr)
                 && !TYPE_IP.equals(typeStr)
                 && !TYPE_WILDCARD.equals(typeStr)
-                && !TYPE_GEO_POINT.equals(typeStr)) {
+                && !TYPE_GEO_POINT.equals(typeStr)
+                && !TYPE_LANCE_TEXT.equals(typeStr)) {
                 throw new IllegalArgumentException(
                     "[overrides."
                         + baseName
                         + ".type="
                         + typeStr
-                        + "] is not supported; accepted types are [date], [keyword], [ip], [wildcard], [geo_point]"
+                        + "] is not supported; accepted types are [date], [keyword], [ip], [wildcard], [geo_point], [lance_text]"
                 );
             }
             type = typeStr;

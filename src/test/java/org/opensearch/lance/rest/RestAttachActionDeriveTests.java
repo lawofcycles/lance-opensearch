@@ -472,4 +472,69 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
         Path scratchDir = createTempDir();
         return LanceTableFactory.writeEnglishTextTable(scratchDir, "derive-" + getTestName().toLowerCase(Locale.ROOT));
     }
+
+    public void testLanceTextOverrideOnColumnWithoutAnIndexDerivesLanceText() throws Exception {
+        // The English text table carries no inverted index, so without
+        // the override body maps keyword; with it the mapping is
+        // lance_text, the declaration is in the field meta and the
+        // column joins ftsColumns.
+        try (Dataset dataset = LanceRegistry.openDataset(englishTextTable(), StorageOptions.empty())) {
+            RestAttachAction.Derivation plain = RestAttachAction.derive(dataset);
+            assertTrue(
+                "body maps keyword without the override: " + plain.mappingJson(),
+                plain.mappingJson().contains("\"body\":{\"type\":\"keyword\"")
+            );
+            assertFalse(plain.ftsColumns().contains("body"));
+
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+                dataset,
+                overrides(Map.of("body", Map.of("type", "lance_text", "fields", Map.of("raw", Map.of("type", "keyword")))))
+            );
+            String mapping = derivation.mappingJson();
+            assertTrue("body must map as lance_text: " + mapping, mapping.contains("\"body\":{\"type\":\"lance_text\""));
+            assertTrue("meta must record the declared type: " + mapping, mapping.contains("\"lance_override_type\":\"lance_text\""));
+            assertTrue("meta must keep the Arrow type: " + mapping, mapping.contains("\"lance_arrow_type\":\"Utf8\""));
+            assertTrue("the keyword sub-field is emitted: " + mapping, mapping.contains("\"fields\":{\"raw\":{\"type\":\"keyword\""));
+            assertTrue("body joins ftsColumns: " + derivation.ftsColumns(), derivation.ftsColumns().contains("body"));
+            assertFalse("body leaves scalarColumns: " + derivation.scalarColumns(), derivation.scalarColumns().contains("body"));
+            assertTrue(
+                "overrides JSON must persist: " + derivation.overridesJson(),
+                derivation.overridesJson().contains("\"body\"") && derivation.overridesJson().contains("\"lance_text\"")
+            );
+        }
+    }
+
+    public void testLanceTextOverrideOnInvertedIndexColumnKeepsLanceText() throws Exception {
+        // The label column of the epoch-millis fixture carries an
+        // inverted index: the override pins the type the derivation
+        // picks anyway and records the declaration.
+        try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
+            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+                dataset,
+                overrides(Map.of("label", Map.of("type", "lance_text")))
+            );
+            String mapping = derivation.mappingJson();
+            assertTrue("label must map as lance_text: " + mapping, mapping.contains("\"label\":{\"type\":\"lance_text\""));
+            assertTrue("meta must record the declared type: " + mapping, mapping.contains("\"lance_override_type\":\"lance_text\""));
+            assertTrue("label stays in ftsColumns: " + derivation.ftsColumns(), derivation.ftsColumns().contains("label"));
+        }
+    }
+
+    public void testLanceTextOverrideOnNonUtf8Rejected() throws Exception {
+        try (Dataset dataset = LanceRegistry.openDataset(ipTable(), StorageOptions.empty())) {
+            IllegalArgumentException onInt = expectThrows(
+                IllegalArgumentException.class,
+                () -> RestAttachAction.derive(dataset, overrides(Map.of("id", Map.of("type", "lance_text"))))
+            );
+            assertTrue(onInt.getMessage(), onInt.getMessage().contains("type=lance_text] needs a Utf8 column"));
+            assertTrue(onInt.getMessage(), onInt.getMessage().contains("id"));
+            // The multi-valued List<Utf8> shape is refused as well.
+            IllegalArgumentException onList = expectThrows(
+                IllegalArgumentException.class,
+                () -> RestAttachAction.derive(dataset, overrides(Map.of("addrs", Map.of("type", "lance_text"))))
+            );
+            assertTrue(onList.getMessage(), onList.getMessage().contains("type=lance_text] needs a Utf8 column"));
+            assertTrue(onList.getMessage(), onList.getMessage().contains("addrs"));
+        }
+    }
 }

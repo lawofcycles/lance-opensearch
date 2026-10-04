@@ -193,7 +193,11 @@ public class RestAttachAction extends BaseRestHandler {
      * a Utf8 column maps it to {@code keyword} even when the column
      * carries a Lance inverted index, which also keeps it out of
      * {@code ftsColumns}; on
-     * a List&lt;Utf8&gt; column it pins the derived type. Sub-field
+     * a List&lt;Utf8&gt; column it pins the derived type. {@code type:
+     * lance_text} on a Utf8 column maps it to {@code lance_text} whether
+     * or not the column carries an inverted index and puts it in
+     * {@code ftsColumns} (Lance runs its flat BM25 scan where no index
+     * covers the rows). Sub-field
      * declarations ({@code fields}) behave as the {@code multi_fields}
      * clause always has.
      *
@@ -235,6 +239,7 @@ public class RestAttachAction extends BaseRestHandler {
         java.util.Set<String> keywordOverrides = effective.keywordColumns();
         java.util.Set<String> ipOverrides = effective.ipColumns();
         java.util.Set<String> wildcardOverrides = effective.wildcardColumns();
+        java.util.Set<String> lanceTextOverrides = effective.lanceTextColumns();
         Map<String, String> geoPointOverrides = effective.geoPointColumns();
         for (LanceField field : lanceSchema.fields()) {
             ArrowType type = field.getType();
@@ -439,6 +444,21 @@ public class RestAttachAction extends BaseRestHandler {
                     writeMultiFieldsBlock(mapping, name, multiFields);
                     mapping.endObject();
                     scalarColumns.add(name);
+                } else if (lanceTextOverrides.contains(name)) {
+                    // The operator declared the column full text. The
+                    // mapping is lance_text whether or not the table
+                    // carries an inverted index: Lance searches the
+                    // index when there is one and tokenises the scanned
+                    // rows (its flat BM25 path) when there is none, so
+                    // the mapping does not depend on the index and the
+                    // freshness check never flips it. The declaration
+                    // is recorded in the field meta like a wildcard
+                    // override, so GET _mapping shows the column is
+                    // lance_text by declaration and not by index.
+                    startFieldWithId(mapping, name, fieldId, "lance_text", arrowTypeIdentity(type), LanceOverrides.TYPE_LANCE_TEXT);
+                    writeMultiFieldsBlock(mapping, name, multiFields);
+                    mapping.endObject();
+                    ftsColumns.add(name);
                 } else if (hasFts && !keywordOverrides.contains(name) && !wildcardOverrides.contains(name)) {
                     startFieldWithId(mapping, name, fieldId, "lance_text", arrowTypeIdentity(type));
                     writeMultiFieldsBlock(mapping, name, multiFields);
@@ -635,7 +655,8 @@ public class RestAttachAction extends BaseRestHandler {
      * column (a pin); {@code type: ip} needs a Utf8 or List&lt;Utf8&gt;
      * column whose strings are IP addresses; {@code type: wildcard}
      * needs a Utf8 column (it is served through the keyword mapping);
-     * {@code fields} needs a Utf8
+     * {@code type: lance_text} needs a Utf8 column (with or without an
+     * inverted index); {@code fields} needs a Utf8
      * column, sub-field types must be {@code keyword}, and a sub-field
      * path must not collide with an existing schema column.
      */
@@ -747,6 +768,14 @@ public class RestAttachAction extends BaseRestHandler {
         if (LanceOverrides.TYPE_WILDCARD.equals(column.type()) && !(type instanceof ArrowType.Utf8)) {
             throw new IllegalArgumentException(
                 "[overrides." + baseName + ".type=wildcard] needs a Utf8 column; [" + baseName + "] is " + type
+            );
+        }
+        if (LanceOverrides.TYPE_LANCE_TEXT.equals(column.type()) && !(type instanceof ArrowType.Utf8)) {
+            // List<Utf8> is refused as well: the fragment reader serves
+            // a lance_text column through Lance's full text scan of one
+            // Utf8 column, and the multi valued shape has no such path.
+            throw new IllegalArgumentException(
+                "[overrides." + baseName + ".type=lance_text] needs a Utf8 column; [" + baseName + "] is " + type
             );
         }
         if (LanceOverrides.TYPE_GEO_POINT.equals(column.type())) {
@@ -1241,9 +1270,11 @@ public class RestAttachAction extends BaseRestHandler {
             mapping.field("lance_arrow_type", arrowType);
         }
         if (overrideType != null) {
-            // The operator's declared override when it differs from the
-            // emitted mapping type (a `wildcard` override served by the
-            // keyword mapping), so GET _mapping shows the intent.
+            // The operator's declared override when the mapping type
+            // alone does not show it (a `wildcard` override served by
+            // the keyword mapping, a `lance_text` override on a column
+            // the index presence would have mapped keyword), so GET
+            // _mapping shows the intent.
             mapping.field("lance_override_type", overrideType);
         }
         mapping.endObject();
