@@ -131,10 +131,9 @@ alone, or inside a `bool` whose `must` and `should` hold full text clauses only,
 plan as their own logical nodes and show on the scan as pushed `fts` / `knn` operations carrying
 every parameter and the filter's SQL. A pushed `fts` also carries `index=`: `index=inverted` when
 every searched column carries an inverted index the scan answers from, `index=none` when none
-does and Lance tokenises and scores every row of the column instead (a `type: lance_text`
-override on a column the writer has not indexed, see
-[mapping-overrides.md](mapping-overrides.md)), and one word per column
-(`index=[body=inverted, title=none]`) when the columns split. The flat path's time and memory
+does and Lance tokenises and scores every row of the column instead, and one word per column
+(`index=[body=inverted, title=none]`) when the columns split. A column without an index reaches
+the scan through a `type: lance_text` override ([mapping-overrides.md](mapping-overrides.md)). The flat path's time and memory
 grow with the row count where the indexed path's do not, so the term is what tells an operator
 that an index on the column would change the plan's cost; the set of indexed columns is the one
 the executors' admission gate splits the clause by. Do not parse the text; its shape will keep

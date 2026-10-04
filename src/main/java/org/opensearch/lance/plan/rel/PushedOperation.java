@@ -149,7 +149,7 @@ public sealed interface PushedOperation permits PushedOperation.PushedAggregate,
          * they split, null when the model does not know.
          */
         public String indexSummary() {
-            if (indexedColumns == null) {
+            if (indexedColumns == null || fts.columns().isEmpty()) {
                 return null;
             }
             int indexed = 0;
