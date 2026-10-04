@@ -45,11 +45,8 @@ import org.opensearch.monitor.os.OsProbe;
  */
 public final class NativeMemoryLimit {
 
-    /** Index cache share of the Session part of the limit (6 / 7 in Lance's own defaults). */
-    static final double INDEX_SHARE = 6.0 / 7.0;
-
     /** Metadata cache share of the Session part of the limit (1 / 7 in Lance's own defaults). */
-    static final double METADATA_SHARE = 1.0 / 7.0;
+    private static final double METADATA_SHARE = 1.0 / 7.0;
 
     /**
      * Lance's minimum weight budget per index cache shard, 4 GiB
@@ -57,10 +54,10 @@ public final class NativeMemoryLimit {
      * The capacity divided by this value is the capacity term of the
      * shard count.
      */
-    static final long MIN_SHARD_SHARE_BYTES = 4L << 30;
+    private static final long MIN_SHARD_SHARE_BYTES = 4L << 30;
 
     /** Upper clamp of Lance's shard count. */
-    static final int MAX_SHARDS = 1024;
+    private static final int MAX_SHARDS = 1024;
 
     /**
      * Upper estimate of the index cache weight of one inverted index per
@@ -74,7 +71,7 @@ public final class NativeMemoryLimit {
      * is 4.82 GiB, which is 51.75 bytes per row; 52 rounds that up so
      * the estimate stays above the measurement.
      */
-    static final long INVERTED_INDEX_BYTES_PER_ROW = 52L;
+    private static final long INVERTED_INDEX_BYTES_PER_ROW = 52L;
 
     private NativeMemoryLimit() {}
 
@@ -181,9 +178,10 @@ public final class NativeMemoryLimit {
 
     /**
      * Upper estimate of the largest index cache entry of an inverted
-     * index over {@code rows} rows, {@link #INVERTED_INDEX_BYTES_PER_ROW}
-     * per row. Compared with {@link #shardShareBytes} to tell whether
-     * the index can stay cached at all.
+     * index over {@code rows} rows, 52 bytes
+     * ({@code INVERTED_INDEX_BYTES_PER_ROW}) per row. Compared with
+     * {@link #shardShareBytes} to tell whether the index can stay cached
+     * at all.
      */
     public static long invertedIndexEntryEstimateBytes(long rows) {
         return Math.max(0L, rows) * INVERTED_INDEX_BYTES_PER_ROW;
@@ -226,17 +224,17 @@ public final class NativeMemoryLimit {
 
     /**
      * Index-cache byte budget: the Session part of the limit minus the
-     * metadata cache, which is the {@link #INDEX_SHARE} ratio up to
-     * rounding. This is the budget {@link #sizeIndexCache} chooses the
-     * capacity within, not the capacity itself.
+     * metadata cache, which leaves 6/7 of it up to rounding. This is the
+     * budget {@link #sizeIndexCache} chooses the capacity within, not the
+     * capacity itself.
      */
     public static long indexCacheBudgetBytes(long sessionBytes) {
         return sessionBytes - metadataCacheBytes(sessionBytes);
     }
 
     /**
-     * Metadata-cache byte budget derived from the Session part of the
-     * limit using the {@link #METADATA_SHARE} ratio.
+     * Metadata-cache byte budget: 1/7 of the Session part of the limit,
+     * Lance's own default ratio.
      */
     public static long metadataCacheBytes(long sessionBytes) {
         return (long) (sessionBytes * METADATA_SHARE);
