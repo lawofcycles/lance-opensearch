@@ -92,16 +92,18 @@ import org.opensearch.search.aggregations.InternalAggregations;
  * Version 5 added the deferred hits of a request whose coordinator asked
  * for them ({@link LanceFragmentQueryRequest#deferFetch()}) as a fourth
  * optional block; an older coordinator never asks, so it never receives
- * a non empty one.
+ * a non empty one. Version 6 added the admission kind the executor's
+ * full text gate judged the request under as a fifth optional block,
+ * read as absent by an older coordinator.
  */
 public final class LanceFragmentQueryResponse extends ActionResponse {
 
     /**
      * The wire format's version, the first field the response writes; 2
      * added the profile block, 3 the take columns block, 4 the full text
-     * scans block, 5 the deferred hits block.
+     * scans block, 5 the deferred hits block, 6 the admission kind block.
      */
-    public static final int WIRE_VERSION = 5;
+    public static final int WIRE_VERSION = 6;
 
     /**
      * The hits of a page the executor collected but did not render, in
@@ -195,23 +197,41 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
      * {@code _rowaddr IN (...)} take scans the request issued on the
      * executor, how many row addresses they carried, how many columns
      * they projected summed over the scans, and their wall time summed,
-     * whichever phase issued them, and the Lance full text scans the
+     * whichever phase issued them, the Lance full text scans the
      * request ran on the executor (the hits scans of its full text
-     * Weights and the count-only scans behind {@code hits.total}). The
+     * Weights and the count-only scans behind {@code hits.total}), and
+     * the admission kind the executor's full text gate judged the
+     * request under ({@code fts} for columns answered from an inverted
+     * index, {@code fts_flat} for a column Lance scans flat; null when
+     * the gate did not run, a request without a full text clause). The
      * first five figures travel in the version 2 block, the columns in
-     * the version 3 block and the full text scans in the version 4
-     * block, so a response from an executor of an older plugin version
-     * reads as {@link #NONE} or with the later figures at zero.
+     * the version 3 block, the full text scans in the version 4 block
+     * and the admission kind in the version 6 block, so a response
+     * from an executor of an older plugin version reads as
+     * {@link #NONE} or with the later figures at zero and no kind.
      */
     public record Profile(long queryMillis, long fetchMillis, long takeCount, long takeRows, long takeMillis, long takeColumns,
-        long ftsScans) implements Writeable {
+        long ftsScans, String admissionKind) implements Writeable {
 
-        /** What an executor that does not report timings stands for: every figure zero. */
-        public static final Profile NONE = new Profile(0L, 0L, 0L, 0L, 0L, 0L, 0L);
+        /** What an executor that does not report timings stands for: every figure zero, no admission kind. */
+        public static final Profile NONE = new Profile(0L, 0L, 0L, 0L, 0L, 0L, 0L, null);
+
+        /** A profile of a request whose full text gate did not run: no admission kind. */
+        public Profile(
+            long queryMillis,
+            long fetchMillis,
+            long takeCount,
+            long takeRows,
+            long takeMillis,
+            long takeColumns,
+            long ftsScans
+        ) {
+            this(queryMillis, fetchMillis, takeCount, takeRows, takeMillis, takeColumns, ftsScans, null);
+        }
 
         /** The version 2 block: the five figures before the take columns existed; {@code takeColumns} and {@code ftsScans} stay zero. */
         public Profile(StreamInput in) throws IOException {
-            this(in.readVLong(), in.readVLong(), in.readVLong(), in.readVLong(), in.readVLong(), 0L, 0L);
+            this(in.readVLong(), in.readVLong(), in.readVLong(), in.readVLong(), in.readVLong(), 0L, 0L, null);
         }
 
         /** The version 2 block: the five figures before the take columns existed. */
@@ -226,15 +246,24 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
 
         /** This profile with {@code takeColumns} in place of its own, for the version 3 block read after the version 2 one. */
         public Profile withTakeColumns(long takeColumns) {
-            return new Profile(queryMillis, fetchMillis, takeCount, takeRows, takeMillis, takeColumns, ftsScans);
+            return new Profile(queryMillis, fetchMillis, takeCount, takeRows, takeMillis, takeColumns, ftsScans, admissionKind);
         }
 
         /** This profile with {@code ftsScans} in place of its own, for the version 4 block read after the version 3 one. */
         public Profile withFtsScans(long ftsScans) {
-            return new Profile(queryMillis, fetchMillis, takeCount, takeRows, takeMillis, takeColumns, ftsScans);
+            return new Profile(queryMillis, fetchMillis, takeCount, takeRows, takeMillis, takeColumns, ftsScans, admissionKind);
         }
 
-        /** The figures of this and {@code other} added, for the responses one node returned to one request. */
+        /** This profile with {@code admissionKind} in place of its own, for the version 6 block read after the version 5 one. */
+        public Profile withAdmissionKind(String admissionKind) {
+            return new Profile(queryMillis, fetchMillis, takeCount, takeRows, takeMillis, takeColumns, ftsScans, admissionKind);
+        }
+
+        /**
+         * The figures of this and {@code other} added, for the responses
+         * one node returned to one request; the admission kind is the
+         * later response's when it reports one, else this one's.
+         */
         public Profile plus(Profile other) {
             return new Profile(
                 queryMillis + other.queryMillis,
@@ -243,7 +272,8 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
                 takeRows + other.takeRows,
                 takeMillis + other.takeMillis,
                 takeColumns + other.takeColumns,
-                ftsScans + other.ftsScans
+                ftsScans + other.ftsScans,
+                other.admissionKind != null ? other.admissionKind : admissionKind
             );
         }
     }
@@ -372,9 +402,10 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         this.aggregations = in.readBoolean() ? InternalAggregations.readFrom(in) : null;
         this.terminatedEarly = in.readOptionalBoolean();
         Profile timings = reader.block(2, Profile::new, Profile.NONE);
-        this.profile = timings.withTakeColumns(reader.block(3, StreamInput::readVLong, 0L))
+        Profile withScans = timings.withTakeColumns(reader.block(3, StreamInput::readVLong, 0L))
             .withFtsScans(reader.block(4, StreamInput::readVLong, 0L));
         this.deferredHits = reader.block(5, DeferredHits::new, DeferredHits.NONE);
+        this.profile = withScans.withAdmissionKind(reader.block(6, StreamInput::readOptionalString, null));
         reader.finish();
     }
 
@@ -401,11 +432,13 @@ public final class LanceFragmentQueryResponse extends ActionResponse {
         // optional: the version 2 timings, then the version 3 columns,
         // then the version 4 full text scans, then the version 5
         // deferred hits (empty unless the coordinator asked for them,
-        // which an older coordinator cannot).
+        // which an older coordinator cannot), then the version 6
+        // admission kind.
         WireVersion.writeBlock(out, false, profile);
         WireVersion.writeBlock(out, false, columns -> columns.writeVLong(profile.takeColumns()));
         WireVersion.writeBlock(out, false, scans -> scans.writeVLong(profile.ftsScans()));
         WireVersion.writeBlock(out, false, deferredHits);
+        WireVersion.writeBlock(out, false, kind -> kind.writeOptionalString(profile.admissionKind()));
     }
 
     public long matched() {
