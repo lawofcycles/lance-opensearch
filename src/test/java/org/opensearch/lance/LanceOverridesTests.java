@@ -89,6 +89,55 @@ public class LanceOverridesTests extends OpenSearchTestCase {
         assertEquals("keyword", overrides.subFields().get("body").get("raw"));
     }
 
+    public void testSubFieldNameWithWhitespaceRejectedInBothClauses() {
+        // The multi_fields clause and overrides.[col].fields share one
+        // name rule: a space, a dot, a control character or an empty
+        // name is refused before the table is opened, naming the clause.
+        IllegalArgumentException legacy = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseAttachClauses(null, Map.of("body", Map.of("raw name", Map.of("type", "keyword"))))
+        );
+        assertTrue(legacy.getMessage(), legacy.getMessage().contains("[multi_fields.body] sub-field name [raw name]"));
+        assertTrue(legacy.getMessage(), legacy.getMessage().contains("whitespace or control characters"));
+
+        IllegalArgumentException fields = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseAttachClauses(Map.of("body", Map.of("fields", Map.of("raw name", Map.of("type", "keyword")))), null)
+        );
+        assertTrue(fields.getMessage(), fields.getMessage().contains("[overrides.body.fields] sub-field name [raw name]"));
+
+        IllegalArgumentException dotted = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseAttachClauses(null, Map.of("body", Map.of("raw.", Map.of("type", "keyword"))))
+        );
+        assertTrue(dotted.getMessage(), dotted.getMessage().contains("must not contain [.]"));
+
+        IllegalArgumentException control = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseAttachClauses(null, Map.of("body", Map.of("raw\tname", Map.of("type", "keyword"))))
+        );
+        assertTrue(control.getMessage(), control.getMessage().contains("whitespace or control characters"));
+
+        IllegalArgumentException empty = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceOverrides.parseAttachClauses(null, Map.of("body", Map.of("", Map.of("type", "keyword"))))
+        );
+        assertTrue(empty.getMessage(), empty.getMessage().contains("must be non-empty strings"));
+    }
+
+    public void testSubFieldNameWithOrdinaryCharactersAccepted() {
+        // Letters, digits, underscore and hyphen are what a mapping
+        // field name ordinarily carries; both clauses accept them and
+        // the name round trips through the canonical JSON unchanged.
+        LanceOverrides overrides = LanceOverrides.parseAttachClauses(
+            Map.of("title", Map.of("fields", Map.of("Raw_Keyword-2", Map.of("type", "keyword")))),
+            Map.of("body", Map.of("raw", Map.of("type", "keyword")))
+        );
+        assertEquals("keyword", overrides.subFields().get("title").get("Raw_Keyword-2"));
+        assertEquals("keyword", overrides.subFields().get("body").get("raw"));
+        assertEquals(overrides, LanceOverrides.parse(overrides.toJson()));
+    }
+
     public void testUnknownKeyRejected() {
         IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,

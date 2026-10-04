@@ -302,6 +302,62 @@ public class StorageOptionsTests extends OpenSearchTestCase {
         assertTrue("the Rust location stays: " + redacted, redacted.contains("object_store.rs:1234:56"));
     }
 
+    public void testRedactCredentialsReplacesTheSignatureElementsOfAnS3ErrorBody() {
+        // The body S3 answers a request signed with the right key id and
+        // a wrong secret with, as the plugin's 400 message quotes it.
+        // SignatureProvided is the HMAC the client derived from the
+        // secret; StringToSign and CanonicalRequest are its inputs and
+        // carry the session token and the credential scope over several
+        // lines. The filler values are assembled at run time so the
+        // source carries nothing a secret scanner matches.
+        String signature = "9f" + "e3".repeat(31);
+        String sessionToken = "FwoGZXIvYXdzE" + "Bya".repeat(5);
+        String stringToSign = "AWS4-HMAC-SHA256\n20260927T015900Z\n20260927/us-east-1/s3/aws4_request\n" + "ab".repeat(32);
+        String canonicalRequest = "GET\n/t.lance/_versions/\n\nhost:bucket.s3.amazonaws.com\nx-amz-content-sha256:UNSIGNED-PAYLOAD\n"
+            + "x-amz-date:20260927T015900Z\nx-amz-security-token:"
+            + sessionToken
+            + "\n\nhost;x-amz-content-sha256;x-amz-date;x-amz-security-token\nUNSIGNED-PAYLOAD";
+        String body = "Invalid user input: LanceError(IO): Generic S3 error: Client error with status 403 Forbidden: "
+            + "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>SignatureDoesNotMatch</Code>"
+            + "<Message>The request signature we calculated does not match the signature you provided. "
+            + "Check your key and signing method.</Message>"
+            + "<AWSAccessKeyId>"
+            + TEMPORARY_ACCESS_KEY_ID
+            + "</AWSAccessKeyId>"
+            + "<StringToSign>"
+            + stringToSign
+            + "</StringToSign>"
+            + "<SignatureProvided>"
+            + signature
+            + "</SignatureProvided>"
+            + "<StringToSignBytes>41 57 53 34</StringToSignBytes>"
+            + "<CanonicalRequest>"
+            + canonicalRequest
+            + "</CanonicalRequest>"
+            + "<CanonicalRequestBytes>47 45 54 0a</CanonicalRequestBytes>"
+            + "<RequestId>7A9E3F0C2B1D4E5F</RequestId><HostId>host</HostId></Error>, "
+            + "/home/runner/work/lance/rust/lance-io/src/object_store.rs:1234:56";
+
+        String redacted = StorageOptions.redactCredentials(body);
+        assertFalse("the signature must not survive: " + redacted, redacted.contains(signature));
+        assertFalse("the session token must not survive: " + redacted, redacted.contains(sessionToken));
+        assertFalse("the credential scope must not survive: " + redacted, redacted.contains("aws4_request"));
+        assertFalse("the key id must not survive: " + redacted, redacted.contains(TEMPORARY_ACCESS_KEY_ID));
+        assertTrue(redacted, redacted.contains("<StringToSign>***</StringToSign>"));
+        assertTrue(redacted, redacted.contains("<SignatureProvided>***</SignatureProvided>"));
+        assertTrue(redacted, redacted.contains("<CanonicalRequest>***</CanonicalRequest>"));
+        assertTrue(redacted, redacted.contains("<AWSAccessKeyId>***</AWSAccessKeyId>"));
+        assertTrue("the S3 error code stays: " + redacted, redacted.contains("<Code>SignatureDoesNotMatch</Code>"));
+        assertTrue("the message stays: " + redacted, redacted.contains("Check your key and signing method.</Message>"));
+        assertTrue(
+            "the byte dumps of the inputs are not matched by the element pattern: " + redacted,
+            redacted.contains("<StringToSignBytes>41 57 53 34</StringToSignBytes>")
+                && redacted.contains("<CanonicalRequestBytes>47 45 54 0a</CanonicalRequestBytes>")
+        );
+        assertTrue("the request id is not a credential: " + redacted, redacted.contains("7A9E3F0C2B1D4E5F"));
+        assertTrue("the Rust location stays: " + redacted, redacted.contains("object_store.rs:1234:56"));
+    }
+
     public void testRedactCredentialsReplacesAccessKeyIdsWhereverTheyAppear() {
         // Long lived and temporary key ids, in a SigV4 Authorization
         // header, a presigned URL and a MinIO style element that does
