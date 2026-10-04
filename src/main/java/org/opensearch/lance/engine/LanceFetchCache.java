@@ -24,8 +24,11 @@ import org.opensearch.cluster.ClusterStateListener;
 import org.opensearch.common.cache.Cache;
 import org.opensearch.common.cache.CacheBuilder;
 import org.opensearch.common.cache.RemovalReason;
+import org.opensearch.common.settings.ClusterSettings;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.index.Index;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.stats.LanceNodeStats;
 
 /**
@@ -289,6 +292,26 @@ public final class LanceFetchCache implements ClusterStateListener {
     private final LongAdder invalidations = new LongAdder();
     private final LongAdder skipped = new LongAdder();
     private final LongAdder rowsServed = new LongAdder();
+
+    /**
+     * The node's cache, sized and switched by the
+     * {@code plugins.lance.fetch_cache.*} settings, registered for the
+     * dynamic updates of {@link LanceSettings#FETCH_CACHE_ENABLED_SETTING}
+     * and {@link LanceSettings#FETCH_CACHE_EXPIRE_SETTING}. The caller adds
+     * the cache as a cluster state listener; that registration is paired
+     * with its removal at close.
+     */
+    public static LanceFetchCache fromSettings(Settings settings, ClusterSettings clusterSettings) {
+        LanceFetchCache cache = new LanceFetchCache(
+            LanceSettings.FETCH_CACHE_SIZE_SETTING.get(settings).getBytes(),
+            LanceSettings.FETCH_CACHE_MAX_ENTRY_SIZE_SETTING.get(settings).getBytes(),
+            LanceSettings.FETCH_CACHE_ENABLED_SETTING.get(settings),
+            LanceSettings.FETCH_CACHE_EXPIRE_SETTING.get(settings)
+        );
+        clusterSettings.addSettingsUpdateConsumer(LanceSettings.FETCH_CACHE_ENABLED_SETTING, cache::setEnabled);
+        clusterSettings.addSettingsUpdateConsumer(LanceSettings.FETCH_CACHE_EXPIRE_SETTING, cache::setExpire);
+        return cache;
+    }
 
     /**
      * @param limitBytes    the most the entries may weigh together

@@ -9,7 +9,7 @@ import org.apache.calcite.plan.Contexts;
 import org.apache.calcite.plan.hep.HepPlanner;
 import org.apache.calcite.plan.hep.HepProgramBuilder;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -63,9 +63,9 @@ public class CostInputsTests extends OpenSearchTestCase {
     }
 
     public void testRoutingSettingDefaultsMatchThePlugin() {
-        assertEquals(LancePlugin.AGGREGATION_PUSHDOWN_SETTING.getDefault(Settings.EMPTY), CostInputs.local().pushdownEnabled());
+        assertEquals(LanceSettings.AGGREGATION_PUSHDOWN_SETTING.getDefault(Settings.EMPTY), CostInputs.local().pushdownEnabled());
         assertEquals(
-            LancePlugin.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING.getDefault(Settings.EMPTY).longValue(),
+            LanceSettings.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING.getDefault(Settings.EMPTY).longValue(),
             CostInputs.DEFAULT_MAX_GROUPS
         );
     }

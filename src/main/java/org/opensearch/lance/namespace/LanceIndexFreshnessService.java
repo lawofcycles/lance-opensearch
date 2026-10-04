@@ -32,7 +32,7 @@ import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.lance.LanceOverrides;
-import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.dispatch.LanceCoordinatorThreads;
@@ -267,10 +267,10 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
      */
     Tracked track(TrackedShard shard) {
         Settings settings = shard.settings();
-        if (LancePlugin.TABLE_SETTING.get(settings).isEmpty()) {
+        if (LanceSettings.TABLE_SETTING.get(settings).isEmpty()) {
             return null;
         }
-        if (LancePlugin.VERSION_SETTING.get(settings) >= 0) {
+        if (LanceSettings.VERSION_SETTING.get(settings) >= 0) {
             return null;
         }
         Tracked entry = new Tracked(shard);
@@ -328,7 +328,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         Tracked entry = tracked.get(indexName);
         if (entry == null) {
             Settings settings = indexShard.indexSettings().getIndexMetadata().getSettings();
-            if (LancePlugin.VERSION_SETTING.get(settings) >= 0) {
+            if (LanceSettings.VERSION_SETTING.get(settings) >= 0) {
                 return Outcome.notChecked(indexName, "the index is pinned to index.plugins.lance.version and never advances");
             }
             entry = track(new IndexShardHandle(indexShard, servedVersions));
@@ -365,7 +365,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         Settings settings = shard.settings();
         String table = LanceEngineFactory.tableOf(settings);
         StorageOptions storageOptions = StorageOptions.fromIndexSettings(settings);
-        String tagSetting = LancePlugin.TAG_SETTING.get(settings);
+        String tagSetting = LanceSettings.TAG_SETTING.get(settings);
         String tag = tagSetting.isEmpty() ? null : tagSetting;
         long served = shard.servedVersion();
         long target;
@@ -447,7 +447,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         // still stands, because the mapping the index should have has
         // not changed and the update that failed has not been retried.
         if (derivation != null) {
-            if ("wait".equals(LancePlugin.UNCOVERED_FRAGMENT_POLICY_SETTING.get(settings))) {
+            if ("wait".equals(LanceSettings.UNCOVERED_FRAGMENT_POLICY_SETTING.get(settings))) {
                 // `wait` is accepted but converges with the immediate
                 // branch: the plugin never writes to a user table, so
                 // folding appended fragments into the existing indexes is

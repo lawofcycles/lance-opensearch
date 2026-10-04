@@ -218,11 +218,11 @@ public final class LanceOverrides {
      * only overrides, else {@link #EMPTY}.
      */
     public static LanceOverrides of(Settings settings) {
-        String json = LancePlugin.OVERRIDES_SETTING.get(settings);
+        String json = LanceSettings.OVERRIDES_SETTING.get(settings);
         if (!json.isEmpty()) {
             return parse(json);
         }
-        String legacy = LancePlugin.MULTI_FIELDS_SETTING.get(settings);
+        String legacy = LanceSettings.MULTI_FIELDS_SETTING.get(settings);
         if (!legacy.isEmpty()) {
             return fromSubFields(RestAttachAction.deserialiseMultiFields(legacy));
         }

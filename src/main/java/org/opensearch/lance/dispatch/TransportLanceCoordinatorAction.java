@@ -46,6 +46,7 @@ import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LanceMappingMeta;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.StorageOptions;
@@ -214,8 +215,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         this.client = client;
         this.indicesService = indicesService;
         long nativeBudgetBytes = NativeMemoryLimit.parse(
-            LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.get(clusterService.getSettings()),
-            LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.getKey()
+            LanceSettings.NATIVE_MEMORY_LIMIT_SETTING.get(clusterService.getSettings()),
+            LanceSettings.NATIVE_MEMORY_LIMIT_SETTING.getKey()
         );
         this.plannerFactory = new LancePlannerFactory(nativeBudgetBytes, Runtime.getRuntime().maxMemory());
         this.tableStatistics = warmCache.tableStatistics();
@@ -438,7 +439,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // once its executor count and reader wrapper are known; the
         // body level conditions are settled here.
         boolean deferFetchCandidate = deferFetchCandidate(
-            clusterService.getClusterSettings().get(LancePlugin.FRAGMENT_PATH_DEFER_FETCH_SETTING),
+            clusterService.getClusterSettings().get(LanceSettings.FRAGMENT_PATH_DEFER_FETCH_SETTING),
             query,
             from,
             size,
@@ -961,7 +962,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         // would not fit one Lucene reader on the executor; then the node
         // gets one request per group of fragments that fits. Every table
         // under the bound (the usual case) keeps one request per node.
-        long maxDocs = clusterService.getClusterSettings().get(LancePlugin.MAX_DOCS_PER_READER_SETTING);
+        long maxDocs = clusterService.getClusterSettings().get(LanceSettings.MAX_DOCS_PER_READER_SETTING);
         List<PlanExecutor.FragmentGroup> groups = PlanExecutor.splitByRows(perNode, allFragmentIds, allFragmentRows, maxDocs);
 
         // Two or more executors answer this target's page: they defer
@@ -1214,7 +1215,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             for (LanceMappingMeta.RenamedField renamed : LanceMappingMeta.renamedFields(indexMetadata.mapping())) {
                 renamedFields.put(renamed.from(), renamed.to());
             }
-            String primaryKeyField = LancePlugin.PRIMARY_KEY_FIELD_SETTING.get(indexMetadata.getSettings());
+            String primaryKeyField = LanceSettings.PRIMARY_KEY_FIELD_SETTING.get(indexMetadata.getSettings());
             targets.add(
                 new IndexTarget(
                     index,
@@ -1245,8 +1246,8 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * Session keeps cheap.
      */
     private static long resolvePinnedVersion(IndexMetadata indexMetadata, String tableUri, StorageOptions storageOptions) {
-        long pinnedVersion = LancePlugin.VERSION_SETTING.get(indexMetadata.getSettings());
-        String tag = LancePlugin.TAG_SETTING.get(indexMetadata.getSettings());
+        long pinnedVersion = LanceSettings.VERSION_SETTING.get(indexMetadata.getSettings());
+        String tag = LanceSettings.TAG_SETTING.get(indexMetadata.getSettings());
         if (pinnedVersion < 0 && !tag.isEmpty()) {
             pinnedVersion = LanceRegistry.resolveTagVersion(tableUri, storageOptions, tag);
         }

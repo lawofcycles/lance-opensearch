@@ -23,6 +23,7 @@ import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.LanceMappingMeta;
 import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.attach.LanceAttachAction;
@@ -64,7 +65,7 @@ public class TransportLanceStatsActionTests extends OpenSearchSingleNodeTestCase
     protected Settings nodeSettings() {
         return Settings.builder()
             .put(super.nodeSettings())
-            .put(LancePlugin.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.getKey(), "wrapped:body:id:4")
+            .put(LanceSettings.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.getKey(), "wrapped:body:id:4")
             .build();
     }
 

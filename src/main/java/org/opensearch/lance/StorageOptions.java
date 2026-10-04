@@ -514,7 +514,7 @@ public final class StorageOptions {
      * when the group is missing.
      */
     public static StorageOptions fromIndexSettings(Settings settings) {
-        Settings group = LancePlugin.STORAGE_OPTIONS_SETTING.get(settings);
+        Settings group = LanceSettings.STORAGE_OPTIONS_SETTING.get(settings);
         Map<String, String> map = new LinkedHashMap<>();
         for (String key : group.keySet()) {
             map.put(key, group.get(key));

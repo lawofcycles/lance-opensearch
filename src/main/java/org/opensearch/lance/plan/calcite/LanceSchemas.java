@@ -12,7 +12,7 @@ import org.lance.Dataset;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.lance.LanceMappingMeta;
-import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
@@ -261,16 +261,16 @@ public final class LanceSchemas {
         Settings settings = indexMetadata.getSettings();
         String tableUri = LanceEngineFactory.tableOf(settings);
         StorageOptions storageOptions = StorageOptions.fromIndexSettings(settings);
-        long pinnedVersion = LancePlugin.VERSION_SETTING.get(settings);
-        String tag = LancePlugin.TAG_SETTING.get(settings);
+        long pinnedVersion = LanceSettings.VERSION_SETTING.get(settings);
+        String tag = LanceSettings.TAG_SETTING.get(settings);
         if (pinnedVersion < 0 && !tag.isEmpty()) {
             pinnedVersion = LanceRegistry.resolveTagVersion(tableUri, storageOptions, tag);
         }
         Optional<Long> version = pinnedVersion >= 0 ? Optional.of(pinnedVersion) : Optional.empty();
-        String pkField = LancePlugin.PRIMARY_KEY_FIELD_SETTING.get(settings);
+        String pkField = LanceSettings.PRIMARY_KEY_FIELD_SETTING.get(settings);
         LancePrimaryKeyType pkType = pkField.isEmpty()
             ? LancePrimaryKeyType.NONE
-            : LancePrimaryKeyType.fromSetting(LancePlugin.PRIMARY_KEY_TYPE_SETTING.get(settings));
+            : LancePrimaryKeyType.fromSetting(LanceSettings.PRIMARY_KEY_TYPE_SETTING.get(settings));
         LanceOverrides overrides = LanceOverrides.of(settings);
         Map<String, LinkedHashMap<String, String>> multiFields = overrides.subFields();
         Map<String, String> renamedFields = new LinkedHashMap<>();

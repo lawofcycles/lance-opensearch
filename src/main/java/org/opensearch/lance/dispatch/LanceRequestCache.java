@@ -35,6 +35,8 @@ import org.opensearch.common.cache.Cache;
 import org.opensearch.common.cache.CacheBuilder;
 import org.opensearch.common.cache.RemovalReason;
 import org.opensearch.common.io.stream.BytesStreamOutput;
+import org.opensearch.common.settings.ClusterSettings;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.common.xcontent.XContentType;
@@ -43,6 +45,7 @@ import org.opensearch.core.index.Index;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.plan.explain.ReaderWrapperProbe;
 import org.opensearch.lance.stats.LanceNodeStats;
 import org.opensearch.search.SearchHit;
@@ -302,6 +305,26 @@ public final class LanceRequestCache implements ClusterStateListener {
 
     /** The wall clock in milliseconds: {@code System.currentTimeMillis} outside tests. */
     private final LongSupplier clock;
+
+    /**
+     * The coordinator's cache, sized and switched by the
+     * {@code plugins.lance.request_cache.*} settings, registered for the
+     * dynamic updates of {@link LanceSettings#REQUEST_CACHE_ENABLED_SETTING}
+     * and {@link LanceSettings#REQUEST_CACHE_EXPIRE_SETTING}. The caller
+     * adds the cache as a cluster state listener; that registration is
+     * paired with its removal at close.
+     */
+    public static LanceRequestCache fromSettings(Settings settings, ClusterSettings clusterSettings) {
+        LanceRequestCache cache = new LanceRequestCache(
+            LanceSettings.REQUEST_CACHE_SIZE_SETTING.get(settings).getBytes(),
+            LanceSettings.REQUEST_CACHE_MAX_ENTRY_SIZE_SETTING.get(settings).getBytes(),
+            LanceSettings.REQUEST_CACHE_ENABLED_SETTING.get(settings),
+            LanceSettings.REQUEST_CACHE_EXPIRE_SETTING.get(settings)
+        );
+        clusterSettings.addSettingsUpdateConsumer(LanceSettings.REQUEST_CACHE_ENABLED_SETTING, cache::setEnabled);
+        clusterSettings.addSettingsUpdateConsumer(LanceSettings.REQUEST_CACHE_EXPIRE_SETTING, cache::setExpire);
+        return cache;
+    }
 
     /**
      * @param limitBytes the most the entries may weigh together

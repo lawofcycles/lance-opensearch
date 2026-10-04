@@ -32,7 +32,7 @@ import org.opensearch.index.IndexService;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LanceOverrides;
-import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.engine.FetchTakeStats;
 import org.opensearch.lance.engine.FragmentGroupScan;
 import org.opensearch.lance.engine.LanceCancellation;
@@ -152,10 +152,10 @@ public final class TransportLanceFragmentFetchAction extends HandledTransportAct
         if (indexMetadata == null) {
             throw new IllegalStateException("Fragment path cannot resolve OpenSearch index [" + request.indexName() + "] on this node");
         }
-        String pkField = LancePlugin.PRIMARY_KEY_FIELD_SETTING.get(indexMetadata.getSettings());
+        String pkField = LanceSettings.PRIMARY_KEY_FIELD_SETTING.get(indexMetadata.getSettings());
         LancePrimaryKeyType pkType = pkField.isEmpty()
             ? LancePrimaryKeyType.NONE
-            : LancePrimaryKeyType.fromSetting(LancePlugin.PRIMARY_KEY_TYPE_SETTING.get(indexMetadata.getSettings()));
+            : LancePrimaryKeyType.fromSetting(LanceSettings.PRIMARY_KEY_TYPE_SETTING.get(indexMetadata.getSettings()));
         LanceOverrides overrides = LanceOverrides.of(indexMetadata.getSettings());
         // The fragments the addresses name, in address order: the reader
         // is opened over those alone.
@@ -200,7 +200,7 @@ public final class TransportLanceFragmentFetchAction extends HandledTransportAct
             .resolveReaderWrapper(indexService);
         FragmentGroupScan groupScan = new FragmentGroupScan(
             intraRequestExecutor,
-            clusterService.getClusterSettings().get(LancePlugin.FRAGMENT_PATH_PARALLELISM_SETTING),
+            clusterService.getClusterSettings().get(LanceSettings.FRAGMENT_PATH_PARALLELISM_SETTING),
             cancellation
         );
         try (

@@ -15,7 +15,7 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryRewriteContext;
 import org.opensearch.index.query.Rewriteable;
 import org.opensearch.indices.IndicesService;
-import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.plan.calcite.LancePlannerFactory;
 import org.opensearch.lance.plan.calcite.LanceSchemas;
@@ -161,10 +161,10 @@ public final class RequestPlanner {
             Math.max(1, dataNodes),
             tableUri,
             NativeMemoryLimit.availableCpus(),
-            clusterSettings.get(LancePlugin.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING),
-            clusterSettings.get(LancePlugin.FRAGMENT_PATH_SLICES_SETTING),
-            clusterSettings.get(LancePlugin.AGGREGATION_PUSHDOWN_SETTING),
-            clusterSettings.get(LancePlugin.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING)
+            clusterSettings.get(LanceSettings.AGGREGATION_PUSHDOWN_PARALLELISM_SETTING),
+            clusterSettings.get(LanceSettings.FRAGMENT_PATH_SLICES_SETTING),
+            clusterSettings.get(LanceSettings.AGGREGATION_PUSHDOWN_SETTING),
+            clusterSettings.get(LanceSettings.AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING)
         );
     }
 

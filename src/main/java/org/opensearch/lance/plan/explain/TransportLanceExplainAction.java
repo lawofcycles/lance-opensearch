@@ -22,6 +22,7 @@ import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LanceMappingMeta;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.dispatch.LanceRequestCache;
 import org.opensearch.lance.engine.LanceEngineFactory;
@@ -143,8 +144,8 @@ public final class TransportLanceExplainAction extends HandledTransportAction<La
         this.warmCache = warmCache;
         this.requestCache = requestCache;
         long nativeBudgetBytes = NativeMemoryLimit.parse(
-            LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.get(settings),
-            LancePlugin.NATIVE_MEMORY_LIMIT_SETTING.getKey()
+            LanceSettings.NATIVE_MEMORY_LIMIT_SETTING.get(settings),
+            LanceSettings.NATIVE_MEMORY_LIMIT_SETTING.getKey()
         );
         this.plannerFactory = new LancePlannerFactory(nativeBudgetBytes, Runtime.getRuntime().maxMemory());
     }

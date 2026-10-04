@@ -52,7 +52,7 @@ import org.opensearch.index.engine.SegmentsStats;
 import org.opensearch.index.shard.DocsStats;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LanceOverrides;
-import org.opensearch.lance.LancePlugin;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.plan.explain.ReaderWrapperProbe;
@@ -165,7 +165,7 @@ public final class LanceEngineFactory implements EngineFactory {
      * {@code Setting} objects in {@code LancePlugin} with the deprecated
      * {@code index.lance.*} keys of the first preview releases as their
      * fallbacks, so the code reads the settings through those objects
-     * ({@link org.opensearch.lance.LancePlugin#TABLE_SETTING} and its
+     * ({@link org.opensearch.lance.LanceSettings#TABLE_SETTING} and its
      * siblings) and an index created under the old keys keeps opening.
      */
     public static final String TABLE_SETTING = "index.plugins.lance.table";
@@ -239,7 +239,7 @@ public final class LanceEngineFactory implements EngineFactory {
      * under the current key or under the deprecated one.
      */
     public static boolean isLanceIndex(Settings settings) {
-        return LancePlugin.TABLE_SETTING.existsOrFallbackExists(settings);
+        return LanceSettings.TABLE_SETTING.existsOrFallbackExists(settings);
     }
 
     /**
@@ -247,7 +247,7 @@ public final class LanceEngineFactory implements EngineFactory {
      * set no table under the current key or the deprecated one.
      */
     public static String tableOf(Settings settings) {
-        return isLanceIndex(settings) ? LancePlugin.TABLE_SETTING.get(settings) : null;
+        return isLanceIndex(settings) ? LanceSettings.TABLE_SETTING.get(settings) : null;
     }
 
     /**
@@ -327,8 +327,8 @@ public final class LanceEngineFactory implements EngineFactory {
 
     @Override
     public Engine newReadWriteEngine(EngineConfig config) {
-        String table = LancePlugin.TABLE_SETTING.get(config.getIndexSettings().getSettings());
-        String field = LancePlugin.PRIMARY_KEY_FIELD_SETTING.get(config.getIndexSettings().getSettings());
+        String table = LanceSettings.TABLE_SETTING.get(config.getIndexSettings().getSettings());
+        String field = LanceSettings.PRIMARY_KEY_FIELD_SETTING.get(config.getIndexSettings().getSettings());
         // Empty field name overrides whatever the type setting says: no PK
         // means no lookup, no _id materialisation from a column, and the
         // reader will synthesise "<fragment>-<offset>" instead. Callers that
@@ -337,11 +337,11 @@ public final class LanceEngineFactory implements EngineFactory {
         // and another the type.
         LancePrimaryKeyType pkType = field.isEmpty()
             ? LancePrimaryKeyType.NONE
-            : LancePrimaryKeyType.fromSetting(LancePlugin.PRIMARY_KEY_TYPE_SETTING.get(config.getIndexSettings().getSettings()));
+            : LancePrimaryKeyType.fromSetting(LanceSettings.PRIMARY_KEY_TYPE_SETTING.get(config.getIndexSettings().getSettings()));
         int shardId = config.getShardId().id();
-        long versionSetting = LancePlugin.VERSION_SETTING.get(config.getIndexSettings().getSettings());
+        long versionSetting = LanceSettings.VERSION_SETTING.get(config.getIndexSettings().getSettings());
         Optional<Long> pinnedVersion = versionSetting >= 0 ? Optional.of(versionSetting) : Optional.empty();
-        String tagSetting = LancePlugin.TAG_SETTING.get(config.getIndexSettings().getSettings());
+        String tagSetting = LanceSettings.TAG_SETTING.get(config.getIndexSettings().getSettings());
         String tag = tagSetting.isEmpty() ? null : tagSetting;
         StorageOptions storageOptions = StorageOptions.fromIndexSettings(config.getIndexSettings().getSettings());
         String indexUuid = config.getIndexSettings().getIndex().getUUID();
@@ -549,7 +549,7 @@ public final class LanceEngineFactory implements EngineFactory {
          * value captured at engine open.
          */
         String currentTag() {
-            String tagSetting = LancePlugin.TAG_SETTING.get(config().getIndexSettings().getSettings());
+            String tagSetting = LanceSettings.TAG_SETTING.get(config().getIndexSettings().getSettings());
             return tagSetting.isEmpty() ? null : tagSetting;
         }
 

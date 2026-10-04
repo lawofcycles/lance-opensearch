@@ -39,8 +39,11 @@ import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.opensearch.common.settings.ClusterSettings;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.plan.metadata.TableStatisticsCache;
@@ -448,6 +451,40 @@ public final class LanceWarmCache implements Closeable {
 
     /** How long {@link #close} waits for the requests that still hold a lease before their datasets are closed under them. */
     static final long CLOSE_WAIT_MILLIS = 60_000L;
+
+    /**
+     * The node's cache as the plugin builds it: the column store gets
+     * {@code columnCacheBytes} of the native memory budget, the snapshot
+     * count and the enabled flag come from the
+     * {@code plugins.lance.cache.*} settings, the statistics collection
+     * delay from {@link LanceSettings#TEST_STATISTICS_COLLECT_DELAY_SETTING},
+     * and the cache registers for the dynamic updates of the enabled flag
+     * and the delay.
+     */
+    public static LanceWarmCache fromSettings(
+        Settings settings,
+        ClusterSettings clusterSettings,
+        BufferAllocator allocator,
+        long columnCacheBytes,
+        Executor executor,
+        LanceFetchCache fetchCache
+    ) {
+        LanceWarmCache cache = new LanceWarmCache(
+            allocator,
+            columnCacheBytes,
+            LanceSettings.CACHE_MAX_SNAPSHOTS_SETTING.get(settings),
+            LanceSettings.CACHE_ENABLED_SETTING.get(settings),
+            executor,
+            fetchCache
+        );
+        clusterSettings.addSettingsUpdateConsumer(LanceSettings.CACHE_ENABLED_SETTING, cache::setEnabled);
+        cache.tableStatistics().setCollectDelayMillis(LanceSettings.TEST_STATISTICS_COLLECT_DELAY_SETTING.get(settings).millis());
+        clusterSettings.addSettingsUpdateConsumer(
+            LanceSettings.TEST_STATISTICS_COLLECT_DELAY_SETTING,
+            delay -> cache.tableStatistics().setCollectDelayMillis(delay.millis())
+        );
+        return cache;
+    }
 
     /**
      * A cache whose table statistics are collected, and whose fetch cache

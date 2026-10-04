@@ -38,9 +38,12 @@ import org.lance.Fragment;
 import org.lance.ipc.FullTextQuery;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.opensearch.common.settings.ClusterSettings;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.lance.LanceCircuitBreaker;
+import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.engine.LanceCancellation;
 import org.opensearch.lance.engine.LanceFragmentLeafReader;
 
@@ -93,6 +96,19 @@ public final class LanceFtsQuery extends Query {
     private static volatile int subsetProbeLimit = DEFAULT_SUBSET_PROBE_LIMIT;
     private static volatile double subsetProbeRatio = DEFAULT_SUBSET_PROBE_RATIO;
     private static volatile int subsetProbeMinRows = DEFAULT_SUBSET_PROBE_MIN_ROWS;
+
+    /**
+     * Read the three probe parameters from the node settings and register
+     * for their dynamic updates. Called once by the plugin at start.
+     */
+    public static void bindSettings(Settings settings, ClusterSettings clusterSettings) {
+        setSubsetProbeLimit(LanceSettings.FTS_SUBSET_PROBE_LIMIT_SETTING.get(settings));
+        clusterSettings.addSettingsUpdateConsumer(LanceSettings.FTS_SUBSET_PROBE_LIMIT_SETTING, LanceFtsQuery::setSubsetProbeLimit);
+        setSubsetProbeRatio(LanceSettings.FTS_SUBSET_PROBE_RATIO_SETTING.get(settings));
+        clusterSettings.addSettingsUpdateConsumer(LanceSettings.FTS_SUBSET_PROBE_RATIO_SETTING, LanceFtsQuery::setSubsetProbeRatio);
+        setSubsetProbeMinRows(LanceSettings.FTS_SUBSET_PROBE_MIN_ROWS_SETTING.get(settings));
+        clusterSettings.addSettingsUpdateConsumer(LanceSettings.FTS_SUBSET_PROBE_MIN_ROWS_SETTING, LanceFtsQuery::setSubsetProbeMinRows);
+    }
 
     /** Current value of the {@code plugins.lance.fts.subset_probe_limit} setting. */
     public static int subsetProbeLimit() {
