@@ -132,4 +132,18 @@ public class LanceRegistryTests extends OpenSearchTestCase {
             assertNotNull("Lance always attaches some Session to a Dataset", dataset.session());
         }
     }
+
+    public void testOpenDatasetAtRejectsANegativeVersion() throws Exception {
+        // -1 is how pinnedVersion() and the index setting spell "no
+        // version"; a caller that forwards it instead of switching to
+        // openDataset is told so here, before Lance sees the request.
+        Path scratch = createTempDir();
+        String uri = LanceTableFactory.writeTable(scratch, "negative", 1);
+
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> LanceRegistry.openDatasetAt(uri, StorageOptions.empty(), -1L)
+        );
+        assertEquals("version must be non negative, got [-1]", e.getMessage());
+    }
 }

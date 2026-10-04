@@ -170,8 +170,16 @@ public final class LanceRegistry {
      * {@code ReadOptions} rather than round-tripping through
      * {@link StorageOptions#toReadOptionsOrNull} (which would drop
      * the version silently).
+     *
+     * @throws IllegalArgumentException when {@code version} is negative;
+     *         Lance manifest versions start at 1, and {@code -1} is the
+     *         "no version" encoding of {@code index.plugins.lance.version},
+     *         which belongs to {@link #openDataset(String, StorageOptions)}
      */
     public static Dataset openDatasetAt(String uri, StorageOptions storageOptions, long version) {
+        if (version < 0) {
+            throw new IllegalArgumentException("version must be non negative, got [" + version + "]");
+        }
         return open(uri, storageOptions, version);
     }
 
