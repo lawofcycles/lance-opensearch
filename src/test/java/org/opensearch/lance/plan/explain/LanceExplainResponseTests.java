@@ -22,11 +22,13 @@ import org.opensearch.lance.WireVersion;
 import org.opensearch.lance.plan.execute.FragmentPlan;
 import org.opensearch.lance.plan.execute.FragmentPlanRefiner;
 import org.opensearch.lance.plan.rel.MetricSpec;
+import org.opensearch.lance.plan.rel.PushedOperation.PushedFts;
 import org.opensearch.lance.plan.traits.Accuracy;
 import org.opensearch.lance.plan.traits.PlanRequirement;
 import org.opensearch.lance.plan.traits.TieStability;
 import org.opensearch.lance.plan.traits.TraitEnforcement;
 import org.opensearch.lance.query.LanceKnnQueryBuilder;
+import org.opensearch.lance.query.LanceMatchQueryBuilder;
 import org.opensearch.search.SearchModule;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -100,10 +102,12 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
             null,
             List.of(FragmentPlanRefiner.Reason.SORT_FIELD_TYPE),
             NO_DEMAND,
-            LanceExplainResponse.Cacheability.no("size > 0")
+            LanceExplainResponse.Cacheability.no("size > 0"),
+            null
         );
         assertEquals(response, roundTrip(response));
         assertEquals(LanceExplainResponse.Route.FRAGMENT, response.route());
+        assertNull("a knn clause has no full text index word", response.ftsIndex());
 
         Map<String, Object> json = json(response);
         assertEquals("demo", json.get("index"));
@@ -117,6 +121,7 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
         assertEquals("PUSHED_SCAN", fragmentPlan.get("kind"));
         assertEquals("rating >= 500", fragmentPlan.get("filter_sql"));
         assertEquals("lance_knn", fragmentPlan.get("lance_clause"));
+        assertFalse("no full text clause, no fts_index: " + fragmentPlan, fragmentPlan.containsKey("fts_index"));
         assertFalse(fragmentPlan.containsKey("aggregate"));
         Map<String, Object> topK = object(fragmentPlan, "top_k");
         assertEquals(5, topK.get("fetch"));
@@ -140,7 +145,8 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
             null,
             List.of(),
             NO_DEMAND,
-            LanceExplainResponse.Cacheability.YES
+            LanceExplainResponse.Cacheability.YES,
+            null
         );
         assertEquals(response, roundTrip(response));
         Map<String, Object> json = json(response);
@@ -169,7 +175,8 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
             // Given out of order: the response sorts the reasons.
             List.of(FragmentPlanRefiner.Reason.SORT_FIELD_TYPE, FragmentPlanRefiner.Reason.SECURITY_WRAPPER),
             NO_DEMAND,
-            LanceExplainResponse.Cacheability.no("dls")
+            LanceExplainResponse.Cacheability.no("dls"),
+            null
         );
         assertEquals(response, roundTrip(response));
         Map<String, Object> json = json(response);
@@ -222,7 +229,8 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
             null,
             List.of(),
             traits,
-            LanceExplainResponse.Cacheability.YES
+            LanceExplainResponse.Cacheability.YES,
+            null
         );
         LanceExplainResponse read = roundTrip(response);
         assertEquals(response, read);
@@ -297,7 +305,7 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
 
     public void testMixedPluginVersionAVersion2AnswerHasNoCacheability() throws IOException {
         // The stream a version 2 node writes: today's base fields and no
-        // block; the cacheability falls back to absent.
+        // block; the cacheability and the index word fall back to absent.
         LanceExplainResponse today = LanceExplainResponse.fragment(
             "demo",
             "logical",
@@ -306,13 +314,15 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
             null,
             List.of(),
             NO_DEMAND,
-            LanceExplainResponse.Cacheability.YES
+            LanceExplainResponse.Cacheability.YES,
+            PushedFts.INDEX_INVERTED
         );
         try (BytesStreamOutput out = new BytesStreamOutput(); BytesStreamOutput written = new BytesStreamOutput()) {
             today.writeTo(written);
             int blockBytes;
             try (BytesStreamOutput block = new BytesStreamOutput()) {
                 WireVersion.writeBlock(block, false, o -> o.writeOptionalWriteable(LanceExplainResponse.Cacheability.YES));
+                WireVersion.writeBlock(block, false, o -> o.writeOptionalString(PushedFts.INDEX_INVERTED));
                 blockBytes = block.bytes().length();
             }
             try (StreamInput in = written.bytes().streamInput()) {
@@ -323,8 +333,88 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
             }
             LanceExplainResponse asVersion2 = read(out);
             assertNull(asVersion2.cacheability());
+            assertNull(asVersion2.ftsIndex());
             assertEquals(today.fragmentPlan(), asVersion2.fragmentPlan());
             assertEquals(today.traits(), asVersion2.traits());
+        }
+    }
+
+    public void testFtsIndexRoundTripsAndRendersInsideTheFragmentPlan() throws IOException {
+        FragmentPlan plan = new FragmentPlan(
+            FragmentPlan.Kind.PUSHED_SCAN,
+            null,
+            new LanceMatchQueryBuilder("body", "hello"),
+            new FragmentPlan.TopK(List.of(), 10, null),
+            null
+        );
+        for (String word : List.of(PushedFts.INDEX_INVERTED, PushedFts.INDEX_NONE, PushedFts.INDEX_MIXED)) {
+            LanceExplainResponse response = LanceExplainResponse.fragment(
+                "demo",
+                "logical",
+                "physical",
+                plan,
+                null,
+                List.of(),
+                NO_DEMAND,
+                LanceExplainResponse.Cacheability.no("size > 0"),
+                word
+            );
+            LanceExplainResponse read = roundTrip(response);
+            assertEquals(response, read);
+            assertEquals(word, read.ftsIndex());
+            Map<String, Object> fragmentPlan = object(json(response), "fragment_plan");
+            assertEquals("lance_match", fragmentPlan.get("lance_clause"));
+            assertEquals("the word sits next to the clause: " + fragmentPlan, word, fragmentPlan.get("fts_index"));
+        }
+        // The plan's own JSON, as the executor would log it, carries no
+        // word: the explain response hands it in at rendering time.
+        try (XContentBuilder builder = XContentBuilder.builder(XContentType.JSON.xContent())) {
+            plan.toXContent(builder, ToXContent.EMPTY_PARAMS);
+            Map<String, Object> alone = XContentHelper.convertToMap(BytesReference.bytes(builder), true, XContentType.JSON).v2();
+            assertFalse("no param, no fts_index: " + alone, alone.containsKey("fts_index"));
+        }
+        assertEquals("the wire of the plan did not change", 3, FragmentPlan.WIRE_VERSION);
+    }
+
+    public void testMixedPluginVersionAVersion3CoordinatorReadsTodaysAnswerWithoutTheFtsIndex() throws IOException {
+        // Today's writer, read as a version 3 node does: the base fields
+        // and the cacheability block it knows, then the walk over the
+        // index word block it does not.
+        LanceExplainResponse today = LanceExplainResponse.fragment(
+            "demo",
+            "logical",
+            "physical",
+            FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_TOPK, "rating = 5"),
+            null,
+            List.of(),
+            NO_DEMAND,
+            LanceExplainResponse.Cacheability.no("size > 0"),
+            PushedFts.INDEX_NONE
+        );
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            today.writeTo(out);
+            try (
+                StreamInput raw = out.bytes().streamInput();
+                NamedWriteableAwareStreamInput in = new NamedWriteableAwareStreamInput(raw, REGISTRY)
+            ) {
+                WireVersion.Reader reader = WireVersion.read(in, "LanceExplainResponse", 3, 2);
+                assertEquals(LanceExplainResponse.WIRE_VERSION, reader.marker());
+                assertEquals("demo", in.readString());
+                assertEquals(LanceExplainResponse.Route.FRAGMENT, in.readEnum(LanceExplainResponse.Route.class));
+                assertEquals("logical", in.readOptionalString());
+                assertEquals("physical", in.readOptionalString());
+                assertEquals(today.fragmentPlan(), in.readOptionalWriteable(FragmentPlan::new));
+                assertNull(in.readOptionalString());
+                assertEquals(List.of(), in.readList(input -> input.readEnum(FragmentPlanRefiner.Reason.class)));
+                assertTrue(in.readBoolean());
+                assertEquals(today.traits(), LanceExplainResponse.Traits.read(in));
+                assertEquals(
+                    LanceExplainResponse.Cacheability.no("size > 0"),
+                    reader.block(3, block -> block.readOptionalWriteable(LanceExplainResponse.Cacheability::new), null)
+                );
+                reader.finish();
+                assertEquals("the version 3 reader stepped over the index word block", -1, in.read());
+            }
         }
     }
 
@@ -341,7 +431,8 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
             "collapse",
             List.of(FragmentPlanRefiner.Reason.SORT_FIELD_TYPE),
             NO_DEMAND,
-            LanceExplainResponse.Cacheability.no("size > 0")
+            LanceExplainResponse.Cacheability.no("size > 0"),
+            null
         );
         try (BytesStreamOutput out = new BytesStreamOutput()) {
             today.writeTo(out);

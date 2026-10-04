@@ -10,6 +10,7 @@ import org.apache.calcite.rex.RexNode;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 
 import org.lance.ipc.ColumnOrdering;
 
@@ -98,21 +99,101 @@ public sealed interface PushedOperation permits PushedOperation.PushedAggregate,
     /**
      * A full text match pushed into the scan: the {@link LanceFtsMatch}
      * the scan replaced (whose builder the executor turns into the
-     * Lance {@code FullTextQuery}) and the SQL of the scalar filter the
+     * Lance {@code FullTextQuery}), the SQL of the scalar filter the
      * scan evaluates as a Lance prefilter before the inverted-index
-     * lookup, or null when the shape carries no filter. The row type
-     * gains the {@code _score} column.
+     * lookup, or null when the shape carries no filter, and the
+     * table's columns that carry an inverted index, or null when the
+     * planner's model does not know them. The row type gains the
+     * {@code _score} column.
+     *
+     * <p>A searched column without an inverted index is scanned by
+     * Lance's flat BM25 path, whose time and memory grow with the row
+     * count, where an indexed column is answered from the index; the
+     * explain output names which one every searched column takes
+     * ({@link #indexSummary()}) so an operator can tell the two apart.
      */
-    record PushedFts(LanceFtsMatch fts, String filterSql) implements PushedOperation {
+    record PushedFts(LanceFtsMatch fts, String filterSql, Set<String> indexedColumns) implements PushedOperation {
+
+        /** The {@code fts_index} value and the {@code index=} term of a clause whose columns all carry an inverted index. */
+        public static final String INDEX_INVERTED = "inverted";
+        /** The {@code fts_index} value and the {@code index=} term of a clause none of whose columns carries an inverted index. */
+        public static final String INDEX_NONE = "none";
+        /** The {@code fts_index} value of a clause whose columns split between the two. */
+        public static final String INDEX_MIXED = "mixed";
 
         public PushedFts {
             Objects.requireNonNull(fts, "fts");
+            indexedColumns = indexedColumns == null ? null : Set.copyOf(indexedColumns);
+        }
+
+        /** A pushed match whose model does not know which columns carry an index. */
+        public PushedFts(LanceFtsMatch fts, String filterSql) {
+            this(fts, filterSql, null);
+        }
+
+        /** Whether the model knew the table's indexed columns when the match was pushed. */
+        public boolean indexKnown() {
+            return indexedColumns != null;
+        }
+
+        /** Whether {@code column} is answered from an inverted index; false when the model does not know. */
+        public boolean indexed(String column) {
+            return indexedColumns != null && indexedColumns.contains(column);
         }
 
         /**
-         * Prints every FTS parameter and the filter SQL, so the digest
-         * of two scans with different pushed operations differs and
-         * the explain output names what was pushed.
+         * One word for the {@code fts_index} key of the explain
+         * endpoint's {@code fragment_plan}: {@link #INDEX_INVERTED} when
+         * every searched column carries an inverted index,
+         * {@link #INDEX_NONE} when none does, {@link #INDEX_MIXED} when
+         * they split, null when the model does not know.
+         */
+        public String indexSummary() {
+            if (indexedColumns == null) {
+                return null;
+            }
+            int indexed = 0;
+            for (String column : fts.columns()) {
+                if (indexedColumns.contains(column)) {
+                    indexed++;
+                }
+            }
+            if (indexed == fts.columns().size()) {
+                return INDEX_INVERTED;
+            }
+            return indexed == 0 ? INDEX_NONE : INDEX_MIXED;
+        }
+
+        /**
+         * The {@code index=} term of {@link #toString}: the summary when
+         * every column agrees, else every column with its own word in
+         * declaration order ({@code [body=inverted, title=none]}); empty
+         * when the model does not know.
+         */
+        String indexTerm() {
+            String summary = indexSummary();
+            if (summary == null) {
+                return "";
+            }
+            if (!INDEX_MIXED.equals(summary)) {
+                return ", index=" + summary;
+            }
+            StringBuilder sb = new StringBuilder(", index=[");
+            for (int i = 0; i < fts.columns().size(); i++) {
+                String column = fts.columns().get(i);
+                if (i > 0) {
+                    sb.append(", ");
+                }
+                sb.append(column).append('=').append(indexedColumns.contains(column) ? INDEX_INVERTED : INDEX_NONE);
+            }
+            return sb.append(']').toString();
+        }
+
+        /**
+         * Prints every FTS parameter, whether each searched column is
+         * answered from an inverted index, and the filter SQL, so the
+         * digest of two scans with different pushed operations differs
+         * and the explain output names what was pushed and how it runs.
          */
         @Override
         public String toString() {
@@ -120,6 +201,7 @@ public sealed interface PushedOperation permits PushedOperation.PushedAggregate,
                 + fts.kind()
                 + ", columns="
                 + fts.columns()
+                + indexTerm()
                 + ", query="
                 + fts.queryJson()
                 + (filterSql == null ? "" : ", filter=" + filterSql)

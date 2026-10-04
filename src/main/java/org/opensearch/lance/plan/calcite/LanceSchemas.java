@@ -122,7 +122,7 @@ public final class LanceSchemas {
         Set<String> dateOverrideColumns,
         LongSupplier rowCount
     ) {
-        return model(indexName, arrowSchema, multiFields, renamedFields, primaryKeyField, dateOverrideColumns, rowCount, null);
+        return model(indexName, arrowSchema, multiFields, renamedFields, primaryKeyField, dateOverrideColumns, rowCount, null, null);
     }
 
     /**
@@ -139,6 +139,26 @@ public final class LanceSchemas {
         Set<String> dateOverrideColumns,
         TableStatistics statistics
     ) {
+        return model(indexName, arrowSchema, multiFields, renamedFields, primaryKeyField, dateOverrideColumns, statistics, null);
+    }
+
+    /**
+     * {@link #model(String, Schema, Map, Map, String, Set, TableStatistics)}
+     * with the Utf8 columns that carry an inverted index
+     * ({@code ftsIndexedColumns}, the snapshot's; null when unknown), so
+     * a pushed full text match can say whether each searched column is
+     * answered from the index or by Lance's flat scan.
+     */
+    public static IndexModel model(
+        String indexName,
+        Schema arrowSchema,
+        Map<String, LinkedHashMap<String, String>> multiFields,
+        Map<String, String> renamedFields,
+        String primaryKeyField,
+        Set<String> dateOverrideColumns,
+        TableStatistics statistics,
+        Set<String> ftsIndexedColumns
+    ) {
         return model(
             indexName,
             arrowSchema,
@@ -147,7 +167,36 @@ public final class LanceSchemas {
             primaryKeyField,
             dateOverrideColumns,
             statistics::rowCount,
-            () -> statistics
+            () -> statistics,
+            ftsIndexedColumns
+        );
+    }
+
+    /**
+     * {@link #model(String, Schema, Map, Map, String, Set, LongSupplier)}
+     * with the Utf8 columns that carry an inverted index
+     * ({@code ftsIndexedColumns}, the snapshot's; null when unknown).
+     */
+    public static IndexModel model(
+        String indexName,
+        Schema arrowSchema,
+        Map<String, LinkedHashMap<String, String>> multiFields,
+        Map<String, String> renamedFields,
+        String primaryKeyField,
+        Set<String> dateOverrideColumns,
+        LongSupplier rowCount,
+        Set<String> ftsIndexedColumns
+    ) {
+        return model(
+            indexName,
+            arrowSchema,
+            multiFields,
+            renamedFields,
+            primaryKeyField,
+            dateOverrideColumns,
+            rowCount,
+            null,
+            ftsIndexedColumns
         );
     }
 
@@ -159,9 +208,10 @@ public final class LanceSchemas {
         String primaryKeyField,
         Set<String> dateOverrideColumns,
         LongSupplier rowCount,
-        Supplier<TableStatistics> statistics
+        Supplier<TableStatistics> statistics,
+        Set<String> ftsIndexedColumns
     ) {
-        LanceTable table = new LanceTable(indexName, arrowSchema, rowCount, statistics);
+        LanceTable table = new LanceTable(indexName, arrowSchema, rowCount, statistics, ftsIndexedColumns);
         return new IndexModel(
             indexName,
             arrowSchema,
@@ -241,6 +291,11 @@ public final class LanceSchemas {
             Dataset dataset = lease.snapshot().dataset();
             Schema arrowSchema = dataset.getSchema();
             long snapshotVersion = lease.snapshot().version();
+            // The columns whose inverted index the snapshot resolved when
+            // it opened, the same set the executors' admission gate
+            // splits a full text clause by; the pushed match reports
+            // them in the explain output.
+            Set<String> ftsIndexedColumns = lease.snapshot().ftsColumns();
             // The collection the cache starts on a miss opens the table
             // on its own: the snapshot's dataset closes with the
             // snapshot.
@@ -256,7 +311,16 @@ public final class LanceSchemas {
                 } catch (RuntimeException e) {
                     LOGGER.warn("zone maps of [{}] unavailable, planning without pruning", indexName, e);
                 }
-                return model(indexName, arrowSchema, multiFields, renamedFields, pkField, overrides.dateColumns().keySet(), statistics);
+                return model(
+                    indexName,
+                    arrowSchema,
+                    multiFields,
+                    renamedFields,
+                    pkField,
+                    overrides.dateColumns().keySet(),
+                    statistics,
+                    ftsIndexedColumns
+                );
             }
             // The statistics are being collected in the background:
             // this plan reads the fragment row counts instead.
@@ -266,7 +330,16 @@ public final class LanceSchemas {
                 rows += fragmentRows;
             }
             final long total = rows;
-            return model(indexName, arrowSchema, multiFields, renamedFields, pkField, overrides.dateColumns().keySet(), () -> total);
+            return model(
+                indexName,
+                arrowSchema,
+                multiFields,
+                renamedFields,
+                pkField,
+                overrides.dateColumns().keySet(),
+                () -> total,
+                ftsIndexedColumns
+            );
         }
     }
 }

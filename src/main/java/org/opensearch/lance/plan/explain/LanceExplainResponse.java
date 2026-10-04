@@ -10,6 +10,7 @@ import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.common.io.stream.Writeable;
+import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.ToXContentObject;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.WireVersion;
@@ -25,6 +26,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -72,7 +74,8 @@ import java.util.Objects;
  * with a reasons list, and plan texts and traits that were always
  * present; version 2 dropped the list and made those optional for the
  * unsupported route; version 3 added {@code cacheable} as a block an
- * older reader steps over. A reader of this version decodes a version
+ * older reader steps over; version 4 added the full text index word as
+ * another. A reader of this version decodes a version
  * 1 stream by mapping a shard path answer to an unsupported one whose
  * message is {@link #SHARD_PATH_RETIRED}, and reads a fragment answer
  * field by field.
@@ -88,6 +91,15 @@ import java.util.Objects;
  * where nothing runs. The response travels from the node that planned the
  * explain body to the node that received the REST call when they
  * differ.
+ *
+ * <p>{@code fragment_plan.fts_index} says how the pushed full text
+ * clause runs: {@code inverted} when every searched column carries an
+ * inverted index, {@code none} when none does and Lance scans the rows
+ * flat, {@code mixed} when the columns split. It is rendered from
+ * {@link #ftsIndex()} into the fragment plan's JSON
+ * ({@link FragmentPlan#FTS_INDEX_PARAM}) and never travels in the
+ * {@link FragmentPlan} itself: the executor reads the index from its
+ * own snapshot. Absent when the plan pushes no full text clause.
  */
 public final class LanceExplainResponse extends ActionResponse implements ToXContentObject {
 
@@ -96,9 +108,10 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
      * read. Bumped when a field is added; 2 dropped the reasons list of
      * the retired fallback route and made the plan texts and the traits
      * optional for the unsupported route, the last change to the base
-     * fields the format allows; 3 added the cacheability block.
+     * fields the format allows; 3 added the cacheability block; 4 the
+     * full text index word.
      */
-    public static final int WIRE_VERSION = 3;
+    public static final int WIRE_VERSION = 4;
 
     /** The {@code unplanned} message of a shard path answer read from a version 1 stream. */
     public static final String SHARD_PATH_RETIRED =
@@ -244,6 +257,8 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
     private final List<FragmentPlanRefiner.Reason> refinementsPossible;
     private final Traits traits;
     private final Cacheability cacheability;
+    /** The {@code fts_index} word of the pushed full text clause, null when the plan pushes none. */
+    private final String ftsIndex;
 
     /**
      * A fragment route answer.
@@ -252,6 +267,9 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
      * @param refinementsPossible the predicted node local downgrades, empty when none apply
      * @param traits the trait side of the plan
      * @param cacheability whether the result cache would serve the body on a repeat
+     * @param ftsIndex how the pushed full text clause runs
+     *     ({@code inverted}, {@code none}, {@code mixed}), or null when
+     *     the plan pushes no full text clause
      */
     public static LanceExplainResponse fragment(
         String index,
@@ -261,7 +279,8 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         String unplanned,
         List<FragmentPlanRefiner.Reason> refinementsPossible,
         Traits traits,
-        Cacheability cacheability
+        Cacheability cacheability,
+        String ftsIndex
     ) {
         return new LanceExplainResponse(
             index,
@@ -272,7 +291,8 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
             unplanned,
             refinementsPossible,
             Objects.requireNonNull(traits, "traits"),
-            Objects.requireNonNull(cacheability, "cacheability")
+            Objects.requireNonNull(cacheability, "cacheability"),
+            ftsIndex
         );
     }
 
@@ -294,6 +314,7 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
             Objects.requireNonNull(planFailed, "planFailed"),
             List.of(),
             Objects.requireNonNull(traits, "traits"),
+            null,
             null
         );
     }
@@ -313,6 +334,7 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
             Objects.requireNonNull(unplanned, "unplanned"),
             List.of(),
             null,
+            null,
             null
         );
     }
@@ -326,7 +348,8 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         String unplanned,
         List<FragmentPlanRefiner.Reason> refinementsPossible,
         Traits traits,
-        Cacheability cacheability
+        Cacheability cacheability,
+        String ftsIndex
     ) {
         this.index = Objects.requireNonNull(index, "index");
         this.route = Objects.requireNonNull(route, "route");
@@ -337,6 +360,7 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         this.refinementsPossible = inReasonOrder(refinementsPossible);
         this.traits = traits;
         this.cacheability = cacheability;
+        this.ftsIndex = ftsIndex;
     }
 
     /** {@code reasons} sorted in {@link FragmentPlanRefiner.Reason} order, so the array reads the same for every caller. */
@@ -398,6 +422,9 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         // Version 3: the cacheability, absent from an older writer's
         // answer, which had no result cache to report on.
         this.cacheability = reader.block(3, block -> block.readOptionalWriteable(Cacheability::new), null);
+        // Version 4: the full text index word, absent from an older
+        // writer's answer, which did not tell the two paths apart.
+        this.ftsIndex = reader.block(4, StreamInput::readOptionalString, null);
         reader.finish();
     }
 
@@ -418,6 +445,9 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         // An older reader that ignores the cacheability shows the plan
         // without it, so the block is never critical.
         WireVersion.writeBlock(out, false, o -> o.writeOptionalWriteable(cacheability));
+        // Likewise the full text index word: an older reader shows the
+        // plan without it.
+        WireVersion.writeBlock(out, false, o -> o.writeOptionalString(ftsIndex));
     }
 
     public String index() {
@@ -467,6 +497,15 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         return cacheability;
     }
 
+    /**
+     * How the pushed full text clause runs ({@code inverted},
+     * {@code none} or {@code mixed}); null when the plan pushes no full
+     * text clause, on the unsupported route and when the plan failed.
+     */
+    public String ftsIndex() {
+        return ftsIndex;
+    }
+
     @Override
     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
         builder.startObject();
@@ -480,7 +519,10 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
         }
         if (fragmentPlan != null) {
             builder.field("fragment_plan");
-            fragmentPlan.toXContent(builder, params);
+            Params planParams = ftsIndex == null
+                ? params
+                : new ToXContent.DelegatingMapParams(Map.of(FragmentPlan.FTS_INDEX_PARAM, ftsIndex), params);
+            fragmentPlan.toXContent(builder, planParams);
         }
         if (unplanned != null) {
             builder.field("unplanned", unplanned);
@@ -521,11 +563,12 @@ public final class LanceExplainResponse extends ActionResponse implements ToXCon
             && Objects.equals(unplanned, other.unplanned)
             && refinementsPossible.equals(other.refinementsPossible)
             && Objects.equals(traits, other.traits)
-            && Objects.equals(cacheability, other.cacheability);
+            && Objects.equals(cacheability, other.cacheability)
+            && Objects.equals(ftsIndex, other.ftsIndex);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(index, route, logical, physical, fragmentPlan, unplanned, refinementsPossible, traits, cacheability);
+        return Objects.hash(index, route, logical, physical, fragmentPlan, unplanned, refinementsPossible, traits, cacheability, ftsIndex);
     }
 }

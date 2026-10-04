@@ -20,6 +20,7 @@ import org.opensearch.lance.plan.metadata.TableStatistics;
 import org.opensearch.lance.plan.rel.LanceTableScan;
 
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
@@ -45,6 +46,7 @@ public final class LanceTable extends AbstractTable implements TranslatableTable
     private final Schema arrowSchema;
     private final LongSupplier rowCount;
     private final Supplier<TableStatistics> statistics;
+    private final Set<String> ftsIndexedColumns;
 
     /**
      * @param indexName name of the OpenSearch index backed by the Lance table
@@ -64,10 +66,33 @@ public final class LanceTable extends AbstractTable implements TranslatableTable
      *     null when the caller has none
      */
     public LanceTable(String indexName, Schema arrowSchema, LongSupplier rowCount, Supplier<TableStatistics> statistics) {
+        this(indexName, arrowSchema, rowCount, statistics, null);
+    }
+
+    /**
+     * @param indexName name of the OpenSearch index backed by the Lance table
+     * @param arrowSchema Arrow schema of the attached Lance table
+     * @param rowCount supplies the current row count on every read; only
+     *     read when {@code statistics} is null
+     * @param statistics supplies the table statistics on every read, or
+     *     null when the caller has none
+     * @param ftsIndexedColumns the Utf8 columns that carry an inverted
+     *     index at the version the caller read (the snapshot's
+     *     {@code ftsColumns}), or null when the caller does not know
+     *     them
+     */
+    public LanceTable(
+        String indexName,
+        Schema arrowSchema,
+        LongSupplier rowCount,
+        Supplier<TableStatistics> statistics,
+        Set<String> ftsIndexedColumns
+    ) {
         this.indexName = indexName;
         this.arrowSchema = arrowSchema;
         this.rowCount = rowCount;
         this.statistics = statistics;
+        this.ftsIndexedColumns = ftsIndexedColumns == null ? null : Set.copyOf(ftsIndexedColumns);
     }
 
     @Override
@@ -91,6 +116,16 @@ public final class LanceTable extends AbstractTable implements TranslatableTable
      */
     public Optional<TableStatistics> tableStatistics() {
         return statistics == null ? Optional.empty() : Optional.ofNullable(statistics.get());
+    }
+
+    /**
+     * The Utf8 columns that carry an inverted index, for the pushed full
+     * text match to say whether each searched column is answered from
+     * the index or by Lance's flat scan; null when the caller that
+     * built the table did not know them.
+     */
+    public Set<String> ftsIndexedColumns() {
+        return ftsIndexedColumns;
     }
 
     @Override

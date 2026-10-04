@@ -31,6 +31,8 @@ import org.opensearch.lance.plan.calcite.LanceSchemas;
 import org.opensearch.lance.plan.cost.CostInputs;
 import org.opensearch.lance.plan.execute.PlanExecutor;
 import org.opensearch.lance.plan.execute.RequestPlanner;
+import org.opensearch.lance.plan.rel.LanceTableScan;
+import org.opensearch.lance.plan.rel.PushedOperation.PushedFts;
 import org.opensearch.lance.plan.traits.UnmetPlanRequirementException;
 import org.opensearch.lance.plan.translate.QueryToRex;
 import org.opensearch.lance.plan.translate.SearchRequestToRel;
@@ -92,7 +94,12 @@ import java.io.IOException;
  * it declares and the cost the planner charged it, the root the total.
  * The {@code traits} object summarises the same for the plan: what the
  * request demanded, what the root declares and whether the enforcer
- * (the second Volcano pass with the demand on the root) fired.
+ * (the second Volcano pass with the demand on the root) fired. A pushed
+ * full text clause names in both the text ({@code index=inverted},
+ * {@code index=none}) and the fragment plan's JSON ({@code fts_index})
+ * whether its columns carry an inverted index, read off the snapshot
+ * the model was built from ({@link LanceWarmCache.Snapshot#ftsColumns()}),
+ * the same set the executors' admission gate splits the clause by.
  *
  * <p>Threading: the cluster state lookup runs wherever the request
  * arrives; the model build and the planning are handed to the plugin's
@@ -209,8 +216,29 @@ public final class TransportLanceExplainAction extends HandledTransportAction<La
             planned.unplanned(),
             ExplainRefinements.predict(planned.plan(), readerWrapper, overrides.ipColumns()),
             LanceExplainResponse.Traits.of(planned.enforcement(), coordinatorPlan.getTraitSet()),
-            cacheSkip == null ? LanceExplainResponse.Cacheability.YES : LanceExplainResponse.Cacheability.no(cacheSkip.reason())
+            cacheSkip == null ? LanceExplainResponse.Cacheability.YES : LanceExplainResponse.Cacheability.no(cacheSkip.reason()),
+            ftsIndexOf(planned.perNode())
         );
+    }
+
+    /**
+     * The {@code fts_index} word of the full text clause {@code plan}
+     * pushes into its scan ({@link PushedFts#indexSummary()}), read off
+     * the model's snapshot when the match was pushed; null when no scan
+     * of the tree carries one. The tree holds one scan, so the first
+     * found is the one.
+     */
+    static String ftsIndexOf(RelNode plan) {
+        if (plan instanceof LanceTableScan scan) {
+            return scan.pushedFts().map(PushedFts::indexSummary).orElse(null);
+        }
+        for (RelNode input : plan.getInputs()) {
+            String word = ftsIndexOf(input);
+            if (word != null) {
+                return word;
+            }
+        }
+        return null;
     }
 
     /** The data nodes a search would fan out to, at least one so a cluster without them still explains. */
