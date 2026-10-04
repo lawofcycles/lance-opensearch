@@ -222,7 +222,7 @@ Notes per row:
 
 ### Vector nearest neighbour
 
-- `lance_knn` on a `knn_vector` (Lance `fixed_size_list<float32>`) column. Per-fragment nearest scan; the coordinator merge reconstructs the global top-K.
+- `lance_knn` on a `lance_vector` (Lance `fixed_size_list<float32>`) column. Per-fragment nearest scan; the coordinator merge reconstructs the global top-K.
 - Optional inner `filter` clause is evaluated by Lance before the K-nearest cutoff (pre-filter): supported clauses are `match_all`, `term`, `terms`, `exists`, `range`, `wildcard`, `regexp`, `prefix`, and `bool`.
 - Score is `boost / (1 + distance)`; comparable within a query, not across queries or engines.
 - The stock `knn` query is not rewritten to `lance_knn`: `knn` is the k-NN plugin's query name, and on a cluster that also runs the k-NN plugin the two would compete for it. Use `lance_knn` explicitly on Lance backed indexes, on any cluster.
@@ -595,7 +595,7 @@ Types listed here map to real OpenSearch field types with doc values or FTS back
 | `list<utf8>` | multi-valued `keyword` |
 | `struct` | `object` |
 | `list<struct>` | `nested` |
-| `fixed_size_list<float32>` | `knn_vector` |
+| `fixed_size_list<float32>` | `lance_vector` |
 | `binary` / `large_binary` | `binary` |
 
 Notes per row:
