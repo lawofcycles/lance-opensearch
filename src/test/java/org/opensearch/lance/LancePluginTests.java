@@ -14,11 +14,8 @@ import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.SettingsFilter;
-import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
-import org.opensearch.core.common.unit.ByteSizeUnit;
-import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
@@ -115,93 +112,32 @@ public class LancePluginTests extends OpenSearchTestCase {
         assertTrue(settingKeys.contains("plugins.lance.allowed_catalog_endpoints"));
     }
 
-    public void testEverySettingHasACurrentAndADeprecatedKey() {
-        // Every current key is plugins.lance.* (node scope) or
-        // index.plugins.lance.* (index scope), and each key that existed
-        // under the old prefix has a deprecated twin under lance.* or
-        // index.lance.* with the same scope, the same dynamic flag and the
-        // same default, so a cluster configured with the old keys behaves
-        // as before and reading an old key logs a deprecation. A setting
-        // introduced after the rename has no old key and no twin.
-        Set<String> introducedAfterRename = Set.of(
-            LanceSettings.FRAGMENT_PATH_DEFER_FETCH_SETTING.getKey(),
-            LanceSettings.ALLOWED_CATALOG_ENDPOINTS_SETTING.getKey(),
-            LanceSettings.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.getKey()
-        );
+    public void testEverySettingIsUnderThePluginPrefix() {
+        // Every key is plugins.lance.* (node scope) or index.plugins.lance.*
+        // (index scope), nothing is registered as deprecated and the set is
+        // pinned so a new or removed setting shows up in review.
         List<Setting<?>> settings = plugin.getSettings();
-        List<Setting<?>> current = settings.stream().filter(s -> s.isDeprecated() == false).collect(java.util.stream.Collectors.toList());
-        List<Setting<?>> deprecated = settings.stream().filter(Setting::isDeprecated).collect(java.util.stream.Collectors.toList());
         // 39 node settings and 9 index settings.
-        assertEquals(48, current.size());
-        assertEquals(current.size() - introducedAfterRename.size(), deprecated.size());
-        java.util.Map<String, Setting<?>> deprecatedByKey = deprecated.stream()
-            .collect(java.util.stream.Collectors.toMap(Setting::getKey, s -> s));
-        for (Setting<?> setting : current) {
+        assertEquals(48, settings.size());
+        assertEquals(settings.size(), settings.stream().map(Setting::getKey).collect(java.util.stream.Collectors.toSet()).size());
+        int nodeScoped = 0;
+        int indexScoped = 0;
+        for (Setting<?> setting : settings) {
             String key = setting.getKey();
-            String oldKey;
+            assertFalse(key, setting.isDeprecated());
             if (key.startsWith("index.plugins.lance.")) {
                 assertTrue(key, setting.hasIndexScope());
-                oldKey = "index.lance." + key.substring("index.plugins.lance.".length());
+                assertFalse(key, setting.hasNodeScope());
+                indexScoped++;
             } else {
                 assertTrue(key, key.startsWith("plugins.lance."));
                 assertTrue(key, setting.hasNodeScope());
-                oldKey = "lance." + key.substring("plugins.lance.".length());
+                assertFalse(key, setting.hasIndexScope());
+                nodeScoped++;
             }
-            Setting<?> old = deprecatedByKey.get(oldKey);
-            if (introducedAfterRename.contains(key)) {
-                assertNull("no deprecated twin for a setting introduced after the rename: " + key, old);
-                continue;
-            }
-            assertNotNull("deprecated twin of " + key, old);
-            assertEquals(key, setting.hasNodeScope(), old.hasNodeScope());
-            assertEquals(key, setting.hasIndexScope(), old.hasIndexScope());
-            assertEquals(key, setting.isDynamic(), old.isDynamic());
-            assertEquals(key, setting.isFinal(), old.isFinal());
-            assertEquals(key, setting.getDefault(Settings.EMPTY), old.getDefault(Settings.EMPTY));
         }
-    }
-
-    public void testDeprecatedNodeKeysAreReadThroughTheCurrentSettings() {
-        // A node whose opensearch.yml still carries the lance.* keys: the
-        // current settings read the old values through their fallbacks,
-        // and a current key set next to an old one wins.
-        Settings settings = Settings.builder()
-            .put("lance.namespace.poll_cadence", "3s")
-            .putList("lance.allowed_table_roots", "/a", "/b")
-            .put("lance.native_memory.limit", "7gb")
-            .put("lance.cache.column_share", 0.25)
-            .put("lance.request_cache.size", "3mb")
-            .put("lance.admission.headroom", "9gb")
-            .put("lance.attach.warm_indexes", "all")
-            .putList("lance.test.admission_available_memory", "1gb", "2gb")
-            .put("lance.fragment_path.slices", 7)
-            .put("plugins.lance.fragment_path.slices", 9)
-            .build();
-        assertEquals(TimeValue.timeValueSeconds(3), LanceSettings.NAMESPACE_POLL_CADENCE_SETTING.get(settings));
-        assertEquals(List.of("/a", "/b"), LanceSettings.ALLOWED_TABLE_ROOTS_SETTING.get(settings));
-        assertEquals("7gb", LanceSettings.NATIVE_MEMORY_LIMIT_SETTING.get(settings));
-        assertEquals(0.25, LanceSettings.CACHE_COLUMN_SHARE_SETTING.get(settings), 0.0);
-        assertEquals(new ByteSizeValue(3, ByteSizeUnit.MB), LanceSettings.REQUEST_CACHE_SIZE_SETTING.get(settings));
-        assertEquals(new ByteSizeValue(9, ByteSizeUnit.GB), LanceSettings.ADMISSION_HEADROOM_SETTING.get(settings));
-        assertEquals(LanceIndexWarmer.Mode.ALL, LanceSettings.ATTACH_WARM_INDEXES_SETTING.get(settings));
-        assertEquals(List.of("1gb", "2gb"), LanceSettings.TEST_ADMISSION_AVAILABLE_MEMORY_SETTING.get(settings));
-        assertEquals(Integer.valueOf(9), LanceSettings.FRAGMENT_PATH_SLICES_SETTING.get(settings));
-        // Defaults still apply when neither key is set.
-        assertEquals(Boolean.TRUE, LanceSettings.CACHE_ENABLED_SETTING.get(settings));
-        // Every old key present in the settings is reported as deprecated,
-        // including the one a current key overrides.
-        assertSettingDeprecationsAndWarnings(
-            new Setting<?>[] {
-                LanceSettings.NAMESPACE_POLL_CADENCE_SETTING_DEPRECATED,
-                LanceSettings.ALLOWED_TABLE_ROOTS_SETTING_DEPRECATED,
-                LanceSettings.NATIVE_MEMORY_LIMIT_SETTING_DEPRECATED,
-                LanceSettings.CACHE_COLUMN_SHARE_SETTING_DEPRECATED,
-                LanceSettings.REQUEST_CACHE_SIZE_SETTING_DEPRECATED,
-                LanceSettings.ADMISSION_HEADROOM_SETTING_DEPRECATED,
-                LanceSettings.ATTACH_WARM_INDEXES_SETTING_DEPRECATED,
-                LanceSettings.TEST_ADMISSION_AVAILABLE_MEMORY_SETTING_DEPRECATED,
-                LanceSettings.FRAGMENT_PATH_SLICES_SETTING_DEPRECATED }
-        );
+        assertEquals(39, nodeScoped);
+        assertEquals(9, indexScoped);
     }
 
     public void testHidingWrapperSettingTakesFourPartsOrNothing() {
@@ -223,40 +159,21 @@ public class LancePluginTests extends OpenSearchTestCase {
         }
     }
 
-    public void testDynamicUpdateOfADeprecatedKeyReachesTheCurrentSettingsConsumer() {
-        // The consumers are registered on the current settings only. An
-        // operator who still updates the old key must reach them, once,
-        // through the fallback.
-        Set<Setting<?>> nodeSettings = new HashSet<>(ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
-        for (Setting<?> setting : plugin.getSettings()) {
-            if (setting.hasNodeScope()) {
-                nodeSettings.add(setting);
-            }
-        }
-        ClusterSettings clusterSettings = new ClusterSettings(Settings.EMPTY, nodeSettings);
-        List<Boolean> seen = new java.util.ArrayList<>();
-        clusterSettings.addSettingsUpdateConsumer(LanceSettings.CACHE_ENABLED_SETTING, seen::add);
-        clusterSettings.applySettings(Settings.builder().put("lance.cache.enabled", false).build());
-        assertEquals(List.of(false), seen);
-        clusterSettings.applySettings(Settings.builder().put("plugins.lance.cache.enabled", true).build());
-        assertEquals(List.of(false, true), seen);
-        assertSettingDeprecationsAndWarnings(new Setting<?>[] { LanceSettings.CACHE_ENABLED_SETTING_DEPRECATED });
-    }
-
-    public void testIndexCreatedUnderTheDeprecatedKeysIsALanceIndex() {
-        // The cluster state of an index attached by an earlier release
-        // carries index.lance.*; the engine factory, the table, the
-        // primary key and the storage options are all resolved from it.
+    public void testIndexSettingsNameTheTableAndCopyUnderThePluginPrefix() {
+        // The engine factory, the table, the primary key and the storage
+        // options are all resolved from the index settings, and a recreate
+        // carries the plugin's keys and nothing else.
         Settings settings = Settings.builder()
-            .put("index.lance.table", "s3://bucket/old.lance")
-            .put("index.lance.primary_key_field", "id")
-            .put("index.lance.primary_key_type", "keyword")
-            .put("index.lance.version", 4)
-            .put("index.lance.uncovered_fragment_policy", "wait")
-            .put("index.lance.storage_options.aws_region", "eu-west-1")
+            .put("index.plugins.lance.table", "s3://bucket/demo.lance")
+            .put("index.plugins.lance.primary_key_field", "id")
+            .put("index.plugins.lance.primary_key_type", "keyword")
+            .put("index.plugins.lance.version", 4)
+            .put("index.plugins.lance.uncovered_fragment_policy", "wait")
+            .put("index.plugins.lance.storage_options.aws_region", "eu-west-1")
+            .put("index.number_of_shards", 1)
             .build();
         assertTrue(LanceEngineFactory.isLanceIndex(settings));
-        assertEquals("s3://bucket/old.lance", LanceEngineFactory.tableOf(settings));
+        assertEquals("s3://bucket/demo.lance", LanceEngineFactory.tableOf(settings));
         assertEquals("id", LanceSettings.PRIMARY_KEY_FIELD_SETTING.get(settings));
         assertEquals("keyword", LanceSettings.PRIMARY_KEY_TYPE_SETTING.get(settings));
         assertEquals(Long.valueOf(4L), LanceSettings.VERSION_SETTING.get(settings));
@@ -264,15 +181,15 @@ public class LancePluginTests extends OpenSearchTestCase {
         assertEquals("", LanceSettings.TAG_SETTING.get(settings));
         assertEquals(java.util.Map.of("aws_region", "eu-west-1"), StorageOptions.fromIndexSettings(settings).asMap());
         IndexSettings indexSettings = IndexSettingsModule.newIndexSettings(
-            "legacy",
+            "demo",
             settings,
             plugin.getSettings().stream().filter(Setting::hasIndexScope).toArray(Setting<?>[]::new)
         );
         assertTrue(plugin.getEngineFactory(indexSettings).isPresent());
         assertFalse(LanceEngineFactory.isLanceIndex(Settings.builder().put("index.number_of_shards", 1).build()));
+        assertFalse(LanceEngineFactory.isLanceIndex(Settings.builder().put("index.lance.table", "s3://bucket/old.lance").build()));
         assertNull(LanceEngineFactory.tableOf(Settings.EMPTY));
 
-        // Recreating the index from these settings writes the current keys.
         Settings.Builder copy = Settings.builder();
         LanceEngineFactory.copyLanceIndexSettings(settings, copy);
         Settings copied = copy.build();
@@ -288,15 +205,7 @@ public class LancePluginTests extends OpenSearchTestCase {
             ),
             copied.keySet()
         );
-        assertEquals("s3://bucket/old.lance", copied.get("index.plugins.lance.table"));
-        assertSettingDeprecationsAndWarnings(
-            new Setting<?>[] {
-                LanceSettings.TABLE_SETTING_DEPRECATED,
-                LanceSettings.PRIMARY_KEY_FIELD_SETTING_DEPRECATED,
-                LanceSettings.PRIMARY_KEY_TYPE_SETTING_DEPRECATED,
-                LanceSettings.VERSION_SETTING_DEPRECATED,
-                LanceSettings.UNCOVERED_FRAGMENT_POLICY_SETTING_DEPRECATED }
-        );
+        assertEquals("s3://bucket/demo.lance", copied.get("index.plugins.lance.table"));
     }
 
     public void testSettingsFilterWithholdsCredentialStorageOptions() {

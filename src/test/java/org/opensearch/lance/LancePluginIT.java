@@ -6,14 +6,12 @@
 package org.opensearch.lance;
 
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
+import org.opensearch.client.ResponseException;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
@@ -48,101 +46,24 @@ public class LancePluginIT extends LanceRestTestCase {
         assertTrue("expected namespaces JSON, saw: " + body, body.contains("namespaces"));
     }
 
-    public void testOldPathsAnswerWithDeprecationWarning() throws Exception {
-        // The test client runs in strict deprecation mode, so a Warning
-        // header fails the request unless the options expect it. The
-        // node logs one "deprecated_route" message per X-Opaque-Id and
-        // only a logged message becomes a Warning header, so every old
-        // path request carries its own opaque id to be sure the header
-        // is there even after another request already tripped the
-        // deprecation on the same node.
-        assertDeprecatedPath("GET", "/_lance/stats", "/_lance/stats", "/_plugins/_lance/stats");
-        assertDeprecatedPath("GET", "/_lance/namespace", "/_lance/namespace", "/_plugins/_lance/namespace");
-
-        // Attach answers from the callback of a create it issued under a
-        // stashed thread context, so its 200 covers the response header
-        // surviving that stash, both on the create and on the
-        // already_attached answer of a second attach.
-        String suffix = "oldattach-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
-        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
-        String tableName = "demo-" + suffix;
-        LanceTableFactory.writeTable(scratchDir, tableName, 2);
-        String attachBody = "{\"table\":\"" + scratchDir.resolve(tableName + ".lance") + "\"}";
-        try {
-            Response attached = assertDeprecatedPath("POST", "/_lance/attach", attachBody, "/_lance/attach", "/_plugins/_lance/attach");
-            String body = readAll(attached);
-            assertEquals("expected the index name in " + body, tableName, stringPath(body, "index"));
-            assertFalse("expected a fresh attach in " + body, body.contains("\"already_attached\":true"));
-
-            Response again = assertDeprecatedPath("POST", "/_lance/attach", attachBody, "/_lance/attach", "/_plugins/_lance/attach");
-            String againBody = readAll(again);
-            assertTrue("expected already_attached in " + againBody, againBody.contains("\"already_attached\":true"));
-        } finally {
-            try {
-                client().performRequest(new Request("DELETE", "/" + tableName));
-            } catch (Exception ignored) {}
-            deleteRecursively(scratchDir);
+    public void testOldPathsAreGone() throws IOException {
+        // The paths from before the move under /_plugins/_lance/ are not
+        // registered, so the REST controller answers 400 (no handler) or
+        // 405 (the path exists for another method).
+        for (String[] call : new String[][] {
+            { "GET", "/_lance/stats" },
+            { "GET", "/_lance/namespace" },
+            { "POST", "/_lance/attach" },
+            { "GET", "/_lance/refs/demo" },
+            { "POST", "/demo/_lance/sync" },
+            { "GET", "/demo/_lance/explain" } }) {
+            ResponseException refused = expectThrows(ResponseException.class, () -> client().performRequest(new Request(call[0], call[1])));
+            int status = refused.getResponse().getStatusLine().getStatusCode();
+            assertTrue(
+                call[0] + " " + call[1] + " answered " + status,
+                status == RestStatus.BAD_REQUEST.getStatus() || status == RestStatus.METHOD_NOT_ALLOWED.getStatus()
+            );
         }
-
-        Response stats = client().performRequest(new Request("GET", "/_plugins/_lance/stats"));
-        assertEquals(RestStatus.OK.getStatus(), stats.getStatusLine().getStatusCode());
-        assertEquals("unexpected warnings on the new path: " + stats.getWarnings(), List.of(), stats.getWarnings());
-
-        Response namespaces = client().performRequest(new Request("GET", "/_plugins/_lance/namespace"));
-        assertEquals(RestStatus.OK.getStatus(), namespaces.getStatusLine().getStatusCode());
-        assertEquals("unexpected warnings on the new path: " + namespaces.getWarnings(), List.of(), namespaces.getWarnings());
-    }
-
-    public void testOldStatsPathReadsNodeIdOnBothTemplates() throws IOException {
-        // The old template /_lance/stats/{node_id} shares its parameter
-        // name with the new /_plugins/_lance/{node_id}/stats, so a node id
-        // on the old path still selects that node.
-        String nodesBody = readAll(client().performRequest(new Request("GET", "/_nodes/_local")));
-        Map<String, Object> nodes = parseJson(nodesBody);
-        @SuppressWarnings("unchecked")
-        Map<String, Object> nodeMap = (Map<String, Object>) nodes.get("nodes");
-        String nodeId = nodeMap.keySet().iterator().next();
-
-        Response oldPath = assertDeprecatedPath(
-            "GET",
-            "/_lance/stats/" + nodeId,
-            "/_lance/stats/{node_id}",
-            "/_plugins/_lance/{node_id}/stats"
-        );
-        String oldBody = readAll(oldPath);
-        assertEquals("expected exactly one node in " + oldBody, 1, extractIntPath(oldBody, "_nodes", "total"));
-        assertTrue("expected node " + nodeId + " in " + oldBody, oldBody.contains("\"" + nodeId + "\""));
-
-        Response newPath = client().performRequest(new Request("GET", "/_plugins/_lance/" + nodeId + "/stats"));
-        String newBody = readAll(newPath);
-        assertEquals("expected exactly one node in " + newBody, 1, extractIntPath(newBody, "_nodes", "total"));
-        assertTrue("expected node " + nodeId + " in " + newBody, newBody.contains("\"" + nodeId + "\""));
-    }
-
-    /**
-     * Sends {@code method oldPath} and asserts it answers 200 with exactly
-     * the deprecation warning OpenSearch's {@code RestController} builds for
-     * a replaced route. The templates are the paths as registered, with
-     * their {@code {param}} placeholders, because the warning quotes the
-     * templates, not the resolved request path.
-     */
-    private static Response assertDeprecatedPath(String method, String oldPath, String oldTemplate, String newTemplate) throws IOException {
-        return assertDeprecatedPath(method, oldPath, null, oldTemplate, newTemplate);
-    }
-
-    /** {@link #assertDeprecatedPath(String, String, String, String)} with a JSON body. */
-    private static Response assertDeprecatedPath(String method, String oldPath, String jsonBody, String oldTemplate, String newTemplate)
-        throws IOException {
-        String warning = "[" + method + " " + oldTemplate + "] is deprecated! Use [" + method + " " + newTemplate + "] instead.";
-        Request request = new Request(method, oldPath);
-        if (jsonBody != null) {
-            request.setJsonEntity(jsonBody);
-        }
-        request.setOptions(expectWarnings(warning).toBuilder().addHeader("X-Opaque-Id", "lance-deprecated-" + randomAlphaOfLength(12)));
-        Response response = client().performRequest(request);
-        assertEquals(RestStatus.OK.getStatus(), response.getStatusLine().getStatusCode());
-        assertEquals("expected the deprecation warning on " + oldPath, List.of(warning), response.getWarnings());
-        return response;
     }
 
     public void testStatsAPIsSucceedForLanceIndex() throws Exception {
