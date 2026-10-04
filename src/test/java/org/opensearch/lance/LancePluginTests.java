@@ -24,6 +24,7 @@ import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
 import org.opensearch.env.TestEnvironment;
 import org.opensearch.index.IndexSettings;
+import org.opensearch.lance.engine.HidingReaderWrapper;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceIndexWarmer;
 import org.opensearch.lance.mapper.LanceTextFieldMapper;
@@ -124,13 +125,14 @@ public class LancePluginTests extends OpenSearchTestCase {
         // introduced after the rename has no old key and no twin.
         Set<String> introducedAfterRename = Set.of(
             LancePlugin.FRAGMENT_PATH_DEFER_FETCH_SETTING.getKey(),
-            LancePlugin.ALLOWED_CATALOG_ENDPOINTS_SETTING.getKey()
+            LancePlugin.ALLOWED_CATALOG_ENDPOINTS_SETTING.getKey(),
+            LancePlugin.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.getKey()
         );
         List<Setting<?>> settings = plugin.getSettings();
         List<Setting<?>> current = settings.stream().filter(s -> s.isDeprecated() == false).collect(java.util.stream.Collectors.toList());
         List<Setting<?>> deprecated = settings.stream().filter(Setting::isDeprecated).collect(java.util.stream.Collectors.toList());
-        // 38 node settings and 9 index settings.
-        assertEquals(47, current.size());
+        // 39 node settings and 9 index settings.
+        assertEquals(48, current.size());
         assertEquals(current.size() - introducedAfterRename.size(), deprecated.size());
         java.util.Map<String, Setting<?>> deprecatedByKey = deprecated.stream()
             .collect(java.util.stream.Collectors.toMap(Setting::getKey, s -> s));
@@ -200,6 +202,25 @@ public class LancePluginTests extends OpenSearchTestCase {
                 LancePlugin.TEST_ADMISSION_AVAILABLE_MEMORY_SETTING_DEPRECATED,
                 LancePlugin.FRAGMENT_PATH_SLICES_SETTING_DEPRECATED }
         );
+    }
+
+    public void testHidingWrapperSettingTakesFourPartsOrNothing() {
+        // The empty default installs no wrapper; a value is the prefix,
+        // the hidden column, the filter column and an integer minimum.
+        assertNull(HidingReaderWrapper.Rule.parse(LancePlugin.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.get(Settings.EMPTY)));
+        Settings valid = Settings.builder().put("plugins.lance.test.hiding_wrapper_index_prefix", "wrapped-:body:rating:200").build();
+        HidingReaderWrapper.Rule rule = HidingReaderWrapper.Rule.parse(LancePlugin.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.get(valid));
+        assertEquals(new HidingReaderWrapper.Rule("wrapped-", "body", "rating", 200L), rule);
+        assertTrue(rule.appliesTo("wrapped-demo"));
+        assertFalse(rule.appliesTo("plain-demo"));
+        for (String bad : List.of("wrapped-", "wrapped-:body:rating", "wrapped-:body:rating:ten", ":body:rating:1", "a:b:c:1:2")) {
+            Settings settings = Settings.builder().put("plugins.lance.test.hiding_wrapper_index_prefix", bad).build();
+            IllegalArgumentException refused = expectThrows(
+                IllegalArgumentException.class,
+                () -> LancePlugin.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.get(settings)
+            );
+            assertTrue(refused.getMessage(), refused.getMessage().contains("plugins.lance.test.hiding_wrapper_index_prefix"));
+        }
     }
 
     public void testDynamicUpdateOfADeprecatedKeyReachesTheCurrentSettingsConsumer() {

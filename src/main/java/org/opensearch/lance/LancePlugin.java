@@ -51,6 +51,7 @@ import org.opensearch.lance.dispatch.LanceStatisticsPrefetchAction;
 import org.opensearch.lance.dispatch.TransportLanceRequestCacheClearAction;
 import org.opensearch.lance.dispatch.TransportLanceFragmentFetchAction;
 import org.opensearch.lance.dispatch.TransportLanceStatisticsPrefetchAction;
+import org.opensearch.lance.engine.HidingReaderWrapper;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceIndexWarmer;
 import org.opensearch.lance.engine.LanceServedVersions;
@@ -929,6 +930,28 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     );
 
     /**
+     * Test hook that installs a reader wrapper shaped like the security
+     * plugin's document and field level security reader
+     * ({@link HidingReaderWrapper}) on every Lance backed index created
+     * while it is set whose name starts with the given prefix. The value
+     * is {@code <index prefix>:<hidden column>:<filter column>:<minimum>}:
+     * the wrapper drops the hidden column from the leaves' field infos
+     * and shows only the rows whose filter column is at least the
+     * minimum. Empty (the default) installs nothing. It exists so the
+     * integration tests, whose cluster has no security plugin, can pin
+     * what the plugin does under such a wrapper; do not set it on a real
+     * node. Dynamic: {@link #onIndexModule} reads it when an index
+     * service is built, so an index created after an update follows the
+     * new value and an index created before keeps its wrapper.
+     */
+    public static final Setting<String> TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING = Setting.simpleString(
+        "plugins.lance.test.hiding_wrapper_index_prefix",
+        HidingReaderWrapper.Rule::parse,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
      * Whether a {@code size: 0} aggregation request whose shape the
      * scan can compute (metrics including stats, cardinality and tdigest
      * percentiles; {@code terms} / {@code histogram} / {@code date_histogram}
@@ -1280,6 +1303,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             TEST_INDEX_CACHE_SHARD_SHARE_SETTING,
             TEST_ADMISSION_AVAILABLE_MEMORY_SETTING,
             TEST_STATISTICS_COLLECT_DELAY_SETTING,
+            TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING,
             AGGREGATION_PUSHDOWN_SETTING,
             AGGREGATION_PUSHDOWN_PARALLELISM_SETTING,
             AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING,
@@ -1495,12 +1519,31 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * first access; {@code LanceAttachIT#testAttachRecreateAtSamePathServesNewContent}
      * covers that. The service is {@code null} only for an index module
      * built before the components exist (a test harness).
+     *
+     * <p>While {@link #TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING} is set,
+     * a Lance backed index whose name starts with its prefix also gets
+     * the {@link HidingReaderWrapper} the value describes as its reader
+     * wrapper. The hook runs for the node's own index service and for the
+     * temporary one the fragment executor and the probes build, so both
+     * see the same wrapper, as they do the security plugin's.
      */
     @Override
     public void onIndexModule(IndexModule indexModule) {
+        if (!LanceEngineFactory.isLanceIndex(indexModule.getSettings())) {
+            return;
+        }
         LanceIndexFreshnessService freshness = freshnessService;
-        if (freshness != null && LanceEngineFactory.isLanceIndex(indexModule.getSettings())) {
+        if (freshness != null) {
             indexModule.addIndexEventListener(freshness);
+        }
+        ClusterService cluster = clusterService;
+        if (cluster != null) {
+            HidingReaderWrapper.Rule rule = HidingReaderWrapper.Rule.parse(
+                cluster.getClusterSettings().get(TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING)
+            );
+            if (rule != null && rule.appliesTo(indexModule.getIndex().getName())) {
+                indexModule.setReaderWrapper(indexService -> new HidingReaderWrapper(rule));
+            }
         }
     }
 
