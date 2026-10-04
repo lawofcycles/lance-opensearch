@@ -251,6 +251,63 @@ public class LanceTextOverrideIT extends LanceRestTestCase {
         }
     }
 
+    public void testDisabledGateRefusesTheFlatScanWith400AndLeavesTheIndexedColumnAlone() throws Exception {
+        String suffix = "lancetextoff-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        String tableUri = LanceTableFactory.writeEnglishTextTable(scratchDir, tableName);
+        String declared = tableName;
+        String indexedMatch = "{\"size\":5,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\"}}}";
+        try (LanceTestCluster withIndex = LanceTestCluster.setUp(16, "lancetextidxoff")) {
+            attach(tableUri, declared, "{\"body\":{\"type\":\"lance_text\"}}");
+            String admitted = readAll(postJson("/" + declared + "/_search?request_cache=false", MATCH_THE));
+            assertEquals(5, extractIntPath(admitted, "hits", "total", "value"));
+
+            updateClusterSetting("plugins.lance.admission.enabled", "false");
+            try {
+                Map<String, Object> before = admissionStats();
+                assertEquals(before.toString(), false, before.get("enabled"));
+                // Off, the gate cannot bound the flat scan, so the match
+                // on the declared column is refused as a client error
+                // naming the setting; nothing is counted as a 429.
+                ResponseException refused = expectThrows(
+                    ResponseException.class,
+                    () -> postJson("/" + declared + "/_search?request_cache=false", MATCH_THE)
+                );
+                String body = readAll(refused.getResponse());
+                assertEquals(body, RestStatus.BAD_REQUEST.getStatus(), refused.getResponse().getStatusLine().getStatusCode());
+                assertEquals(body, "illegal_argument_exception", stringPath(body, "error", "type"));
+                assertTrue(
+                    body,
+                    body.contains(
+                        "[lance_admission] full text scan without an inverted index on column [body] is refused while "
+                            + "plugins.lance.admission.enabled is false"
+                    )
+                );
+                assertTrue(body, body.contains("create an inverted index on the column with the table's writer, or enable admission"));
+                Map<String, Object> after = admissionStats();
+                assertEquals(after.toString(), rejections(before, "fts_flat"), rejections(after, "fts_flat"));
+
+                // The column that carries an inverted index answers with
+                // the gate off, as every other kind does.
+                String indexed = readAll(postJson("/" + withIndex.indexName() + "/_search?request_cache=false", indexedMatch));
+                assertEquals(indexed, 5, hitsOf(indexed).size());
+            } finally {
+                updateClusterSetting("plugins.lance.admission.enabled", null);
+            }
+            // Back on, the flat scan is admitted again.
+            String restored = readAll(postJson("/" + declared + "/_search?request_cache=false", MATCH_THE));
+            assertEquals(5, extractIntPath(restored, "hits", "total", "value"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + declared));
+            } catch (Exception ignored) {
+                // best-effort cleanup; the base class wipes indices too
+            }
+            deleteRecursively(scratchDir);
+        }
+    }
+
     public void testKeywordSubFieldNextToTheOverrideServesExactMatchAndTerms() throws Exception {
         String suffix = "lancetextsub-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));

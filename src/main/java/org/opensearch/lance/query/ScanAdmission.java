@@ -1978,7 +1978,10 @@ public final class ScanAdmission {
      * {@link #availablePhysicalMemoryBytes}, the retained credit from
      * the pool and the settings from the static holders, records the
      * estimate, and throws {@link CircuitBreakingException} on a
-     * rejection. An admitted non zero estimate is counted in flight on
+     * rejection. A disabled gate admits the {@link Kind#FTS} path and
+     * refuses the {@link Kind#FTS_FLAT} path with
+     * {@link IllegalArgumentException} (see {@link #admitFlat}). An
+     * admitted non zero estimate is counted in flight on
      * {@code ticket} (the request's {@link LanceHitsAccounting}, released
      * by its close) or, without one, on the calling thread until
      * {@link #requestEnded()} runs there.
@@ -2079,15 +2082,34 @@ public final class ScanAdmission {
      * scores every row of the table for each of them
      * ({@link #flatFtsEstimateBytes}). The remedy names the index the
      * table's writer would create to take the column off this path.
+     *
+     * <p>A disabled gate does not admit this path: it refuses it with
+     * {@link IllegalArgumentException} (a 400). The indexed paths are
+     * bounded by Lance's own index structures when the gate is off; the
+     * flat scan has no bound but this gate, and a caller with read
+     * access alone would otherwise run it over a table of any size.
      */
     private static void admitFlat(String indexName, long rows, Set<String> columns, LanceHitsAccounting ticket) {
-        long shardShare = shardShareBytes();
-        long estimate = flatFtsEstimateBytes(rows, columns.size(), shardShare);
         // Sorted, as the scope key sorts them: the shape's column set
         // carries no order.
         List<String> names = new ArrayList<>(columns);
         names.sort(null);
         String columnList = String.join(", ", names);
+        if (!enabled) {
+            throw new IllegalArgumentException(
+                "["
+                    + LABEL
+                    + "] "
+                    + Kind.FTS_FLAT.description()
+                    + " on "
+                    + (names.size() == 1 ? "column [" + columnList + "]" : "columns [" + columnList + "]")
+                    + " is refused while plugins.lance.admission.enabled is false; create an inverted index on the "
+                    + (names.size() == 1 ? "column" : "columns")
+                    + " with the table's writer, or enable admission"
+            );
+        }
+        long shardShare = shardShareBytes();
+        long estimate = flatFtsEstimateBytes(rows, columns.size(), shardShare);
         String what = Kind.FTS_FLAT.description()
             + " over ["
             + indexName
@@ -2101,7 +2123,7 @@ public final class ScanAdmission {
         String remedy = "Create an inverted index on "
             + (names.size() == 1 ? "column [" + columnList + "]" : "columns [" + columnList + "]")
             + " with the table's writer (pylance create_scalar_index), attach the table to a node with more memory, "
-            + "or relax plugins.lance.admission.headroom / plugins.lance.admission.enabled.";
+            + "or relax plugins.lance.admission.headroom.";
         judge(new Scope(Kind.FTS_FLAT, indexName, columns), estimate, 0L, Long.MAX_VALUE, what, remedy, ticket);
     }
 
