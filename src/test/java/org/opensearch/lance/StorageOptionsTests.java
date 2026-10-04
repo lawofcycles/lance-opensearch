@@ -369,12 +369,60 @@ public class StorageOptionsTests extends OpenSearchTestCase {
         assertTrue("the S3 error code stays: " + redacted, redacted.contains("<Code>SignatureDoesNotMatch</Code>"));
         assertTrue("the message stays: " + redacted, redacted.contains("Check your key and signing method.</Message>"));
         assertTrue(
-            "the byte dumps of the inputs are not matched by the element pattern: " + redacted,
-            redacted.contains("<StringToSignBytes>41 57 53 34</StringToSignBytes>")
-                && redacted.contains("<CanonicalRequestBytes>47 45 54 0a</CanonicalRequestBytes>")
+            "the byte dumps of the inputs are redacted like their text forms: " + redacted,
+            redacted.contains("<StringToSignBytes>***</StringToSignBytes>")
+                && redacted.contains("<CanonicalRequestBytes>***</CanonicalRequestBytes>")
         );
         assertTrue("the request id is not a credential: " + redacted, redacted.contains("7A9E3F0C2B1D4E5F"));
         assertTrue("the Rust location stays: " + redacted, redacted.contains("object_store.rs:1234:56"));
+    }
+
+    public void testRedactCredentialsReplacesTheHexDumpElementsOfAnS3ErrorBody() {
+        // The hex dumps S3 puts next to StringToSign and CanonicalRequest
+        // decode to the same text, session token included, so they are
+        // redacted whole. The payloads are assembled at run time: the
+        // canonical request dump spells "x-amz-security-token:" in hex
+        // followed by the token's bytes, the string to sign dump is a
+        // run of one byte. A hex element S3 does not send today
+        // (FutureBytes) and a dump cut short by a message length limit
+        // are covered by the same family.
+        String tokenHex = "78 2d 61 6d 7a 2d 73 65 63 75 72 69 74 79 2d 74 6f 6b 65 6e 3a " + "46 77 6f 47 ".repeat(12).trim();
+        String stringToSignHex = "41 ".repeat(40).trim();
+        String futureHex = "7a ".repeat(16).trim();
+        String body = "Invalid user input: LanceError(IO): Generic S3 error: Client error with status 403 Forbidden: "
+            + "<Error><Code>SignatureDoesNotMatch</Code>"
+            + "<StringToSign>***</StringToSign>"
+            + "<StringToSignBytes>"
+            + stringToSignHex
+            + "</StringToSignBytes>"
+            + "<CanonicalRequest>***</CanonicalRequest>"
+            + "<CanonicalRequestBytes>"
+            + tokenHex
+            + "</CanonicalRequestBytes>"
+            + "<FutureBytes>"
+            + futureHex
+            + "</FutureBytes>"
+            + "<RequestId>7A9E3F0C2B1D4E5F</RequestId></Error>";
+        String redacted = StorageOptions.redactCredentials(body);
+        assertFalse("the token's hex must not survive: " + redacted, redacted.contains(tokenHex));
+        assertFalse("the string to sign's hex must not survive: " + redacted, redacted.contains(stringToSignHex));
+        assertFalse("the unknown hex element's content must not survive: " + redacted, redacted.contains(futureHex));
+        assertEquals(
+            "Invalid user input: LanceError(IO): Generic S3 error: Client error with status 403 Forbidden: "
+                + "<Error><Code>SignatureDoesNotMatch</Code><StringToSign>***</StringToSign>"
+                + "<StringToSignBytes>***</StringToSignBytes><CanonicalRequest>***</CanonicalRequest>"
+                + "<CanonicalRequestBytes>***</CanonicalRequestBytes><FutureBytes>***</FutureBytes>"
+                + "<RequestId>7A9E3F0C2B1D4E5F</RequestId></Error>",
+            redacted
+        );
+
+        String truncated = "<Error><Code>SignatureDoesNotMatch</Code><CanonicalRequestBytes>" + tokenHex;
+        String redactedTruncated = StorageOptions.redactCredentials(truncated);
+        assertFalse("the token's hex must not survive a cut body: " + redactedTruncated, redactedTruncated.contains(tokenHex));
+        assertEquals("<Error><Code>SignatureDoesNotMatch</Code><CanonicalRequestBytes>***", redactedTruncated);
+
+        String prose = "the StringToSignBytes and CanonicalRequestBytes elements are hex dumps";
+        assertSame("the element names in prose are words, not elements", prose, StorageOptions.redactCredentials(prose));
     }
 
     public void testRedactCredentialsReplacesAnUnclosedSigningElementUpToTheEndOfTheMessage() {

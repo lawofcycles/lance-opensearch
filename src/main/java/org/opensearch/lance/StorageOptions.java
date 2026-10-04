@@ -154,14 +154,17 @@ public final class StorageOptions {
     private static final Pattern XML_ACCESS_KEY_ID = Pattern.compile("(<(?:AWS)?AccessKeyId>)[^<]*(</(?:AWS)?AccessKeyId>)");
 
     /**
-     * The {@code <StringToSign>}, {@code <SignatureProvided>} and
-     * {@code <CanonicalRequest>} elements of the S3
+     * The {@code <StringToSign>}, {@code <SignatureProvided>},
+     * {@code <CanonicalRequest>}, {@code <StringToSignBytes>} and
+     * {@code <CanonicalRequestBytes>} elements of the S3
      * {@code SignatureDoesNotMatch} error body, whatever their content.
      * {@code SignatureProvided} is the HMAC the client derived from
      * the secret access key, {@code StringToSign} and
      * {@code CanonicalRequest} are the inputs it was computed over,
      * which carry the signed headers, the session token and the key
-     * id's credential scope. {@code StringToSign} and
+     * id's credential scope, and the two {@code Bytes} elements are
+     * the same inputs as a space separated hex dump, from which the
+     * text decodes byte for byte. {@code StringToSign} and
      * {@code CanonicalRequest} are newline separated and span lines,
      * so the match runs in DOTALL mode and stops at the element's own
      * closing tag. An opening tag with no closing tag anywhere after
@@ -174,9 +177,20 @@ public final class StorageOptions {
      * is not a match.
      */
     private static final Pattern XML_SIGNING_ELEMENTS = Pattern.compile(
-        "(<(StringToSign|SignatureProvided|CanonicalRequest)>)(?:.*?(</\\2>)|[^<]*)",
+        "(<(StringToSign|SignatureProvided|CanonicalRequest|StringToSignBytes|CanonicalRequestBytes)>)(?:.*?(</\\2>)|[^<]*)",
         Pattern.DOTALL
     );
+
+    /**
+     * Any element whose name ends in {@code Bytes}, the shape S3 gives
+     * the hex dump of a signing input. The two such elements S3 sends
+     * today are named in {@link #XML_SIGNING_ELEMENTS}; this family
+     * match covers a hex element a later S3 body adds next to them, so
+     * its content does not pass through until the name is listed. The
+     * closing tag and truncation handling are those of
+     * {@link #XML_SIGNING_ELEMENTS}.
+     */
+    private static final Pattern XML_HEX_DUMP_ELEMENTS = Pattern.compile("(<([A-Za-z]+Bytes)>)(?:.*?(</\\2>)|[^<]*)", Pattern.DOTALL);
 
     /**
      * A {@code Bearer} or {@code Basic} authorization value, the shapes
@@ -206,7 +220,9 @@ public final class StorageOptions {
      * {@code <AWSAccessKeyId>} element of an S3 error body, the
      * {@code <StringToSign>}, {@code <SignatureProvided>} and
      * {@code <CanonicalRequest>} elements of an S3
-     * {@code SignatureDoesNotMatch} body, a
+     * {@code SignatureDoesNotMatch} body together with their hex dumps
+     * ({@code <StringToSignBytes>}, {@code <CanonicalRequestBytes>} and
+     * any other element whose name ends in {@code Bytes}), a
      * {@code Bearer} or {@code Basic} authorization value, and the
      * {@code sig} parameter of an Azure SAS URL. Region, endpoint,
      * bucket and table path are left as they are. Returns
@@ -227,6 +243,7 @@ public final class StorageOptions {
         }
         String out = message;
         out = XML_SIGNING_ELEMENTS.matcher(out).replaceAll("$1" + REDACTED + "$3");
+        out = XML_HEX_DUMP_ELEMENTS.matcher(out).replaceAll("$1" + REDACTED + "$3");
         out = XML_ACCESS_KEY_ID.matcher(out).replaceAll("$1" + REDACTED + "$2");
         out = ACCESS_KEY_ID.matcher(out).replaceAll(REDACTED);
         out = AUTHORIZATION_VALUE.matcher(out).replaceAll("$1" + REDACTED);
