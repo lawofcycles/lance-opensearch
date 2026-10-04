@@ -54,8 +54,11 @@ import org.opensearch.core.common.io.stream.Writeable;
  * <p>Nothing is ever removed from or retyped in the base fields or in
  * a block that shipped: a field that falls out of use keeps being
  * written with its default, because an older reader still expects it
- * at that position. The policy and the version history of every
- * message are in {@code docs/design/wire-format-compat.md}.
+ * at that position. One block per version above 1, no gaps in the
+ * sequence: a version that removes fields without adding any still
+ * writes its block, empty, so the block index stays contiguous. The
+ * policy and the version history of every message are in
+ * {@code docs/design/wire-format-compat.md}.
  *
  * <p>The marker and the flag travel as variable length ints, one byte
  * each while they stay below 128; a block costs its length prefix on

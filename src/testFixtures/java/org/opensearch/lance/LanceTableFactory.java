@@ -16,7 +16,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Optional;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
@@ -53,7 +52,6 @@ import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.schema.ColumnAlteration;
-import org.lance.schema.SqlExpressions;
 
 /**
  * Test-only helper that writes a small Lance table onto the local
@@ -736,21 +734,6 @@ public final class LanceTableFactory {
     }
 
     /**
-     * Add a column computed by a SQL expression over the existing
-     * columns through {@code Dataset.addColumns(SqlExpressions)}, one
-     * commit, the way a table's writer adds a column after the table was
-     * attached.
-     */
-    public static void addColumnFromSql(String tableUri, String column, String sql) throws Exception {
-        try (
-            RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
-            Dataset dataset = Dataset.open().allocator(allocator).uri(tableUri).build()
-        ) {
-            dataset.addColumns(new SqlExpressions.Builder().withExpression(column, sql).build(), Optional.empty());
-        }
-    }
-
-    /**
      * Drop columns from an existing Lance table. Simulates
      * {@code dataset.drop_columns([...])} from Python / Rust; used by
      * integration tests that exercise mapping-drift detection when the
@@ -1046,64 +1029,6 @@ public final class LanceTableFactory {
             );
             writeIdAndUtf8Table(uri, schema, BODY_COLUMN, ENGLISH_SENTENCES);
             return uri;
-        });
-    }
-
-    /**
-     * {@link #writeEnglishTextTable} plus a Lance inverted index over
-     * {@code body} built by the table writer (Lance's own English
-     * tokenizer, with positions), so the attach derivation maps
-     * {@code body} as {@code lance_text}.
-     *
-     * @return absolute URI of the table, usable as-is for
-     *         {@code /_plugins/_lance/attach} or namespace register.
-     */
-    public static String writeEnglishTextTableWithInvertedIndex(Path parent, String name) throws Exception {
-        String uri = writeEnglishTextTable(parent, name);
-        return withLocaleRoot(() -> {
-            try (
-                RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
-                Dataset dataset = Dataset.open().allocator(allocator).uri(uri).build()
-            ) {
-                ScalarIndexParams scalarParams = ScalarIndexParams.create(
-                    "inverted",
-                    "{\"base_tokenizer\":\"simple\",\"language\":\"English\",\"with_position\":true}"
-                );
-                IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
-                dataset.createIndex(
-                    IndexOptions.builder(Collections.singletonList(BODY_COLUMN), IndexType.INVERTED, indexParams)
-                        .withIndexName(BODY_COLUMN + "_fts")
-                        .build()
-                );
-            }
-            return uri;
-        });
-    }
-
-    /**
-     * Build over {@code column} a whitespace tokenized inverted index
-     * with positions and no lower casing, stemming or stop words, the
-     * way a writer that pre-tokenized the column builds it.
-     */
-    public static void createWhitespaceFtsIndex(String tableUri, String column) throws Exception {
-        withLocaleRoot(() -> {
-            try (
-                RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
-                Dataset dataset = Dataset.open().allocator(allocator).uri(tableUri).build()
-            ) {
-                ScalarIndexParams scalarParams = ScalarIndexParams.create(
-                    "inverted",
-                    "{\"base_tokenizer\":\"whitespace\",\"with_position\":true,\"lower_case\":false,\"stem\":false,"
-                        + "\"remove_stop_words\":false,\"ascii_folding\":false,\"max_token_length\":null}"
-                );
-                IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
-                dataset.createIndex(
-                    IndexOptions.builder(Collections.singletonList(column), IndexType.INVERTED, indexParams)
-                        .withIndexName(column + "_fts")
-                        .build()
-                );
-            }
-            return tableUri;
         });
     }
 
