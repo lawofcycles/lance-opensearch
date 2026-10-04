@@ -391,6 +391,11 @@ testClusters.integTest {
     // path that climbs out of it. The s3 bucket is the one the
     // InvalidAccessKeyId fixture answers for.
     setting 'plugins.lance.allowed_table_roots', "${sharedTablesDir.absolutePath},s3://redaction-bucket"
+    // The catalog ITs answer from HttpServer fixtures bound to the
+    // loopback address on a random port, which the empty allowlist
+    // refuses; naming the address admits every port on it and leaves
+    // the link local address the namespace IT registers outside.
+    setting 'plugins.lance.allowed_catalog_endpoints', 'http://127.0.0.1/'
     environment 'AWS_SHARED_CREDENTIALS_FILE', integTestAwsCredentialsFile.absolutePath
     environment 'AWS_CONFIG_FILE', integTestAwsConfigFile.absolutePath
     if (lanceLanguageModelHome != null) {

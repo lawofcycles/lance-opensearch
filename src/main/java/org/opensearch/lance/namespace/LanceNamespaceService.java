@@ -76,6 +76,7 @@ public final class LanceNamespaceService implements Closeable {
     private final ClusterService clusterService;
     private final TimeValue cadence;
     private final AllowedTableRoots allowedRoots;
+    private final AllowedCatalogEndpoints allowedEndpoints;
     /**
      * Per-node cache of the runtime {@link LanceNamespace} handles
      * keyed by registration name, each wrapped in a
@@ -149,14 +150,6 @@ public final class LanceNamespaceService implements Closeable {
         this(client, clusterService, threadPool, cadence, resurfaceGrace, warmCache, new AllowedTableRoots(List.of()));
     }
 
-    /**
-     * @param warmCache    fragment path snapshot cache to retire entries
-     *                     from when an index is deleted; {@code null}
-     *                     when there is none (tests)
-     * @param allowedRoots the {@code plugins.lance.allowed_table_roots} allowlist,
-     *                     applied to the table locations rest / glue
-     *                     catalogs return before their tables surface
-     */
     public LanceNamespaceService(
         Client client,
         ClusterService clusterService,
@@ -166,12 +159,38 @@ public final class LanceNamespaceService implements Closeable {
         LanceWarmCache warmCache,
         AllowedTableRoots allowedRoots
     ) {
+        this(client, clusterService, threadPool, cadence, resurfaceGrace, warmCache, allowedRoots, new AllowedCatalogEndpoints(List.of()));
+    }
+
+    /**
+     * @param warmCache        fragment path snapshot cache to retire entries
+     *                         from when an index is deleted; {@code null}
+     *                         when there is none (tests)
+     * @param allowedRoots     the {@code plugins.lance.allowed_table_roots} allowlist,
+     *                         applied to the table locations rest / glue
+     *                         catalogs return before their tables surface
+     * @param allowedEndpoints the {@code plugins.lance.allowed_catalog_endpoints}
+     *                         allowlist, applied to a registration's catalog
+     *                         server before the poll or the tables preview
+     *                         builds its client
+     */
+    public LanceNamespaceService(
+        Client client,
+        ClusterService clusterService,
+        ThreadPool threadPool,
+        TimeValue cadence,
+        TimeValue resurfaceGrace,
+        LanceWarmCache warmCache,
+        AllowedTableRoots allowedRoots,
+        AllowedCatalogEndpoints allowedEndpoints
+    ) {
         this.client = client;
         this.clusterService = clusterService;
         this.threadPool = threadPool;
         this.cadence = cadence;
         this.warmCache = warmCache;
         this.allowedRoots = allowedRoots;
+        this.allowedEndpoints = allowedEndpoints;
         this.resurfaceGuard = new LanceResurfaceGuard(resurfaceGrace);
         // The applier listener keeps the tombstone bookkeeping current
         // and releases handles of removed registrations; the poll
@@ -297,6 +316,13 @@ public final class LanceNamespaceService implements Closeable {
      * registration that failed to initialise keeps being retried at
      * the poll cadence.
      *
+     * <p>A registration whose catalog endpoint
+     * {@code plugins.lance.allowed_catalog_endpoints} refuses (one
+     * registered before the setting was tightened; a register request
+     * is refused up front) gets no handle: it is recorded in
+     * {@link #unavailable} with the reason and the endpoint is never
+     * contacted, until the setting admits it again.
+     *
      * <p>Callers run on the generic pool (the poll's schedule and the
      * tables preview's fork), never on the cluster state applier
      * thread, because {@code initialize} is not free of I/O for every
@@ -314,6 +340,14 @@ public final class LanceNamespaceService implements Closeable {
      * policy and not the server frames on this thread's stack.
      */
     private LanceNamespaceHandle ensureHandle(LanceNamespaceMetadata.Entry entry) {
+        String endpointRefusal = allowedEndpoints.refusal(entry);
+        if (endpointRefusal != null) {
+            unavailable.put(entry.name(), endpointRefusal);
+            if (warnedInitFailure.add(entry.name())) {
+                LOG.warn("namespace {} (type {}) is not polled: {}", entry.name(), entry.type(), endpointRefusal);
+            }
+            return null;
+        }
         LanceNamespaceHandle cached = namespaceCache.get(entry.name());
         if (cached != null) {
             return cached;
@@ -427,13 +461,20 @@ public final class LanceNamespaceService implements Closeable {
         List<LanceNamespaceListResponse.NamespaceInfo> infos = new ArrayList<>(metadata.entries().size());
         for (LanceNamespaceMetadata.Entry entry : metadata.entries()) {
             String path = LanceNamespaceMetadata.Entry.TYPE_DIRECTORY.equals(entry.type()) ? entry.rootUri() : null;
+            // The endpoint refusal is a function of the entry and this
+            // node's setting, so every node reports it, not only the
+            // cluster manager whose poll recorded it.
+            String error = allowedEndpoints.refusal(entry);
+            if (error == null) {
+                error = unavailable.get(entry.name());
+            }
             infos.add(
                 new LanceNamespaceListResponse.NamespaceInfo(
                     entry.name(),
                     entry.type(),
                     path,
                     entry.redactedConfig(),
-                    unavailable.get(entry.name()),
+                    error,
                     partial.get(entry.name())
                 )
             );

@@ -707,6 +707,54 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
         }
     }
 
+    public void testPollLeavesARegistrationWhoseEndpointTheAllowlistRefusesUnavailable() throws Exception {
+        // A registration that predates a tighter
+        // plugins.lance.allowed_catalog_endpoints stays in cluster state;
+        // the poll neither builds its client nor contacts the endpoint,
+        // lists it as unavailable with the reason, and the tables
+        // preview answers as for a registration it cannot reach.
+        RecordingLanceNamespace recording = new RecordingLanceNamespace();
+        recording.tables = Set.of("orders");
+        LanceNamespaceFactory.setInstantiatorForTests(type -> recording);
+        LanceNamespaceService guarded = new LanceNamespaceService(
+            client,
+            clusterService,
+            threadPool,
+            TimeValue.timeValueHours(1),
+            TimeValue.timeValueHours(1),
+            null,
+            new AllowedTableRoots(List.of()),
+            new AllowedCatalogEndpoints(List.of("https://catalog.example.com/"))
+        );
+        try {
+            LanceNamespaceMetadata metadata = LanceNamespaceMetadata.EMPTY.withRegistered(
+                new LanceNamespaceMetadata.Entry(
+                    "cat",
+                    LanceNamespaceMetadata.Entry.TYPE_REST,
+                    null,
+                    StorageOptions.empty(),
+                    Map.of("uri", "http://169.254.169.254/")
+                )
+            );
+            ClusterState state = ClusterState.builder(clusterService.state())
+                .metadata(Metadata.builder(clusterService.state().metadata()).putCustom(LanceNamespaceMetadata.TYPE, metadata))
+                .build();
+            ClusterServiceUtils.setState(clusterService, state);
+
+            LanceNamespaceService.PollReport report = guarded.pollNow(null);
+            String expected = "[lance_namespace] catalog endpoint [http://169.254.169.254/] (config.uri) is not under "
+                + "plugins.lance.allowed_catalog_endpoints";
+            assertEquals(Map.of("cat", expected), report.unavailable());
+            assertTrue(report.surfaced().isEmpty());
+            assertEquals(expected, guarded.namespaceInfos().get(0).error());
+            assertEquals(Optional.empty(), guarded.listTables("cat"));
+            assertTrue("the catalog client must not be built for a refused endpoint", recording.initializeCalls.isEmpty());
+        } finally {
+            LanceNamespaceFactory.resetInstantiatorForTests();
+            guarded.close();
+        }
+    }
+
     public void testUnregisterWaitsForTheListingInFlightBeforeReleasingTheHandle() throws Exception {
         // The applier hands a removed registration's handle to the
         // generic pool for closing while the preview (or the poll) may
