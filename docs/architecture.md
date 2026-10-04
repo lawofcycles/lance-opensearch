@@ -159,8 +159,10 @@ src/main/java/org/opensearch/lance/
 └── stats/           # the _plugins/_lance/stats endpoint
 ```
 
-The top-level classes are what every path shares: `LancePlugin` (settings, services, thread
-pools), `LanceRegistry` (the node's single Arrow allocator and shared Lance session, so native
+The top-level classes are what every path shares: `LancePlugin` (what is constructed, what is
+handed to what, thread pools), `LanceSettings` (every `Setting` constant with its validator, the
+list `getSettings` registers), `NativeMemoryLimit` (the native memory limit and the cache budgets
+it splits into), `LanceRegistry` (the node's single Arrow allocator and shared Lance session, so native
 caches are node-scoped rather than per-shard), `LanceOverrides` and `StorageOptions` (the parsed
 forms of the attach body's mapping and credential clauses), and `LanceCircuitBreaker` (a breaker
 over the native memory Lance holds, which JVM heap accounting cannot see).
