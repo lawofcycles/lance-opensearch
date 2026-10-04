@@ -52,7 +52,10 @@ public class LanceRegistryTests extends OpenSearchTestCase {
         assertNull("before initSession there is no shared Session", LanceRegistry.currentSession());
         assertNull("before initSession there is no index cache sizing", LanceRegistry.indexCacheSizing());
 
-        LanceRegistry.initSession(64L * 1024 * 1024, 8L * 1024 * 1024);
+        LanceRegistry.initSession(
+            NativeMemoryLimit.IndexCacheSizing.ofCapacity(64L * 1024 * 1024, NativeMemoryLimit.availableCpus()),
+            8L * 1024 * 1024
+        );
 
         Session session = LanceRegistry.currentSession();
         assertNotNull("initSession must install a Session", session);
@@ -73,11 +76,17 @@ public class LanceRegistryTests extends OpenSearchTestCase {
     }
 
     public void testInitSessionReplacesExistingSession() {
-        LanceRegistry.initSession(64L * 1024 * 1024, 8L * 1024 * 1024);
+        LanceRegistry.initSession(
+            NativeMemoryLimit.IndexCacheSizing.ofCapacity(64L * 1024 * 1024, NativeMemoryLimit.availableCpus()),
+            8L * 1024 * 1024
+        );
         Session first = LanceRegistry.currentSession();
         assertNotNull(first);
 
-        LanceRegistry.initSession(32L * 1024 * 1024, 4L * 1024 * 1024);
+        LanceRegistry.initSession(
+            NativeMemoryLimit.IndexCacheSizing.ofCapacity(32L * 1024 * 1024, NativeMemoryLimit.availableCpus()),
+            4L * 1024 * 1024
+        );
         Session second = LanceRegistry.currentSession();
 
         assertNotNull(second);
@@ -87,7 +96,10 @@ public class LanceRegistryTests extends OpenSearchTestCase {
     }
 
     public void testTwoDatasetsShareTheInstalledSession() throws Exception {
-        LanceRegistry.initSession(64L * 1024 * 1024, 8L * 1024 * 1024);
+        LanceRegistry.initSession(
+            NativeMemoryLimit.IndexCacheSizing.ofCapacity(64L * 1024 * 1024, NativeMemoryLimit.availableCpus()),
+            8L * 1024 * 1024
+        );
         Session installed = LanceRegistry.currentSession();
         assertNotNull(installed);
 
