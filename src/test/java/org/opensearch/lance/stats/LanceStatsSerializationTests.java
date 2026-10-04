@@ -292,7 +292,9 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 json,
                 json.contains(
                     "\"rejections\":{\"fts\":7,\"scalar_index\":0,\"vector_index\":0,\"filter_scan\":1,\"aggregate_scan\":0,"
-                        + "\"column_load\":0}},\"warm_up\":{\"mode\":\"metadata\""
+                        + "\"column_load\":0},\"refused_while_disabled\":{\"fts\":0,\"fts_flat\":3,\"scalar_index\":0,"
+                        + "\"vector_index\":0,\"filter_scan\":0,\"aggregate_scan\":0,\"column_load\":0,\"fetch_take\":0}},"
+                        + "\"warm_up\":{\"mode\":\"metadata\""
                 )
             );
             assertTrue(json, json.endsWith("\"wrapped\":{\"lucene_bound_exceeded\":false}}}}}"));
