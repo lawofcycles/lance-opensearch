@@ -130,6 +130,40 @@ public class LanceAttachIT extends LanceRestTestCase {
         assertTrue("expected message about [number_of_shards], saw: " + body, body.contains("[number_of_shards] is no longer accepted"));
     }
 
+    public void testAttachRejectsUnknownTopLevelKeys() throws Exception {
+        // A key the parser never reads answers 400 naming it and the
+        // accepted list, in core's illegal_argument_exception shape,
+        // instead of creating the index as if the key were absent.
+        String accepted = "accepted keys are table, name, number_of_shards, version, tag, storage_options, overrides, multi_fields";
+        for (String key : new String[] { "indexes", "fts_columns" }) {
+            String payload = "{\"table\":\"/tmp/does-not-matter.lance\",\"" + key + "\":[\"body\"]}";
+            ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_plugins/_lance/attach", payload));
+            int status = failure.getResponse().getStatusLine().getStatusCode();
+            assertEquals("expected 400 for [" + key + "], saw " + status, 400, status);
+            String body = readAll(failure.getResponse());
+            assertTrue("expected illegal_argument_exception, saw: " + body, body.contains("illegal_argument_exception"));
+            assertTrue("expected the key named, saw: " + body, body.contains("[lance_attach] unknown key [" + key + "]"));
+            assertTrue("expected the accepted list, saw: " + body, body.contains(accepted));
+        }
+
+        // The same body without the unknown key attaches.
+        String suffix = "known-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        LanceTableFactory.writeMultiFragmentTable(scratchDir, tableName, 4, 4);
+        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
+        try {
+            Response attached = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\",\"name\":\"" + tableName + "\"}");
+            assertEquals(200, attached.getStatusLine().getStatusCode());
+            assertTrue(readAll(attached).contains("\"already_attached\":false"));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + tableName));
+            } catch (Exception ignored) {}
+            deleteRecursively(scratchDir);
+        }
+    }
+
     public void testAttachRefusesToClaimPlainIndex() throws IOException {
         // A plain OpenSearch index that already owns the target name must
         // not be reported as already_attached.
