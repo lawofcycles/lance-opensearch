@@ -554,10 +554,12 @@ the cluster manager timeout of a cluster manager request, the node of a per node
 acknowledged bit of an acknowledged response), which OpenSearch versions itself, and before the
 first field the plugin owns. A `Writeable` nested in one of these messages without a marker of its
 own (the records inside `LanceNodeStats`) is covered by the enclosing message's number, so a change to its
-fields is a new block of that message. Messages the plugin only executes on the node that received
-the REST call (`LanceExplainRequest`, `LanceRefsRequest`, `LanceNamespaceListRequest` at the top
-level, and their responses) carry no marker: a
-`HandledTransportAction` invoked through the node client never serialises them.
+fields is a new block of that message. The three requests the plugin only executes on the node
+that received the REST call (`LanceExplainRequest`, `LanceRefsRequest`, `LanceNamespaceListRequest`
+at the top level) and two of their responses (`LanceRefsResponse`, `LanceNamespaceListResponse`)
+carry no marker: a `HandledTransportAction` invoked through the node client never serialises them.
+`LanceExplainResponse` is the exception among those responses and opens with the marker described
+above (`WIRE_VERSION` 4).
 `LanceNamespaceMetadata` carries none either: it is cluster state, versioned and published by
 OpenSearch's own mechanism, and its backwards-compatibility policy is written on the class.
 

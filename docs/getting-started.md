@@ -560,7 +560,7 @@ Send the search body to `GET /_plugins/_lance/explain/{index}` (or `POST`, for a
 
 The plugin plans every `_search` once, on the coordinating node, through a Calcite planner: the body is translated to a logical tree over the table, the planner picks the cheapest physical form that declares the traits the request demands, and the per node part of that form ships to the data nodes with each fragment request.
 
-The `bool` from "Composition with bool" is a shape the translator spells. The stock `match` was rewritten to `lance_match` before planning (the `logical` text and `lance_clause` show the rewritten clause), the `range` becomes the Lance SQL `rating >= 3` and rides on the pushed full text operation as its prefilter, the page is pushed too (`PUSHED_SCAN`), and nothing is `unplanned`. The physical lines carry three terms per operator (`accuracy`, `tie_stability`, `cost`), cut here for width:
+The `bool` from "Composition with bool" is a shape the translator spells. The stock `match` was rewritten to `lance_match` before planning (the `logical` text and `lance_clause` show the rewritten clause), the `range` becomes the Lance SQL `rating >= 3` and rides on the pushed full text operation as its prefilter, the page is pushed too (`PUSHED_SCAN`), and nothing is `unplanned`. The `index=inverted` term on the pushed `fts`, and `fts_index` under `fragment_plan`, say that `body` is answered from its inverted index and not scanned flat. The physical lines carry three terms per operator (`accuracy`, `tie_stability`, `cost`), cut here for width:
 
 ```
 curl -s -X GET 'http://localhost:9200/_plugins/_lance/explain/demo?pretty' \
@@ -573,11 +573,12 @@ curl -s -X GET 'http://localhost:9200/_plugins/_lance/explain/demo?pretty' \
   "index" : "demo",
   "route" : "fragment",
   "logical" : "LanceHitShape(columns=[[id, body, title, rating, embedding]], source=[true], id=[true], score=[true], sortValues=[false])\n  LanceTopK(collations=[[]], fetch=[3], offset=[0])\n    LanceFtsMatch(kind=[MATCH], columns=[[body]], query=[{\"lance_match\":{\"field\":\"body\",\"query\":\"hello\",\"boost\":1.0}}])\n      LogicalFilter(condition=[>=(CAST($3):BIGINT NOT NULL, 3)])\n        LanceTableScan(table=[[lance, demo]])\n",
-  "physical" : "MergeExec(reduce=[HITS_TOP_K], ...)\n  FanOutExec(fanOut=[1], partitioning=[EQUAL_FRAGMENT_GROUPS], ...)\n    LanceTableScan(table=[[lance, demo]], pushed=[[fts{kind=MATCH, columns=[body], query={\"lance_match\":{\"field\":\"body\",\"query\":\"hello\",\"boost\":1.0}}, filter=rating >= 3}, topk{collations=[], fetch=3, offset=0, hits{columns=[id, body, title, rating, embedding], source=true, id=true, score=true, sortValues=false}}]], ...)\n",
+  "physical" : "MergeExec(reduce=[HITS_TOP_K], ...)\n  FanOutExec(fanOut=[1], partitioning=[EQUAL_FRAGMENT_GROUPS], ...)\n    LanceTableScan(table=[[lance, demo]], pushed=[[fts{kind=MATCH, columns=[body], index=inverted, query={\"lance_match\":{\"field\":\"body\",\"query\":\"hello\",\"boost\":1.0}}, filter=rating >= 3}, topk{collations=[], fetch=3, offset=0, hits{columns=[id, body, title, rating, embedding], source=true, id=true, score=true, sortValues=false}}]], ...)\n",
   "fragment_plan" : {
     "kind" : "PUSHED_SCAN",
     "filter_sql" : "rating >= 3",
     "lance_clause" : "lance_match",
+    "fts_index" : "inverted",
     "top_k" : {
       "orderings" : [ ],
       "fetch" : 3
@@ -588,7 +589,9 @@ curl -s -X GET 'http://localhost:9200/_plugins/_lance/explain/demo?pretty' \
     "requested" : { "accuracy" : "APPROXIMATE", "tie_stability" : "NONE" },
     "declared" : { "accuracy" : "EXACT", "tie_stability" : "UNSTABLE" },
     "enforcer" : "none"
-  }
+  },
+  "cacheable" : false,
+  "cacheable_reason" : "size > 0"
 }
 ```
 
@@ -615,7 +618,9 @@ curl -s -X GET 'http://localhost:9200/_plugins/_lance/explain/demo?pretty' \
     "requested" : { "accuracy" : "APPROXIMATE", "tie_stability" : "NONE" },
     "declared" : { "accuracy" : "EXACT", "tie_stability" : "STABLE_ROWADDR" },
     "enforcer" : "none"
-  }
+  },
+  "cacheable" : false,
+  "cacheable_reason" : "size > 0"
 }
 ```
 
@@ -627,11 +632,13 @@ How to read the fields:
   - Every physical line ends with the `accuracy` and `tie_stability` the operator declares and the `cost` the planner charged it; the root adds `total_cost`, the figure the candidates were compared by.
   - Below a million rows the milliseconds are placeholders (a bare scan charges one per row, which is where the `16` above comes from); at a million rows and above an aggregation is priced by the fitted model described in [query-plan.md](query-plan.md#cost).
 - `fragment_plan` is what every data node receives: `kind` (`PUSHED_SCAN`, `LUCENE_TOPK`, `LUCENE_COUNT`, `LUCENE_AGGREGATE`), the `filter_sql` of the scalar predicate when there is one, the `lance_clause` the executor builds its Lance query from, and the pushed `top_k` page or `aggregate`.
+  - `fts_index` sits next to a full text `lance_clause` and says how the clause runs: `inverted` when every searched column carries an inverted index, `none` when none does and Lance scans the rows flat (a `lance_text` override on a column without an index), `mixed` when the columns split. The `index=` term on the pushed `fts` in `physical` carries the same information, one word per column when they split (`index=[body=inverted, title=none]`).
 - `unplanned` is present only when some element kept the request, or the whole query, on the Lucene side, and names it (`query type [match]` for a `match` on a field that is not `lance_text`, `full text clause in [should] next to [filter] without a [must] clause`, `sort type [_geo_distance]`, `aggregation type [multi_terms]`, `size [5] (only 0 with aggregations)`, `pipeline aggregation`). It is absent when the planner's cost model chose the Lucene operator for a tree that did translate; the physical plan shows that choice.
 - `refinements_possible` lists the downgrades a data node could still apply to the shipped plan for what only it knows (`security_wrapper` when a DLS / FLS reader wrapper is installed, `sort_field_type` for a page sorted by an `ip` column). `GET /_plugins/_lance/stats` counts what the nodes did under `plan.refinements` and `plan.executed`, see step 6.
 - `traits` is what the body demanded of the plan (`requested`) against what the chosen plan declares (`declared`). `enforcer` says whether the planner had to replace the cheapest plan with one meeting the demand.
   - `requested`: an explicit `track_total_hits` demands `EXACT` accuracy, a `search_after` cursor demands a reproducible tie order; `APPROXIMATE` and `NONE` mean no demand.
   - `declared`: the bare scan above returns rows in Lance row address order (`STABLE_ROWADDR`); a page cut in score order out of a full text or knn scan is `UNSTABLE`, which is why `search_after` over a `lance_match` page sorted by `_score` alone is refused.
+- `cacheable` says whether a `_search` with the same body would be answered from the coordinator result cache on a repeat while the table stays at its version; `cacheable_reason` names why not (`size > 0` for both examples above, which ask for hits; `from > 0`, `dls`, `disabled`). [features.md](features.md#result-cache) has the cache's rules.
 
 The plan text format will change as the planner grows; read it, do not parse it.
 
