@@ -8,6 +8,7 @@ package org.opensearch.lance;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
@@ -24,8 +25,7 @@ import org.opensearch.core.rest.RestStatus;
  * that updates the mapping, a check at the table's version does nothing,
  * a pinned index is never checked, and {@code GET /_plugins/_lance/stats} counts
  * all of it under {@code freshness}. Without a sync, the engine reads
- * the table's current version on every read and the mapping follows the
- * first search that observes a new version.
+ * the table's current version on every read.
  */
 public class LanceFreshnessIT extends LanceRestTestCase {
 
@@ -141,10 +141,10 @@ public class LanceFreshnessIT extends LanceRestTestCase {
 
     public void testEngineReadsSeeACommitOnTheNextCallWithoutASyncOrACadence() throws Exception {
         // The engine refreshes before every read of its own, so a row
-        // committed to the table is answered by GET, counted by _stats
-        // and read by a mixed target _search on the call right after the
-        // commit, with no sync and no wait for the scheduled check. A
-        // string PK table gives GET something to look up.
+        // committed to the table is answered by GET and _mget, counted by
+        // _stats and read by a mixed target _search on the call right
+        // after the commit, with no sync and no wait for the scheduled
+        // check. A string PK table gives GET something to look up.
         String suffix = "engine-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -179,6 +179,15 @@ public class LanceFreshnessIT extends LanceRestTestCase {
             @SuppressWarnings("unchecked")
             Map<String, Object> source = (Map<String, Object>) parseJson(hitBody).get("_source");
             assertEquals(hitBody, "col-5", source.get("label"));
+            // _mget goes through the same searcher acquisition and finds the row too.
+            String mgetBody = readAll(postJson("/" + indexName + "/_mget", "{\"ids\":[\"alpha-5\"]}"));
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> mgetDocs = (List<Map<String, Object>>) parseJson(mgetBody).get("docs");
+            assertEquals(mgetBody, 1, mgetDocs.size());
+            assertEquals(mgetBody, Boolean.TRUE, mgetDocs.get(0).get("found"));
+            @SuppressWarnings("unchecked")
+            Map<String, Object> mgetSource = (Map<String, Object>) mgetDocs.get(0).get("_source");
+            assertEquals(mgetBody, "col-5", mgetSource.get("label"));
             assertEquals("the next _stats counts the appended rows", 6, engineDocCount(indexName));
 
             // A third commit, read by the stock search path over a mixed
@@ -191,53 +200,6 @@ public class LanceFreshnessIT extends LanceRestTestCase {
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName + "," + plain));
-            } catch (Exception ignored) {}
-        }
-    }
-
-    public void testTheMappingFollowsTheFirstSearchThatObservesANewColumn() throws Exception {
-        // A column the table gained is in the mapping after one _search
-        // observed the new version, without a sync: the coordinator asks
-        // the shard's node to check the version it read. A filter on the
-        // new column answers from the Arrow schema of the version the
-        // request read, so it does not wait for the mapping at all.
-        String suffix = "newcol-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
-        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
-        String tableName = "demo-" + suffix;
-        LanceTableFactory.writeTable(scratchDir, tableName, 6);
-        String tableUri = scratchDir.resolve(tableName + ".lance").toString();
-        String indexName = tableName;
-        try {
-            Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
-            assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
-            ensureGreen(indexName);
-            String before = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
-            assertFalse("no score column yet: " + before, before.contains("\"score\":{"));
-
-            // score = id * 10: rows 4 and 5 are at or above 40.
-            LanceTableFactory.addComputedColumn(tableUri, "score", "id * 10");
-            String filtered = readAll(
-                postJson(
-                    "/" + indexName + "/_search",
-                    "{\"size\":10,\"query\":{\"range\":{\"score\":{\"gte\":40}}},\"_source\":[\"id\",\"score\"]}"
-                )
-            );
-            assertEquals(
-                "the filter on the new column answers from the version the request read: " + filtered,
-                2,
-                extractIntPath(filtered, "hits", "total", "value")
-            );
-            assertBusy(() -> {
-                try {
-                    String mapping = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_mapping")));
-                    assertTrue("the mapping gained the column: " + mapping, mapping.contains("\"score\":{"));
-                } catch (ResponseException e) {
-                    throw new AssertionError("index temporarily unavailable: " + e.getMessage(), e);
-                }
-            });
-        } finally {
-            try {
-                client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
         }
     }

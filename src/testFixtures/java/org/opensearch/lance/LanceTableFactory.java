@@ -16,7 +16,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Optional;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
@@ -53,7 +52,6 @@ import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.schema.ColumnAlteration;
-import org.lance.schema.SqlExpressions;
 
 /**
  * Test-only helper that writes a small Lance table onto the local
@@ -732,24 +730,6 @@ public final class LanceTableFactory {
             Dataset dataset = Dataset.open().allocator(allocator).uri(tableUri).build()
         ) {
             dataset.addColumns(List.of(new Field(column, FieldType.nullable(type), null)));
-        }
-    }
-
-    /**
-     * Add a column computed from a SQL expression over the existing
-     * columns ({@code "id * 10"}) through
-     * {@code Dataset.addColumns(SqlExpressions, batchSize)}. Simulates
-     * {@code dataset.add_columns({"score": "id * 10"})} from Python: the
-     * schema gains a field under a new manifest version and every row
-     * gets a value. Used by tests that query a column the mapping does
-     * not know yet.
-     */
-    public static void addComputedColumn(String tableUri, String column, String sqlExpression) throws Exception {
-        try (
-            RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
-            Dataset dataset = Dataset.open().allocator(allocator).uri(tableUri).build()
-        ) {
-            dataset.addColumns(new SqlExpressions.Builder().withExpression(column, sqlExpression).build(), Optional.empty());
         }
     }
 
