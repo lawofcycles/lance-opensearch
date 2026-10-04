@@ -41,7 +41,7 @@ public class LanceNamespaceWireVersionTests extends OpenSearchTestCase {
     }
 
     public void testSyncRequest() throws Exception {
-        LanceIndexSyncRequest original = new LanceIndexSyncRequest("demo");
+        LanceIndexSyncRequest original = new LanceIndexSyncRequest("demo", 7L);
         try (BytesStreamOutput out = new BytesStreamOutput()) {
             original.writeTo(out);
             try (StreamInput in = out.bytes().streamInput()) {
@@ -49,19 +49,43 @@ public class LanceNamespaceWireVersionTests extends OpenSearchTestCase {
                 in.readOptionalWriteable(ShardId::new);
                 assertEquals("demo", in.readOptionalString());
                 assertEquals(LanceIndexSyncRequest.WIRE_VERSION, in.readVInt());
-                assertEquals("nothing follows the marker", -1, in.read());
+                assertEquals("the observed version block is optional", 0, in.readVInt());
+                assertEquals(7L, StreamInput.wrap(in.readByteArray()).readLong());
+                assertEquals("nothing follows the block", -1, in.read());
             }
             try (StreamInput in = out.bytes().streamInput()) {
-                assertEquals("demo", new LanceIndexSyncRequest(in).index());
+                LanceIndexSyncRequest restored = new LanceIndexSyncRequest(in);
+                assertEquals("demo", restored.index());
+                assertEquals(7L, restored.observedVersion());
             }
         }
+        assertEquals(LanceIndexSyncRequest.NO_OBSERVED_VERSION, new LanceIndexSyncRequest("demo").observedVersion());
         Writeable prelude = out -> {
             TaskId.EMPTY_TASK_ID.writeTo(out);
             out.writeOptionalWriteable(null);
             out.writeOptionalString("demo");
         };
-        assertEquals("demo", ((LanceIndexSyncRequest) readNextVersion(original, prelude, LanceIndexSyncRequest::new)).index());
-        assertRefusesCritical("LanceIndexSyncRequest", original, prelude, LanceIndexSyncRequest::new);
+        LanceIndexSyncRequest next = (LanceIndexSyncRequest) readNextVersion(original, prelude, LanceIndexSyncRequest::new);
+        assertEquals("demo", next.index());
+        assertEquals(7L, next.observedVersion());
+        assertRefusesCritical("LanceIndexSyncRequest", LanceIndexSyncRequest.WIRE_VERSION, original, prelude, LanceIndexSyncRequest::new);
+    }
+
+    public void testSyncRequestOfAVersion1NodeChecksUnconditionally() throws Exception {
+        // The stream a node of the previous plugin version writes: the
+        // base class fields, marker 1 and no block.
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            TaskId.EMPTY_TASK_ID.writeTo(out);
+            out.writeOptionalWriteable(null);
+            out.writeOptionalString("demo");
+            WireVersion.write(out, 1);
+            try (StreamInput in = out.bytes().streamInput()) {
+                LanceIndexSyncRequest restored = new LanceIndexSyncRequest(in);
+                assertEquals("demo", restored.index());
+                assertEquals(LanceIndexSyncRequest.NO_OBSERVED_VERSION, restored.observedVersion());
+                assertEquals(-1, in.read());
+            }
+        }
     }
 
     public void testSyncResponse() throws Exception {

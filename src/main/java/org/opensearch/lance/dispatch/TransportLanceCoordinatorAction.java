@@ -183,6 +183,12 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * read, served again while the table stays at that version.
      */
     private final LanceRequestCache requestCache;
+    /**
+     * Asks the shard's node for a freshness check at the version a fan
+     * out observed, once per index and version, so the mapping follows
+     * the first request that reads a new table version.
+     */
+    private final LanceFreshnessTrigger freshnessTrigger;
 
     /**
      * Requests that reach this action over the transport layer (a
@@ -223,6 +229,7 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         this.warmCache = warmCache;
         this.planExecutor = new PlanExecutor(plannerFactory);
         this.requestCache = requestCache;
+        this.freshnessTrigger = new LanceFreshnessTrigger(client, threadPool, clusterService);
     }
 
     /**
@@ -853,6 +860,15 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
         }
         try (Dataset dataset = warmCache.openDataset(target.tableUri(), target.storageOptions(), pinned)) {
             observedVersion = dataset.version();
+            // The mapping may not know this version yet (a column the
+            // table gained since the last freshness check): the shard's
+            // node is asked to check it now, once per version, without
+            // holding this request up. A result cache hit below still
+            // observed the version, so the ask comes first.
+            IndexMetadata observedIndex = clusterService.state().metadata().index(target.index());
+            if (observedIndex != null) {
+                freshnessTrigger.observed(observedIndex, observedVersion);
+            }
             // The result cache is keyed on this version: an entry means
             // the same body already ran against the same manifest on the
             // same node list, so nothing is planned or sent and the merge
