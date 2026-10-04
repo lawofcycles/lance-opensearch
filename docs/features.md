@@ -86,6 +86,7 @@ Distribution over the cluster is automatic: fragments are spread over every data
 - Config values whose key contains `secret`, `password`, `token`, `key`, `authorization`, or `credential` (case-insensitive) are accepted and handed to the implementation intact, but never leave the node readable: `GET /_plugins/_lance/namespace`, the cluster state API, and every log line show them as `***`.
   - The namespace's `storage_options` follow the same rule in the cluster state API (`GET _cluster/state/metadata`, custom `lance.namespaces`) and in log lines; `GET /_plugins/_lance/namespace` does not list storage options at all.
   - Only the gateway-persisted cluster state keeps the raw values, so the catalogs re-initialise and their tables reopen after a full cluster restart.
+  - `config` accepts at most 64 entries, keys of at most 256 bytes and values of at most 4 KiB (UTF 8 bytes), the same bounds as `storage_options`; a larger map returns 400 naming the count or the key and its length, never the value.
 - A catalog whose `initialize` or listing fails (bad credentials, unreachable endpoint) is kept as a registration, warned about once, and retried on every poll; `GET /_plugins/_lance/namespace` shows it as `"status": "unavailable"` with the error message until a poll succeeds.
 - A top level key of the register body outside `path`, `type`, `name`, `config`, `storage_options` and `overrides` returns 400 naming the key and the accepted list; the identifier bodies of `POST /_plugins/_lance/namespace/tables` and `DELETE /_plugins/_lance/namespace` accept `path` and `name` only.
 - For every type except `directory`, each table's location comes from the catalog's `describeTable` and is checked against `plugins.lance.allowed_table_roots` before the table surfaces (the register call names no path the allowlist could gate up front); a directory registration checks its root at register time.
@@ -574,6 +575,7 @@ Test settings, all node scope and dynamic; do not change them on a real node:
   ```
 
 - Keys follow Lance's Rust `object_store` naming. Values ride into `index.plugins.lance.storage_options.<key>` settings so the same JVM can address multiple buckets with different credentials concurrently.
+- Both `storage_options` and the namespace `config` map accept at most 64 entries, keys of at most 256 bytes and values of at most 4 KiB (UTF 8 bytes); a map outside these bounds returns 400 naming the count or the key and its length, never the value.
 - The credential keys are withheld from the settings and cluster state APIs, and a snapshot of the index still carries them; see [limitations.md](limitations.md#storage-and-credentials) before writing keys into the map.
 - Empty map falls back to Lance's env-var lookup (`AWS_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `AWS_ALLOW_HTTP`).
 

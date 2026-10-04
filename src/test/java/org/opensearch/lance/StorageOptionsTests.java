@@ -104,6 +104,78 @@ public class StorageOptionsTests extends OpenSearchTestCase {
         assertTrue("unexpected: " + e.getMessage(), e.getMessage().contains("must be a string"));
     }
 
+    private static Map<String, Object> entries(int count) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        for (int i = 0; i < count; i++) {
+            body.put("key_" + i, "value_" + i);
+        }
+        return body;
+    }
+
+    public void testParseFromRequestFieldAcceptsTheEntryBound() {
+        StorageOptions options = StorageOptions.parseFromRequestField(entries(StorageOptions.MAX_ENTRIES), "[lance_attach]");
+        assertEquals(StorageOptions.MAX_ENTRIES, options.asMap().size());
+    }
+
+    public void testParseFromRequestFieldRejectsOneEntryAboveTheBound() {
+        Map<String, Object> body = entries(StorageOptions.MAX_ENTRIES + 1);
+        Exception e = expectThrows(IllegalArgumentException.class, () -> StorageOptions.parseFromRequestField(body, "[lance_attach]"));
+        assertEquals(
+            "[lance_attach] storage_options has ["
+                + (StorageOptions.MAX_ENTRIES + 1)
+                + "] entries, the limit is "
+                + StorageOptions.MAX_ENTRIES,
+            e.getMessage()
+        );
+    }
+
+    public void testParseFromRequestFieldAcceptsTheKeyBound() {
+        String key = "k".repeat(StorageOptions.MAX_KEY_BYTES);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put(key, "v");
+        assertEquals("v", StorageOptions.parseFromRequestField(body, "[lance_attach]").asMap().get(key));
+    }
+
+    public void testParseFromRequestFieldRejectsOneByteAboveTheKeyBound() {
+        // A multi byte character shows the bound counts UTF 8 bytes, not chars.
+        String key = "k".repeat(StorageOptions.MAX_KEY_BYTES - 1) + "\u00e9";
+        assertEquals(StorageOptions.MAX_KEY_BYTES, key.length());
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put(key, "v");
+        Exception e = expectThrows(IllegalArgumentException.class, () -> StorageOptions.parseFromRequestField(body, "[lance_attach]"));
+        assertEquals(
+            "[lance_attach] storage_options key ["
+                + key
+                + "] is ["
+                + (StorageOptions.MAX_KEY_BYTES + 1)
+                + "] bytes, the limit is "
+                + StorageOptions.MAX_KEY_BYTES,
+            e.getMessage()
+        );
+    }
+
+    public void testParseFromRequestFieldAcceptsTheValueBound() {
+        String value = "v".repeat(StorageOptions.MAX_VALUE_BYTES);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("aws_session_token", value);
+        assertEquals(value, StorageOptions.parseFromRequestField(body, "[lance_attach]").asMap().get("aws_session_token"));
+    }
+
+    public void testParseFromRequestFieldRejectsOneByteAboveTheValueBoundWithoutQuotingIt() {
+        String value = "v".repeat(StorageOptions.MAX_VALUE_BYTES + 1);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("aws_session_token", value);
+        Exception e = expectThrows(IllegalArgumentException.class, () -> StorageOptions.parseFromRequestField(body, "[lance_attach]"));
+        assertEquals(
+            "[lance_attach] storage_options value for [aws_session_token] is ["
+                + (StorageOptions.MAX_VALUE_BYTES + 1)
+                + "] bytes, the limit is "
+                + StorageOptions.MAX_VALUE_BYTES,
+            e.getMessage()
+        );
+        assertFalse("the value must not be quoted: " + e.getMessage(), e.getMessage().contains("vvvv"));
+    }
+
     public void testFromIndexSettingsAndWriteToSettingsRoundTrip() {
         StorageOptions original = StorageOptions.of(Map.of("aws_region", "us-west-2", "aws_endpoint", "https://s3.example"));
         Settings.Builder builder = Settings.builder();
