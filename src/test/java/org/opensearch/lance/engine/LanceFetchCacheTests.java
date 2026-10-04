@@ -361,7 +361,7 @@ public class LanceFetchCacheTests extends OpenSearchTestCase {
                 assertSame(snapshot.fetchTable(), ((LanceStoredFields) leaf.storedFields()).fetchCache());
                 leaf.setTakeProjection(all);
                 leaf.setFetchCacheEligible(true);
-                leaf.prefetchRows(new int[] { 1, 8, 8 });
+                leaf.prefetchRows(new int[] { 1, 8, 8 }, LanceCancellation.NONE);
                 assertEquals("one take", before.takeCount() + 1, FetchTakeStats.snapshot().takeCount());
                 assertEquals(2L * all.columns().size(), fetchCache.count());
                 assertEquals("nothing was held before the take", 0L, fetchCache.hitCount());
@@ -379,7 +379,7 @@ public class LanceFetchCacheTests extends OpenSearchTestCase {
                 LanceFragmentLeafReader leaf = leafOf(reader);
                 leaf.setTakeProjection(all);
                 leaf.setFetchCacheEligible(true);
-                leaf.prefetchRows(new int[] { 1, 8 });
+                leaf.prefetchRows(new int[] { 1, 8 }, LanceCancellation.NONE);
                 assertEquals("no take", before.takeCount(), FetchTakeStats.snapshot().takeCount());
                 assertEquals(2L * all.columns().size(), fetchCache.hitCount());
                 assertEquals(2L, fetchCache.rowsServedCount());
@@ -399,7 +399,7 @@ public class LanceFetchCacheTests extends OpenSearchTestCase {
                 LanceFragmentLeafReader leaf = leafOf(reader);
                 leaf.setTakeProjection(keyOnly);
                 leaf.setFetchCacheEligible(true);
-                leaf.prefetchRows(new int[] { 20, 21 });
+                leaf.prefetchRows(new int[] { 20, 21 }, LanceCancellation.NONE);
                 assertEquals(before.takeCount() + 1, FetchTakeStats.snapshot().takeCount());
                 assertEquals(before.takeColumns() + 1, FetchTakeStats.snapshot().takeColumns());
             }
@@ -409,7 +409,7 @@ public class LanceFetchCacheTests extends OpenSearchTestCase {
                 LanceFragmentLeafReader leaf = leafOf(reader);
                 leaf.setTakeProjection(all);
                 leaf.setFetchCacheEligible(true);
-                leaf.prefetchRows(new int[] { 20, 21 });
+                leaf.prefetchRows(new int[] { 20, 21 }, LanceCancellation.NONE);
                 assertEquals("a partial hit is taken whole", before.takeCount() + 1, FetchTakeStats.snapshot().takeCount());
                 assertEquals(before.takeColumns() + all.columns().size(), FetchTakeStats.snapshot().takeColumns());
                 assertEquals(served, fetchCache.rowsServedCount());
@@ -419,7 +419,7 @@ public class LanceFetchCacheTests extends OpenSearchTestCase {
                 LanceFragmentLeafReader leaf = leafOf(reader);
                 leaf.setTakeProjection(all);
                 leaf.setFetchCacheEligible(true);
-                leaf.prefetchRows(new int[] { 20, 21 });
+                leaf.prefetchRows(new int[] { 20, 21 }, LanceCancellation.NONE);
                 assertEquals("the take filled the other cells", before.takeCount(), FetchTakeStats.snapshot().takeCount());
                 assertEquals(served + 2, fetchCache.rowsServedCount());
             }
@@ -447,7 +447,7 @@ public class LanceFetchCacheTests extends OpenSearchTestCase {
                 LanceFragmentLeafReader leaf = LanceFragmentLeafReader.unwrap(foreign);
                 leaf.setTakeProjection(all);
                 leaf.setFetchCacheEligible(false);
-                leaf.prefetchRows(new int[] { 1, 8, 30 });
+                leaf.prefetchRows(new int[] { 1, 8, 30 }, LanceCancellation.NONE);
                 assertEquals("the held rows are taken all the same", before.takeCount() + 1, FetchTakeStats.snapshot().takeCount());
                 assertEquals(before.takeRows() + 3, FetchTakeStats.snapshot().takeRows());
                 assertEquals("nothing read", hits, fetchCache.hitCount());
@@ -461,7 +461,7 @@ public class LanceFetchCacheTests extends OpenSearchTestCase {
             try (LanceDirectoryReader reader = open(snapshot, fragmentIds)) {
                 LanceFragmentLeafReader leaf = leafOf(reader);
                 leaf.setTakeProjection(all);
-                leaf.prefetchRows(new int[] { 1, 8 });
+                leaf.prefetchRows(new int[] { 1, 8 }, LanceCancellation.NONE);
                 assertEquals(before.takeCount() + 1, FetchTakeStats.snapshot().takeCount());
                 assertEquals(hits, fetchCache.hitCount());
                 assertEquals(3L, fetchCache.skippedCount());

@@ -536,12 +536,13 @@ final class FragmentHitsPages {
      * store whatever the number of fragments the page touches. Before
      * the take every leaf is told whether its rows may go through the
      * node's fetch cache, as {@link #prefetchHitRows} tells the leaves
-     * of a query round page. The hits come back in the order of the
-     * addresses and carry neither score nor sort values; the coordinator
-     * stamps those from the query round. An address whose fragment is
-     * not a leaf of the reader, or whose offset is past the fragment's
-     * rows, is a coordinator bug (the round names rows the query round
-     * collected from the same version) and fails the round.
+     * of a query round page, and the take checks the context's
+     * cancellation after every batch. The hits come back in the order
+     * of the addresses and carry neither score nor sort values; the
+     * coordinator stamps those from the query round. An address whose
+     * fragment is not a leaf of the reader, or whose offset is past the
+     * fragment's rows, is a coordinator bug (the round names rows the
+     * query round collected from the same version) and fails the round.
      */
     static List<SearchHit> render(
         LanceFragmentSearchContext searchContext,
@@ -588,7 +589,7 @@ final class FragmentHitsPages {
             }
             docIdsByLeaf.put(entry.getKey(), leafDocs);
         }
-        LanceMultiLeafTake.prefetchRows(docIdsByLeaf);
+        LanceMultiLeafTake.prefetchRows(docIdsByLeaf, searchContext.cancellation());
         return Arrays.asList(fetchPhase.fetch(searchContext, docIds));
     }
 
@@ -613,7 +614,7 @@ final class FragmentHitsPages {
         if (scoreDocs.length == 0) {
             return HitsPage.EMPTY;
         }
-        prefetchHitRows(reader, scoreDocs, groupScan);
+        prefetchHitRows(reader, scoreDocs, groupScan, searchContext.cancellation());
         int[] docIds = new int[scoreDocs.length];
         for (int i = 0; i < scoreDocs.length; i++) {
             docIds[i] = scoreDocs[i].doc;
@@ -671,8 +672,17 @@ final class FragmentHitsPages {
      * included, so on a cluster running it no request reads or writes
      * the cache and a field its field level security hides for one user
      * is never handed to another from the cache.
+     *
+     * <p>Every leaf's take checks {@code cancellation} after each batch,
+     * so a cancelled request stops at the next batch boundary of
+     * whichever take is running.
      */
-    private static void prefetchHitRows(IndexReader reader, ScoreDoc[] scoreDocs, FragmentGroupScan groupScan) throws IOException {
+    private static void prefetchHitRows(
+        IndexReader reader,
+        ScoreDoc[] scoreDocs,
+        FragmentGroupScan groupScan,
+        LanceCancellation cancellation
+    ) throws IOException {
         if (scoreDocs.length == 0) {
             return;
         }
@@ -697,7 +707,7 @@ final class FragmentHitsPages {
                     for (int i = 0; i < docIds.length; i++) {
                         docIds[i] = docs.get(i);
                     }
-                    lance.prefetchRows(docIds);
+                    lance.prefetchRows(docIds, cancellation);
                 }
                 return null;
             });

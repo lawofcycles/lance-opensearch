@@ -24,6 +24,8 @@ import org.lance.Fragment;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.tasks.TaskCancelledException;
+import org.opensearch.core.tasks.TaskId;
 import org.opensearch.index.mapper.Uid;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
@@ -36,6 +38,7 @@ import org.opensearch.lance.stats.LanceNodeStats;
 import org.opensearch.search.fetch.StoredFieldsContext;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
 import org.opensearch.search.fetch.subphase.FieldAndFormat;
+import org.opensearch.tasks.CancellableTask;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -51,7 +54,10 @@ import org.opensearch.test.OpenSearchTestCase;
  * {@code id, body, rating, category, tags, flag} in schema order (the
  * vector column is not surfaced); and the struct table of
  * {@link LanceTableFactory#writeStructTable} ({@code id} primary key,
- * {@code meta} struct) for the parent and child rules.
+ * {@code meta} struct) for the parent and child rules. The last test
+ * takes more rows than one {@link LanceStoredFields#TAKE_CHUNK} from the
+ * one fragment table, so the take reads at least two batches, and shows
+ * that the take observes the request's cancellation between them.
  */
 @ThreadLeakScope(ThreadLeakScope.Scope.NONE)
 public class LanceStoredFieldsTests extends OpenSearchTestCase {
@@ -237,7 +243,7 @@ public class LanceStoredFieldsTests extends OpenSearchTestCase {
                 leaf.setTakeAccumulator(takes);
                 leaf.setTakeProjection(projection(FetchSourceContext.DO_NOT_FETCH_SOURCE, null).takeProjection(schema));
                 LanceNodeStats.FetchStats before = FetchTakeStats.snapshot();
-                leaf.prefetchRows(new int[] { 1, 7 });
+                leaf.prefetchRows(new int[] { 1, 7 }, LanceCancellation.NONE);
                 LanceNodeStats.FetchStats after = FetchTakeStats.snapshot();
                 assertEquals("one take", before.takeCount() + 1, after.takeCount());
                 assertEquals("the take projects the key only", before.takeColumns() + 1, after.takeColumns());
@@ -255,7 +261,7 @@ public class LanceStoredFieldsTests extends OpenSearchTestCase {
                     projection(new FetchSourceContext(true, new String[] { "category", "rating" }, null), null).takeProjection(schema)
                 );
                 before = FetchTakeStats.snapshot();
-                leaf.prefetchRows(new int[] { 1 });
+                leaf.prefetchRows(new int[] { 1 }, LanceCancellation.NONE);
                 after = FetchTakeStats.snapshot();
                 assertEquals(before.takeColumns() + 3, after.takeColumns());
                 Collected both = new Collected(true, true);
@@ -277,6 +283,96 @@ public class LanceStoredFieldsTests extends OpenSearchTestCase {
                 assertEquals("2", flagOnly.id());
                 assertEquals(Map.of("flag", true), flagOnly.source());
             }
+        }
+    }
+
+    public void testTakeObservesCancellationBetweenBatches() throws Exception {
+        Path scratchDir = createTempDir();
+        String uri = LanceTableFactory.writeHintFixtureTable(scratchDir, "take-" + getTestName().toLowerCase(Locale.ROOT), 1, 10_000);
+        // More doc ids than one chunk: the take opens two scans, so the
+        // loop sees at least two batches whatever Lance's batch size.
+        int[] docIds = new int[LanceStoredFields.TAKE_CHUNK + 10];
+        for (int i = 0; i < docIds.length; i++) {
+            docIds[i] = i;
+        }
+        // A task cancelled before the second batch: the take throws at
+        // that batch's check and asks the task nothing more.
+        try (LanceDirectoryReader reader = open(uri)) {
+            LanceFragmentLeafReader leaf = LanceFragmentLeafReader.unwrap(reader.leaves().get(0).reader());
+            FetchTakeStats.Accumulator takes = new FetchTakeStats.Accumulator();
+            leaf.setTakeAccumulator(takes);
+            CancelOnSecondCheck task = new CancelOnSecondCheck(true);
+            expectThrows(TaskCancelledException.class, () -> leaf.prefetchRows(docIds, LanceCancellation.of(task)));
+            assertEquals("the loop stopped at the check that saw the cancellation", 2, task.checks);
+        }
+        // The same take under a task that is never cancelled returns
+        // every row: rendering the page issues no further take.
+        try (LanceDirectoryReader reader = open(uri)) {
+            LanceFragmentLeafReader leaf = LanceFragmentLeafReader.unwrap(reader.leaves().get(0).reader());
+            FetchTakeStats.Accumulator takes = new FetchTakeStats.Accumulator();
+            leaf.setTakeAccumulator(takes);
+            CancelOnSecondCheck task = new CancelOnSecondCheck(false);
+            leaf.prefetchRows(docIds, LanceCancellation.of(task));
+            assertTrue("the take read at least two batches: " + task.checks, task.checks >= 2);
+            assertEquals("two chunks, two takes", 2L, takes.takeCount());
+            assertEquals(docIds.length, takes.takeRows());
+            for (int docId : docIds) {
+                Collected hit = new Collected(true, true);
+                leaf.materialiseStoredFields(docId, hit);
+                assertEquals(Integer.toString(docId), hit.id());
+                assertEquals(docId, hit.source().get("id"));
+            }
+            assertEquals("every row came from the prefetch", 2L, takes.takeCount());
+        }
+    }
+
+    /**
+     * A reader over every fragment of the table at {@code uri}, on a
+     * dataset of its own: closing the reader closes its dataset.
+     */
+    private static LanceDirectoryReader open(String uri) throws Exception {
+        Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty());
+        List<Integer> fragmentIds = new ArrayList<>();
+        for (Fragment fragment : dataset.getFragments()) {
+            fragmentIds.add(fragment.getId());
+        }
+        return LanceDirectoryReader.openForFragments(
+            new ByteBuffersDirectory(),
+            null,
+            dataset,
+            "id",
+            LancePrimaryKeyType.LONG,
+            LanceOverrides.EMPTY,
+            fragmentIds
+        );
+    }
+
+    /**
+     * A task that, while {@code armed}, cancels itself the second time
+     * its state is read: the first batch of a take passes its check and
+     * the second does not. Counts the reads either way.
+     */
+    private static final class CancelOnSecondCheck extends CancellableTask {
+        private final boolean armed;
+        int checks;
+
+        CancelOnSecondCheck(boolean armed) {
+            super(1L, "transport", "test", "cancel on the second check", TaskId.EMPTY_TASK_ID, Map.of());
+            this.armed = armed;
+        }
+
+        @Override
+        public boolean isCancelled() {
+            checks++;
+            if (armed && checks == 2) {
+                cancel("second batch");
+            }
+            return super.isCancelled();
+        }
+
+        @Override
+        public boolean shouldCancelChildrenOnCancellation() {
+            return false;
         }
     }
 

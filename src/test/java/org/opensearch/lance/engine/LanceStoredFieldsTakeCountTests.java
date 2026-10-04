@@ -168,7 +168,7 @@ public class LanceStoredFieldsTakeCountTests extends OpenSearchTestCase {
             leaf.setTakeProjection(projection);
         }
         for (Map.Entry<Integer, int[]> slice : docsByLeaf(reader, scoreDocs).entrySet()) {
-            leaves.get(slice.getKey()).prefetchRows(slice.getValue());
+            leaves.get(slice.getKey()).prefetchRows(slice.getValue(), LanceCancellation.NONE);
         }
         return takes;
     }

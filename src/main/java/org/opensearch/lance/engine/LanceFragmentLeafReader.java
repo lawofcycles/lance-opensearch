@@ -753,11 +753,12 @@ public final class LanceFragmentLeafReader extends LeafReader {
     }
 
     /**
-     * Fetch the rows behind {@code docIds} for {@code _id} / {@code _source};
-     * see {@link LanceStoredFields#prefetchRows}.
+     * Fetch the rows behind {@code docIds} for {@code _id} / {@code _source},
+     * checking {@code cancellation} after every batch of the take; see
+     * {@link LanceStoredFields#prefetchRows}.
      */
-    public void prefetchRows(int[] docIds) throws IOException {
-        storedFields.prefetchRows(docIds);
+    public void prefetchRows(int[] docIds, LanceCancellation cancellation) throws IOException {
+        storedFields.prefetchRows(docIds, cancellation);
     }
 
     /**

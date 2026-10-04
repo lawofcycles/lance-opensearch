@@ -15,6 +15,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -45,6 +46,7 @@ import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.mapper.Uid;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
@@ -312,8 +314,17 @@ final class LanceStoredFields extends StoredFields {
      * {@link ScanAdmission#scanStarted} and {@link ScanAdmission#scanFinished}.
      * A chunk the cache served whole opens no scan and is not judged. A
      * refusal is thrown as the request's 429.
+     *
+     * <p>{@code cancellation} is the task the request runs under and is
+     * checked after every batch the take returns, so a cancelled request
+     * gives the search thread back at the next batch boundary instead of
+     * at the end of the chunk; the check throws
+     * {@link TaskCancelledException}, which closes the scanner through
+     * the try-with-resources. Callers without a task pass
+     * {@link LanceCancellation#NONE}; null is not accepted.
      */
-    void prefetchRows(int[] docIds) throws IOException {
+    void prefetchRows(int[] docIds, LanceCancellation cancellation) throws IOException {
+        Objects.requireNonNull(cancellation, "cancellation");
         // One projection per take: the executor sets it before the
         // request's first take, so every row of this request follows
         // the same column order as the rendering reads it back with.
@@ -396,6 +407,10 @@ final class LanceStoredFields extends StoredFields {
             long start = System.nanoTime();
             try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
+                    // A cancelled request stops at the batch boundary;
+                    // the batch itself runs in native code and cannot be
+                    // interrupted.
+                    cancellation.checkCancelled();
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
                     UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
                     FieldVector[] vectors = new FieldVector[takeColumns.size()];
@@ -415,7 +430,7 @@ final class LanceStoredFields extends StoredFields {
                         }
                     }
                 }
-            } catch (IOException e) {
+            } catch (IOException | TaskCancelledException e) {
                 throw e;
             } catch (Exception e) {
                 throw new IOException(e);
@@ -686,7 +701,10 @@ final class LanceStoredFields extends StoredFields {
         }
         Object[] row = takenRows.get(docID);
         if (row == null) {
-            prefetchRows(new int[] { docID });
+            // One row is one batch, so there is no batch boundary for a
+            // cancellation to stop at; the Lucene stored fields contract
+            // this runs under carries no task either.
+            prefetchRows(new int[] { docID }, LanceCancellation.NONE);
             row = takenRows.getOrDefault(docID, MISSING_ROW);
         }
         TakeProjection projection = this.projection;
