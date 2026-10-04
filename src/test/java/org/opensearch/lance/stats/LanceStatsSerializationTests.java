@@ -880,7 +880,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
         assertEquals("nothing was admitted, so nothing is retained", 0L, stats.admissionRetainedBytes());
         assertEquals(
             "every kind is reported, zero when it never refused",
-            List.of("fts", "scalar_index", "vector_index", "filter_scan", "aggregate_scan", "column_load", "fetch_take"),
+            List.of("fts", "fts_flat", "scalar_index", "vector_index", "filter_scan", "aggregate_scan", "column_load", "fetch_take"),
             List.copyOf(stats.admissionRejections().keySet())
         );
         assertEquals("none", stats.warmUpMode());

@@ -150,6 +150,8 @@ public final class ScanAdmission {
     public enum Kind {
         /** A full text scan over an inverted index (the document set rebuild, the row addresses of its SQL prefilter, plus the hits scan buffers). */
         FTS("fts", "full text scan"),
+        /** A full text scan over a column without an inverted index (Lance tokenises and scores the scanned rows itself). */
+        FTS_FLAT("fts_flat", "full text scan without an inverted index"),
         /** The load of a scalar index (BTree pages, bitmaps, a zone map) that answers a filter. */
         SCALAR_INDEX("scalar_index", "scalar index load"),
         /** The load of the IVF partitions a nearest scan probes, and its refine reads. */
@@ -275,6 +277,26 @@ public final class ScanAdmission {
      * whose available memory is below it.
      */
     static final long PHRASE_POSITION_BYTES_PER_ROW = 48L;
+
+    /**
+     * Native bytes per scanned row a full text scan over a column
+     * without an inverted index holds. Lance's flat path
+     * ({@code plan_flat_match_query} in {@code lance/src/dataset/scanner.rs},
+     * {@code FlatMatchQueryExec} in {@code lance/src/io/exec/fts.rs})
+     * reads the column of every target fragment, tokenises each row
+     * and, before it scores anything, collects for every row the row
+     * address, the row's token total and the count of each query token
+     * in it ({@code tokenize_and_count} in
+     * {@code lance-index/src/scalar/inverted/index/flat_search.rs}),
+     * then scores the whole collection with {@code MemBM25Scorer} and
+     * holds the scored batch next to it; nothing of this is cached
+     * between scans. The figure is pinned to the one measurement so
+     * far: a {@code match} over a 1B row Utf8 column without an index
+     * on one 128 GB node took 390 s and grew the resident set by about
+     * 100 GB, 100 bytes per row. QA fits it as further measurements
+     * come in.
+     */
+    static final long FLAT_FTS_BYTES_PER_ROW = 100L;
 
     /**
      * Allowance over the modelled scan rows for the batches Lance and
@@ -1259,6 +1281,65 @@ public final class ScanAdmission {
     }
 
     /**
+     * The {@link Kind#FTS_FLAT} estimate: Lance's flat BM25 scan of a
+     * table of {@code rows} rows over each of {@code flatColumns}
+     * columns that carry no inverted index, {@code rows ×
+     * FLAT_FTS_BYTES_PER_ROW} per column ({@link #FLAT_FTS_BYTES_PER_ROW}
+     * says what the scan holds per row). Zero when the sum fits
+     * {@code shardShareBytes}: buffers smaller than one shard of the
+     * cache the node dedicates to Lance are within its sizing, which is
+     * what every small table's flat scan costs. Judged on the table's
+     * rows like the {@link Kind#FTS} estimate, pending the fit of the
+     * coefficient.
+     */
+    static long flatFtsEstimateBytes(long rows, int flatColumns, long shardShareBytes) {
+        long total = Math.max(0L, rows) * FLAT_FTS_BYTES_PER_ROW * Math.max(0, flatColumns);
+        return total <= shardShareBytes ? 0L : total;
+    }
+
+    /**
+     * The rows of {@code column} an inverted index of the table does not
+     * cover, as the table statistics report them
+     * ({@code num_unindexed_rows} of the index statistics, summed over
+     * the column's inverted indexes), {@code 0} when the statistics are
+     * absent, name no inverted index on the column or carry no row
+     * figures for it. Lance scans these rows through its flat path next
+     * to the index lookup and unions the two, so the full text estimate
+     * charges them at {@link #FLAT_FTS_BYTES_PER_ROW} on top of the
+     * document set.
+     */
+    static long flatFtsUnindexedRows(String column, Optional<TableStatistics> statistics) {
+        if (column == null || statistics.isEmpty()) {
+            return 0L;
+        }
+        Optional<ColumnStatistics> columnStatistics = statistics.get().column(column);
+        if (columnStatistics.isEmpty()) {
+            return 0L;
+        }
+        long unindexed = 0L;
+        for (ColumnStatistics.IndexSummary index : columnStatistics.get().indexes()) {
+            if (index.is(IndexType.INVERTED) && index.unindexedRows().isPresent()) {
+                unindexed += Math.max(0L, index.unindexedRows().getAsLong());
+            }
+        }
+        return unindexed;
+    }
+
+    /**
+     * The rows the full text scans over {@code indexedColumns} read
+     * through Lance's flat path because the column's inverted index
+     * does not cover them: {@link #flatFtsUnindexedRows} summed over the
+     * columns.
+     */
+    static long flatFtsUnindexedRows(Set<String> indexedColumns, Optional<TableStatistics> statistics) {
+        long unindexed = 0L;
+        for (String column : indexedColumns) {
+            unindexed += flatFtsUnindexedRows(column, statistics);
+        }
+        return unindexed;
+    }
+
+    /**
      * The {@link Kind#SCALAR_INDEX} estimate: what Lance loads of the
      * index over a column to answer a predicate that selects
      * {@code selectivity} of the table's {@code rows}, zero when that
@@ -1871,22 +1952,83 @@ public final class ScanAdmission {
 
     /**
      * Gate one full-text scan of {@code shape} over {@code indexName},
-     * a table of {@code rows} physical rows. Reads the shard share
-     * from the installed Session (or the test override), the available
-     * physical memory from {@link #availablePhysicalMemoryBytes}, the
-     * retained credit from the pool and the settings from the static
-     * holders, records the estimate, and throws
-     * {@link CircuitBreakingException} on a rejection. An admitted non
-     * zero estimate is counted in flight on {@code ticket} (the
-     * request's {@link LanceHitsAccounting}, released by its close) or,
-     * without one, on the calling thread until {@link #requestEnded()}
-     * runs there.
+     * a table of {@code rows} physical rows, with every searched column
+     * taken as carrying an inverted index and without table statistics
+     * (see {@link #admit(String, long, Shape, Set, Optional, LanceHitsAccounting)}).
      */
     public static void admit(String indexName, long rows, Shape shape, LanceHitsAccounting ticket) {
+        admit(indexName, rows, shape, shape.columns(), Optional.empty(), ticket);
+    }
+
+    /**
+     * Gate one full-text scan of {@code shape} over {@code indexName},
+     * a table of {@code rows} physical rows. {@code indexedColumns} are
+     * the table's Utf8 columns that carry an inverted index (the
+     * snapshot's), {@code statistics} the table statistics when the
+     * node holds them. The columns the shape searches are split by the
+     * index: the columns with one are judged as {@link Kind#FTS} (the
+     * document set rebuild, plus the rows the index does not cover, read
+     * through Lance's flat path, at {@link #FLAT_FTS_BYTES_PER_ROW}
+     * each when the statistics report them), the columns without one as
+     * {@link Kind#FTS_FLAT} ({@link #flatFtsEstimateBytes}), each path
+     * in turn and each counted once on {@code ticket}. A shape that
+     * names no column (a test's) is judged as {@link Kind#FTS}. Reads the
+     * shard share from the installed Session (or the test override), the
+     * available physical memory from
+     * {@link #availablePhysicalMemoryBytes}, the retained credit from
+     * the pool and the settings from the static holders, records the
+     * estimate, and throws {@link CircuitBreakingException} on a
+     * rejection. An admitted non zero estimate is counted in flight on
+     * {@code ticket} (the request's {@link LanceHitsAccounting}, released
+     * by its close) or, without one, on the calling thread until
+     * {@link #requestEnded()} runs there.
+     */
+    public static void admit(
+        String indexName,
+        long rows,
+        Shape shape,
+        Set<String> indexedColumns,
+        Optional<TableStatistics> statistics,
+        LanceHitsAccounting ticket
+    ) {
+        Set<String> indexed = new LinkedHashSet<>();
+        Set<String> flat = new LinkedHashSet<>();
+        for (String column : shape.columns()) {
+            if (indexedColumns != null && indexedColumns.contains(column)) {
+                indexed.add(column);
+            } else {
+                flat.add(column);
+            }
+        }
+        if (!indexed.isEmpty() || flat.isEmpty()) {
+            admitIndexed(indexName, rows, shape, indexed, flatFtsUnindexedRows(indexed, statistics), ticket);
+        }
+        if (!flat.isEmpty()) {
+            admitFlat(indexName, rows, flat, ticket);
+        }
+    }
+
+    /**
+     * The {@link Kind#FTS} judgement of {@code shape} over the
+     * {@code columns} that carry an inverted index: the document set
+     * rebuild, the phrase positions, the prefilter's row addresses and
+     * the hits scan buffers, plus {@code unindexedRows} read through
+     * Lance's flat path at {@link #FLAT_FTS_BYTES_PER_ROW} each when the
+     * index covers some fragments only.
+     */
+    private static void admitIndexed(
+        String indexName,
+        long rows,
+        Shape shape,
+        Set<String> columns,
+        long unindexedRows,
+        LanceHitsAccounting ticket
+    ) {
         long shardShare = shardShareBytes();
         long prefilter = ftsPrefilterEstimateBytes(rows, shape.prefilterSqls(), shardShare);
+        long uncovered = flatFtsEstimateBytes(unindexedRows, 1, shardShare);
         long estimate = ftsEstimateBytes(rows, shape.clauses(), shape.phraseClauses(), scanBufferEstimateBytes(rows, shape), shardShare)
-            + prefilter;
+            + prefilter + uncovered;
         int clauses = Math.max(1, shape.clauses());
         int prefilters = shape.prefilterSqls().size();
         String what = (shape.unbounded() ? "unbounded full text scan" : "bounded full text page")
@@ -1912,6 +2054,13 @@ public final class ScanAdmission {
                     + NativeMemoryLimit.humanReadable(FILTER_SCAN_BYTES_PER_MATCHING_ROW)
                     + "] each"
                 : "")
+            + (unindexedRows > 0L
+                ? " plus the flat BM25 scan of "
+                    + unindexedRows
+                    + " rows the index does not cover at ["
+                    + NativeMemoryLimit.humanReadable(FLAT_FTS_BYTES_PER_ROW)
+                    + "] each"
+                : "")
             + " against an index cache shard of ["
             + NativeMemoryLimit.humanReadable(shardShare)
             + "] plus the hits scan buffers";
@@ -1921,7 +2070,39 @@ public final class ScanAdmission {
             : (prefilters > 0 ? "Drop the scalar filter" + (prefilters > 1 ? "s" : "") + ", attach" : "Attach")
                 + " the table to a node with a larger index cache, or relax plugins.lance.admission.bounded_shapes_gated / "
                 + "plugins.lance.admission.headroom / plugins.lance.admission.enabled.";
-        judge(new Scope(Kind.FTS, indexName, shape.columns()), estimate, 0L, Long.MAX_VALUE, what, remedy, ticket);
+        judge(new Scope(Kind.FTS, indexName, columns), estimate, 0L, Long.MAX_VALUE, what, remedy, ticket);
+    }
+
+    /**
+     * The {@link Kind#FTS_FLAT} judgement of a full text scan over the
+     * {@code columns} that carry no inverted index: Lance tokenises and
+     * scores every row of the table for each of them
+     * ({@link #flatFtsEstimateBytes}). The remedy names the index the
+     * table's writer would create to take the column off this path.
+     */
+    private static void admitFlat(String indexName, long rows, Set<String> columns, LanceHitsAccounting ticket) {
+        long shardShare = shardShareBytes();
+        long estimate = flatFtsEstimateBytes(rows, columns.size(), shardShare);
+        // Sorted, as the scope key sorts them: the shape's column set
+        // carries no order.
+        List<String> names = new ArrayList<>(columns);
+        names.sort(null);
+        String columnList = String.join(", ", names);
+        String what = Kind.FTS_FLAT.description()
+            + " over ["
+            + indexName
+            + "]: flat BM25 scan of ["
+            + Math.max(0L, rows)
+            + "] rows on "
+            + (names.size() == 1 ? "column [" + columnList + "]" : "each of columns [" + columnList + "]")
+            + " at ["
+            + NativeMemoryLimit.humanReadable(FLAT_FTS_BYTES_PER_ROW)
+            + "] each";
+        String remedy = "Create an inverted index on "
+            + (names.size() == 1 ? "column [" + columnList + "]" : "columns [" + columnList + "]")
+            + " with the table's writer (pylance create_scalar_index), attach the table to a node with more memory, "
+            + "or relax plugins.lance.admission.headroom / plugins.lance.admission.enabled.";
+        judge(new Scope(Kind.FTS_FLAT, indexName, columns), estimate, 0L, Long.MAX_VALUE, what, remedy, ticket);
     }
 
     /**
