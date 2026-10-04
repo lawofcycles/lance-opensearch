@@ -664,7 +664,7 @@ When Lance advances to a new version, the plugin exposes it as soon as the next 
 
 Lance's own scanner produces a mixed execution plan for FTS and knn: covered fragments use the existing index, uncovered fragments run a flat scan, and the results are unioned by the query engine, so an incremental append never slows down queries hitting the previously-covered fragments.
 
-The `index.plugins.lance.uncovered_fragment_policy` setting accepts `wait` alongside the default `immediate`. Both values expose the new version immediately. `wait` was reserved for an async optimize the plugin itself was going to run, and that implementation no longer exists; the value is accepted for backward compatibility and has no effect. Setting it logs one informational message per index saying that the plugin never writes to the table. Index coverage of appended fragments is the writer's job (`ds.optimize.optimize_indices()` above).
+The `index.plugins.lance.uncovered_fragment_policy` setting accepts `wait` alongside the default `immediate`. Both values expose the new version immediately; `wait` has no effect beyond one informational log line per index saying that the plugin never writes to the table. Index coverage of appended fragments is the writer's job (`ds.optimize.optimize_indices()` above).
 
 ### Serving an object store table from local NVMe
 
