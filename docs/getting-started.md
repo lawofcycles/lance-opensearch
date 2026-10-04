@@ -89,7 +89,9 @@ Place the table under the directory you mounted in step 2. The rest of this walk
 - `embedding: fixed_size_list<float>[8]` — mapped as `lance_vector`; used by the `lance_knn` query
 - `rating: int32` — mapped as `integer`; used by the `bool.filter` and aggregation examples
 
-Once attached, `curl -s http://localhost:9200/demo/_mapping` shows exactly these types; the mapping is the contract the queries below rely on. Only a `lance_text` field sends `match` and its relatives to Lance. A string column that has no inverted index in the table is mapped as `keyword`, where `match` is an exact match of the whole string and can return 0 hits. To search such a column as full text, declare it `lance_text` on the attach body (`"overrides": {"body": {"type": "lance_text"}}`, see [mapping-overrides.md](mapping-overrides.md#type-lance_text); Lance then scans and scores the rows without an index) or have the table's writer create the inverted index (see "How the plugin thinks about indexes" in step 6).
+Once attached, `curl -s http://localhost:9200/demo/_mapping` shows exactly these types; the mapping is the contract the queries below rely on. Only a `lance_text` field sends `match` and its relatives to Lance. A string column that has no inverted index in the table is mapped as `keyword`, where `match` is an exact match of the whole string and can return 0 hits.
+
+To search such a column as full text, declare it `lance_text` on the attach body (`"overrides": {"body": {"type": "lance_text"}}`, see [mapping-overrides.md](mapping-overrides.md#type-lance_text); Lance then scans and scores the rows without an index) or have the table's writer create the inverted index (see "How the plugin thinks about indexes" in step 6).
 
 ### Option B: create a sample table with Python
 
@@ -242,7 +244,9 @@ curl -X POST http://localhost:9200/_plugins/_lance/attach \
 
 The call is idempotent; a second attach on the same table returns `already_attached: true`.
 
-Every endpoint of the plugin lives under `/_plugins/_lance/`, the node settings under `plugins.lance.*` and the index settings under `index.plugins.lance.*`. In 0.1.0 the previous paths (`/_lance/attach`, `/_lance/namespace`, `/_lance/refs/{index}`, `/_lance/stats`, `/_lance/stats/{node_id}`, `/{index}/_lance/explain`, `/{index}/_lance/sync`) still answer, with a deprecation `Warning` header on the response and a line in the node's deprecation log naming the new path. The previous setting names, `lance.*` and `index.lance.*`, are accepted the same way: a value under an old key is read when the new key is absent, and every read of an old key logs a deprecation warning (a `Warning` header on the request that read it). An index created under the old keys keeps opening; attach and the namespace poll write the new keys only. The old paths and the old setting names are removed in the next minor release.
+Every endpoint of the plugin lives under `/_plugins/_lance/`, the node settings under `plugins.lance.*` and the index settings under `index.plugins.lance.*`. In 0.1.0 the previous paths (`/_lance/attach`, `/_lance/namespace`, `/_lance/refs/{index}`, `/_lance/stats`, `/_lance/stats/{node_id}`, `/{index}/_lance/explain`, `/{index}/_lance/sync`) still answer, with a deprecation `Warning` header on the response and a line in the node's deprecation log naming the new path.
+
+The previous setting names, `lance.*` and `index.lance.*`, are accepted the same way: a value under an old key is read when the new key is absent, and every read of an old key logs a deprecation warning (a `Warning` header on the request that read it). An index created under the old keys keeps opening; attach and the namespace poll write the new keys only. The old paths and the old setting names are removed in the next minor release.
 
 ### Point at S3, GCS, or Azure with storage_options
 
@@ -271,9 +275,13 @@ The same shape works on `POST /_plugins/_lance/namespace`; every table auto-surf
 
 Values must be strings. The plugin does not enumerate a fixed allowlist; whatever keys Lance's Rust `object_store` recognises for the URI scheme reach it verbatim. When `storage_options` is omitted, Lance falls back to its normal environment-variable path (`AWS_*` / `GCS_*` / `AZURE_*`).
 
-Options are persisted as `index.plugins.lance.storage_options.<key>` on the created index, so a single node can address two buckets with different credentials at the same time. The credential keys (any name containing `secret`, `password`, `token`, `key`, `authorization` or `credential`) are withheld from `GET /<index>/_settings`, `GET /<index>` and the cluster state API; region, endpoint and `allow_http` stay visible. A snapshot of the index still carries every option, credentials included, and so does the security plugin's audit log when it records request bodies, so an operator who enables the audit log should turn `plugins.security.audit.config.log_request_body` off or exclude the plugin's attach and namespace paths ([limitations.md](limitations.md#storage-and-credentials)).
+Options are persisted as `index.plugins.lance.storage_options.<key>` on the created index, so a single node can address two buckets with different credentials at the same time. The credential keys (any name containing `secret`, `password`, `token`, `key`, `authorization` or `credential`) are withheld from `GET /<index>/_settings`, `GET /<index>` and the cluster state API; region, endpoint and `allow_http` stay visible.
 
-The credentials handed to the plugin need read access only, because the plugin never writes to the table or the catalog. On S3 that is `s3:GetObject` and `s3:ListBucket` on the table's bucket; on GCS `storage.objects.get` and `storage.objects.list`; on Azure the Storage Blob Data Reader role; for a Glue namespace `glue:GetTable` and `glue:GetDatabase`. The write actions a Lance writer needs (`s3:PutObject`, `s3:DeleteObject`, `glue:UpdateTable`, `glue:CreateTable`, `glue:DeleteTable`) belong to the writer's credentials and can be left out of the plugin's policy. An S3 policy that covers one bucket:
+A snapshot of the index still carries every option, credentials included, and so does the security plugin's audit log when it records request bodies, so an operator who enables the audit log should turn `plugins.security.audit.config.log_request_body` off or exclude the plugin's attach and namespace paths ([limitations.md](limitations.md#storage-and-credentials)).
+
+The credentials handed to the plugin need read access only, because the plugin never writes to the table or the catalog. On S3 that is `s3:GetObject` and `s3:ListBucket` on the table's bucket; on GCS `storage.objects.get` and `storage.objects.list`; on Azure the Storage Blob Data Reader role; for a Glue namespace `glue:GetTable` and `glue:GetDatabase`.
+
+The write actions a Lance writer needs (`s3:PutObject`, `s3:DeleteObject`, `glue:UpdateTable`, `glue:CreateTable`, `glue:DeleteTable`) belong to the writer's credentials and can be left out of the plugin's policy. An S3 policy that covers one bucket:
 
 ```json
 {
@@ -560,7 +568,9 @@ Send the search body to `GET /_plugins/_lance/explain/{index}` (or `POST`, for a
 
 The plugin plans every `_search` once, on the coordinating node, through a Calcite planner: the body is translated to a logical tree over the table, the planner picks the cheapest physical form that declares the traits the request demands, and the per node part of that form ships to the data nodes with each fragment request.
 
-The `bool` from "Composition with bool" is a shape the translator spells. The stock `match` was rewritten to `lance_match` before planning (the `logical` text and `lance_clause` show the rewritten clause), the `range` becomes the Lance SQL `rating >= 3` and rides on the pushed full text operation as its prefilter, the page is pushed too (`PUSHED_SCAN`), and nothing is `unplanned`. The `index=inverted` term on the pushed `fts`, and `fts_index` under `fragment_plan`, say that `body` is answered from its inverted index and not scanned flat. The physical lines carry three terms per operator (`accuracy`, `tie_stability`, `cost`), cut here for width:
+The `bool` from "Composition with bool" is a shape the translator spells. The stock `match` was rewritten to `lance_match` before planning (the `logical` text and `lance_clause` show the rewritten clause), the `range` becomes the Lance SQL `rating >= 3` and rides on the pushed full text operation as its prefilter, the page is pushed too (`PUSHED_SCAN`), and nothing is `unplanned`.
+
+The `index=inverted` term on the pushed `fts`, and `fts_index` under `fragment_plan`, say that `body` is answered from its inverted index and not scanned flat. The physical lines carry three terms per operator (`accuracy`, `tie_stability`, `cost`), cut here for width:
 
 ```
 curl -s -X GET 'http://localhost:9200/_plugins/_lance/explain/demo?pretty' \
@@ -654,7 +664,9 @@ plugins.lance.namespace.poll_cadence: 1s
 
 ### How the plugin thinks about indexes
 
-Indexes on the Lance table (FTS, scalar, vector) belong to the writer. Build them from the same writer that produced the table, using pylance, the Lance Java SDK, or a Ray / Spark job; the freshness check picks a new index up at its manifest commit, and the mapping follows (a Utf8 column becomes `lance_text` once it has an inverted index, unless the attach body declared its type). The plugin never creates or optimises an index: it holds no write credentials for the table and never commits a version to it. A Utf8 column can be searched as full text before its index exists by declaring it `lance_text` on the attach body ([mapping-overrides.md](mapping-overrides.md#type-lance_text)); Lance then tokenises and scores the rows per request, under the admission gate.
+Indexes on the Lance table (FTS, scalar, vector) belong to the writer. Build them from the same writer that produced the table, using pylance, the Lance Java SDK, or a Ray / Spark job; the freshness check picks a new index up at its manifest commit, and the mapping follows (a Utf8 column becomes `lance_text` once it has an inverted index, unless the attach body declared its type).
+
+The plugin never creates or optimises an index: it holds no write credentials for the table and never commits a version to it. A Utf8 column can be searched as full text before its index exists by declaring it `lance_text` on the attach body ([mapping-overrides.md](mapping-overrides.md#type-lance_text)); Lance then tokenises and scores the rows per request, under the admission gate.
 
 ```python
 import lance
@@ -927,7 +939,9 @@ plugins.lance.fts.subset_probe_min_rows: 10000    # default; floor of the probe 
 plugins.lance.fts.subset_probe_limit: 1000000     # default; cap of the probe limit
 ```
 
-The effective probe limit is `min(subset_probe_limit, max(subset_probe_min_rows, floor(covered rows * subset_probe_ratio)))`. When the lookup returns that many rows the node discards them and repeats the scan restricted to its fragments. On a 20M row table over 3 nodes the limit is 200,000, so a term with 500,000 matches takes the restricted scan and a term with a few hits stays on the index-only lookup. The exact count behind `track_total_hits: true` and `_count` does not probe: every node runs one count only scan restricted to its fragments, so the count costs one index lookup per node whatever the match count.
+The effective probe limit is `min(subset_probe_limit, max(subset_probe_min_rows, floor(covered rows * subset_probe_ratio)))`. When the lookup returns that many rows the node discards them and repeats the scan restricted to its fragments. On a 20M row table over 3 nodes the limit is 200,000, so a term with 500,000 matches takes the restricted scan and a term with a few hits stays on the index-only lookup.
+
+The exact count behind `track_total_hits: true` and `_count` does not probe: every node runs one count only scan restricted to its fragments, so the count costs one index lookup per node whatever the match count.
 
 - The ratio is where the two paths cost the same: the whole-table lookup makes every node receive every match and drop the rows of other nodes, about 0.5 to 0.9 µs per received row, while the restricted scan makes Lance read `_rowid` over the node's fragments first, about 21 ns per covered row (139 ms for 6.7M rows at 20M rows). The two are equal when the matches are about 3 percent of the covered rows.
 - Raise the ratio when the restricted scan is slower than the lookup on your hardware; lower the floor or the cap when the per-node heap for the probe rows matters.

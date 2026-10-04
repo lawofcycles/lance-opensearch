@@ -434,8 +434,8 @@ Two request elements demand a trait (`RequestPlanner.requirementOf`). An explici
 `track_total_hits` (an integer bound or `true`) demands `Accuracy.EXACT` at the root: the count the
 response reports must be exact within the bound, which every plan meets except an aggregate over
 a sketch metric, so `track_total_hits: 500` next to a `cardinality` aggregation is refused with a
-400 whose message names the trait, where the request used to answer a sketch under an exact
-count. A `search_after` cursor over a page the tree carries demands `TieStability.STABLE_KEY`: a
+400 whose message names the trait. A `search_after` cursor over a page the tree carries demands
+`TieStability.STABLE_KEY`: a
 cursor continues from the sort values of the previous page's last hit, so the rows on either side
 of it must be the same rows on every call; a cursor over a full text page ordered by score alone
 is refused with a 400 naming the trait, while a cursor over a column sort (a single column folded
