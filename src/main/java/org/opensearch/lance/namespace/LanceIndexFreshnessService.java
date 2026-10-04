@@ -188,11 +188,23 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
          * version before any check derived the mapping for it.
          */
         long derivedVersion = -1L;
+        /**
+         * The version the service last knew the table (or the followed
+         * tag) at: the version the shard served when tracking started,
+         * then the target of every completed check; guarded by the
+         * entry's monitor. A check whose target differs from it is a
+         * move. The served version cannot be that baseline because the
+         * engine advances its reader before every read, so by the time
+         * a check runs the reader may already serve the version the
+         * table moved to.
+         */
+        long knownVersion;
         /** Whether a check has started the table statistics collection since the shard started; guarded by the entry's monitor. */
         boolean statisticsRequested;
 
         Tracked(TrackedShard shard) {
             this.shard = shard;
+            this.knownVersion = shard.servedVersion();
         }
 
         void cancel() {
@@ -424,8 +436,9 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         // when the table moved between two checks.
         boolean readerBehind;
         // Whether the check found a version it had not seen: the reader
-        // is behind, or the mapping was last derived at another version.
-        // The first check after the shard started is not a move.
+        // is behind, or the table (or tag) is at another version than the
+        // one the last check left it at. The first check after the shard
+        // started compares with the version the shard opened at.
         boolean moved;
         // The table URI as Lance spells it, the key the statistics cache
         // and the coordinator's lookup share.
@@ -448,7 +461,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
                 readerBehind = target != served;
             }
             boolean derive = target != entry.derivedVersion;
-            moved = readerBehind || (entry.derivedVersion >= 0 && derive);
+            moved = readerBehind || target != entry.knownVersion;
             if (derive) {
                 // Re-apply the overrides captured at attach or register
                 // so the re-derived mapping keeps the operator's type and
@@ -589,6 +602,9 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
             // rather than on their first request of it.
             broadcastStatisticsPrefetch(indexName, tableKey, target);
         }
+        // Recorded last, so a check that failed above sees the same move
+        // again and retries what it did not get to.
+        entry.knownVersion = target;
         return new Outcome(indexName, true, null, moved, served, target, mappingChanged, false, mappingError);
     }
 

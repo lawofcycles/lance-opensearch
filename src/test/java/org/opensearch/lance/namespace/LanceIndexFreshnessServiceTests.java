@@ -193,6 +193,31 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
         assertEquals(1, client.count(PutMappingAction.NAME));
     }
 
+    public void testFirstCheckAfterTheReaderAdvancedOnItsOwnIsAMove() throws Exception {
+        // The table moves after the shard started and a read advances the
+        // reader before the first check runs. The check compares with the
+        // version the shard opened at, so the move is seen and broadcast,
+        // and the reader, already there, is not refreshed.
+        String tableUri = writeTable("firstmove");
+        FakeShard shard = FakeShard.overTable("firstmove", tableUri, Settings.EMPTY);
+        long opened = shard.servedVersion();
+        LanceIndexFreshnessService.Tracked entry = service.track(shard);
+        LanceTableFactory.appendRows(tableUri, 6, 4);
+        shard.refresh("read");
+        assertTrue(shard.servedVersion() > opened);
+
+        LanceIndexFreshnessService.Outcome first = service.check(entry);
+        assertTrue("the table moved since the shard opened", first.moved());
+        assertEquals(shard.servedVersion(), first.servedVersion());
+        assertEquals(shard.servedVersion(), first.targetVersion());
+        assertEquals("the reader was there already", 1, shard.refreshes.get());
+        assertEquals("the move is broadcast", 1, client.count(LanceStatisticsPrefetchAction.NAME));
+        assertFalse("same schema, no mapping update", first.mappingChanged());
+
+        assertFalse(service.check(entry).moved());
+        assertEquals(1, client.count(LanceStatisticsPrefetchAction.NAME));
+    }
+
     public void testAnObservedVersionTheMappingWasDerivedAtIsSkipped() throws Exception {
         String tableUri = writeTable("observed");
         FakeShard shard = FakeShard.overTable("observed", tableUri, Settings.EMPTY);
