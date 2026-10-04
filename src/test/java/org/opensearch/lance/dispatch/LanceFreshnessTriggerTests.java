@@ -24,8 +24,10 @@ import org.opensearch.test.OpenSearchTestCase;
 
 /**
  * Unit tests for {@link LanceFreshnessTrigger}: one request per index
- * and observed version, none for a pinned index, and the entry of a
- * deleted index is dropped.
+ * and observed version, an older version after a newer one does not
+ * make the newer one be asked for again, a tag following index is asked
+ * for whenever the version differs, none for a pinned index, and the
+ * entry of a deleted index is dropped.
  */
 public class LanceFreshnessTriggerTests extends OpenSearchTestCase {
 
@@ -57,6 +59,33 @@ public class LanceFreshnessTriggerTests extends OpenSearchTestCase {
         assertTrue(trigger.observed(other, 4L));
         assertEquals(List.of("demo@3", "demo@4", "other@4"), sent);
         assertEquals(2, trigger.size());
+    }
+
+    public void testAnOlderVersionAfterANewerOneDoesNotMakeTheNewerOneBeAskedForAgain() {
+        IndexMetadata demo = indexMetadata("demo", "uuid-1", Settings.EMPTY);
+        assertTrue(trigger.observed(demo, 5L));
+        assertFalse("an older version than one asked for sends nothing", trigger.observed(demo, 4L));
+        assertEquals("the entry keeps the higher version", Long.valueOf(5L), trigger.lastRequested("uuid-1"));
+        assertFalse("the higher version observed again is not asked for twice", trigger.observed(demo, 5L));
+        assertEquals(List.of("demo@5"), sent);
+        assertTrue(trigger.observed(demo, 6L));
+        assertEquals(List.of("demo@5", "demo@6"), sent);
+    }
+
+    public void testATagFollowingIndexIsAskedForWheneverTheVersionDiffers() {
+        // A tag can be moved to an older version, so for a tag following
+        // index only the same version as the last one asked for is deduplicated.
+        IndexMetadata tagged = indexMetadata(
+            "tagged",
+            "uuid-t",
+            Settings.builder().put(LanceSettings.TAG_SETTING.getKey(), "release").build()
+        );
+        assertTrue(trigger.observed(tagged, 5L));
+        assertFalse(trigger.observed(tagged, 5L));
+        assertTrue("the tag moved back", trigger.observed(tagged, 4L));
+        assertEquals(Long.valueOf(4L), trigger.lastRequested("uuid-t"));
+        assertFalse(trigger.observed(tagged, 4L));
+        assertEquals(List.of("tagged@5", "tagged@4"), sent);
     }
 
     public void testAPinnedIndexAndANegativeVersionSendNothing() {

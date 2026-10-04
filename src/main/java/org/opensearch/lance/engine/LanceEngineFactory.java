@@ -699,12 +699,14 @@ public final class LanceEngineFactory implements EngineFactory {
          * {@code GET /_doc/{id}}, {@code _mget}, {@code _stats} and a
          * {@code _search} over a target that mixes this index with one
          * that is not Lance backed all see the version the fragment path
-         * reads for its own request. The refresh costs one manifest read,
-         * the same the fragment path pays per request; when the version
-         * did not move {@link LanceReaderManager#refreshIfNeeded} returns
-         * null and the reader stays. Both scopes refresh because the
-         * engine has one reader manager and the only internal scope
-         * caller is {@link #docStats()}.
+         * reads for its own request. {@code refreshToCurrentVersion()}
+         * calls {@code maybeRefreshBlocking()} on the reader manager,
+         * which costs one manifest read, the same the fragment path pays
+         * per request; when the version did not move, the
+         * {@link LanceReaderManager#refreshIfNeeded} it runs returns null
+         * and the reader stays. Both scopes refresh because the engine
+         * has one reader manager and the only internal scope caller is
+         * {@link #docStats()}.
          */
         @Override
         public SearcherSupplier acquireSearcherSupplier(Function<Searcher, Searcher> wrapper, SearcherScope scope) throws EngineException {

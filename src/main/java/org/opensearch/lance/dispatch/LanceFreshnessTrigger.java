@@ -31,13 +31,13 @@ import org.opensearch.transport.client.Client;
  * a version the fan out observed, so the mapping follows the first
  * request that reads a new table version instead of the next scheduled
  * check. One {@link LanceIndexSyncAction} per index and observed
- * version leaves this node: the last version asked for is kept per
- * index uuid, and a request that observes it again sends nothing. The
- * shard's node skips the check when the mapping was derived at that
- * version already, so two coordinators observing the same version cost
- * one check. The request does not wait for the answer; the check's
- * outcome goes to the log. The entry of an index is dropped when the
- * index leaves the cluster state.
+ * version leaves this node: the highest version asked for is kept per
+ * index uuid, and a request that observes it or an older one again
+ * sends nothing. The shard's node skips the check when the mapping was
+ * derived at that version already, so two coordinators observing the
+ * same version cost one check. The request does not wait for the
+ * answer; the check's outcome goes to the log. The entry of an index is
+ * dropped when the index leaves the cluster state.
  *
  * <p>A pinned index ({@code index.plugins.lance.version}) is never
  * checked and nothing is sent for it. The sync action is an index
@@ -55,7 +55,7 @@ final class LanceFreshnessTrigger implements ClusterStateListener {
     }
 
     private final Sender sender;
-    /** Index uuid to the last version a check was asked for. */
+    /** Index uuid to the highest version a check was asked for. */
     private final Map<String, Long> requested = new ConcurrentHashMap<>();
 
     LanceFreshnessTrigger(Client client, ThreadPool threadPool, ClusterService clusterService) {
@@ -88,7 +88,14 @@ final class LanceFreshnessTrigger implements ClusterStateListener {
     /**
      * A fan out of {@code index} read the table at {@code observedVersion}.
      * Sends the check request unless this node asked for that version
-     * already or the index is pinned.
+     * already or the index is pinned. For an index that follows the
+     * latest version the entry keeps the highest version asked for, so a
+     * fan out that read an older version than one already asked for
+     * sends nothing and leaves the entry; otherwise concurrent fan outs
+     * observing {@code N} then {@code N-1} would make the next
+     * observation of {@code N} send again. A tag can move backwards, so
+     * a tag following index is asked for whenever the version differs
+     * from the last one asked for, as the shard's own skip rule does.
      *
      * @param indexMetadata the index as the cluster state has it now
      * @param observedVersion the manifest version the fan out read
@@ -99,8 +106,16 @@ final class LanceFreshnessTrigger implements ClusterStateListener {
             return false;
         }
         String uuid = indexMetadata.getIndexUUID();
-        Long previous = requested.put(uuid, observedVersion);
-        if (previous != null && previous == observedVersion) {
+        boolean followsTag = !LanceSettings.TAG_SETTING.get(indexMetadata.getSettings()).isEmpty();
+        boolean[] send = new boolean[1];
+        requested.compute(uuid, (ignored, previous) -> {
+            if (previous != null && (followsTag ? previous == observedVersion : previous >= observedVersion)) {
+                return previous;
+            }
+            send[0] = true;
+            return observedVersion;
+        });
+        if (!send[0]) {
             return false;
         }
         sender.send(indexMetadata.getIndex().getName(), observedVersion);
