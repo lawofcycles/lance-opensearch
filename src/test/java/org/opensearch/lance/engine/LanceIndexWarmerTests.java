@@ -30,12 +30,14 @@ import org.lance.schema.LanceField;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.Version;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.lance.InvalidAccessKeyIdS3Fixture;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
+import org.opensearch.lance.LanceTestSettings;
 import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceIndexWarmer.Mode;
@@ -123,6 +125,19 @@ public class LanceIndexWarmerTests extends OpenSearchTestCase {
             assertTrue("still " + state, state != State.PENDING && state != State.RUNNING);
         }, 60, java.util.concurrent.TimeUnit.SECONDS);
         return warmer.status(index).get();
+    }
+
+    public void testFromSettingsReadsTheModeAndFollowsItsUpdates() {
+        Settings settings = Settings.builder().put("plugins.lance.attach.warm_indexes", "all").build();
+        ClusterSettings clusterSettings = LanceTestSettings.clusterSettings(settings);
+        LanceIndexWarmer warmer = LanceIndexWarmer.fromSettings(settings, clusterSettings, cache, executor);
+        try {
+            assertEquals(Mode.ALL, warmer.mode());
+            clusterSettings.applySettings(Settings.builder().put("plugins.lance.attach.warm_indexes", "none").build());
+            assertEquals("the mode consumer is registered", Mode.NONE, warmer.mode());
+        } finally {
+            warmer.close();
+        }
     }
 
     public void testMetadataModeWarmsEveryIndex() throws Exception {

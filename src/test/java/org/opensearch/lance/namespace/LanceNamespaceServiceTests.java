@@ -30,8 +30,10 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.lance.LanceTestSettings;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.test.ClusterServiceUtils;
@@ -90,6 +92,34 @@ public class LanceNamespaceServiceTests extends OpenSearchTestCase {
 
     public void testCadenceReturnsConstructorValue() {
         assertEquals(TimeValue.timeValueHours(1), service.cadence());
+    }
+
+    public void testFromSettingsReadsTheNodeSettingsAndFollowsTheGraceUpdates() throws Exception {
+        Settings settings = Settings.builder()
+            .put("node.name", "namespace-settings")
+            .put("cluster.name", "namespace-settings")
+            .put("plugins.lance.namespace.poll_cadence", "1h")
+            .put("plugins.lance.namespace.resurface_guard_grace", "15m")
+            .build();
+        ClusterSettings clusterSettings = LanceTestSettings.clusterSettings(settings);
+        ClusterService configured = ClusterServiceUtils.createClusterService(settings, clusterSettings, threadPool);
+        LanceNamespaceService built = LanceNamespaceService.fromSettings(
+            client,
+            configured,
+            threadPool,
+            null,
+            new AllowedTableRoots(List.of()),
+            new AllowedCatalogEndpoints(List.of())
+        );
+        try {
+            assertEquals(TimeValue.timeValueHours(1), built.cadence());
+            assertEquals(TimeValue.timeValueMinutes(15), built.resurfaceGrace());
+            clusterSettings.applySettings(Settings.builder().put("plugins.lance.namespace.resurface_guard_grace", "2h").build());
+            assertEquals("the grace consumer is registered", TimeValue.timeValueHours(2), built.resurfaceGrace());
+        } finally {
+            built.close();
+            configured.close();
+        }
     }
 
     public void testCloseStopsTheScheduledPoll() throws Exception {

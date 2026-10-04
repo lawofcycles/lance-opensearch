@@ -33,12 +33,15 @@ import org.apache.lucene.util.Constants;
 import org.lance.Dataset;
 import org.lance.index.IndexType;
 import org.lance.ipc.FullTextQuery;
+import org.opensearch.common.settings.ClusterSettings;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.CircuitBreakingException;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
+import org.opensearch.lance.LanceTestSettings;
 import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.plan.metadata.ColumnStatistics;
@@ -540,6 +543,40 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         ScanAdmission.setAvailableMemoryOverride(List.of());
         assertEquals(123L, ScanAdmission.availablePhysicalMemoryBytes());
         assertTrue(ScanAdmission.residentSetExcessBytes() > 0L);
+    }
+
+    public void testBindSettingsReadsTheGateSettingsAndFollowsTheirUpdates() {
+        ScanAdmission.setMemoryProbeForTests(() -> 123L);
+        Settings settings = Settings.builder()
+            .put("plugins.lance.admission.enabled", false)
+            .put("plugins.lance.admission.headroom", "3gb")
+            .put("plugins.lance.admission.bounded_shapes_gated", false)
+            .put("plugins.lance.test.index_cache_shard_share", "7gb")
+            .putList("plugins.lance.test.admission_available_memory", "2000b")
+            .build();
+        ClusterSettings clusterSettings = LanceTestSettings.clusterSettings(settings);
+
+        ScanAdmission.bindSettings(settings, clusterSettings);
+        assertFalse(ScanAdmission.enabled());
+        assertEquals(3 * GB, ScanAdmission.headroomBytes());
+        assertFalse(ScanAdmission.boundedShapesGated());
+        assertEquals(7 * GB, ScanAdmission.shardShareBytes());
+        assertEquals(2000L, ScanAdmission.availablePhysicalMemoryBytes());
+
+        clusterSettings.applySettings(
+            Settings.builder()
+                .put("plugins.lance.admission.enabled", true)
+                .put("plugins.lance.admission.headroom", "5gb")
+                .put("plugins.lance.admission.bounded_shapes_gated", true)
+                .put("plugins.lance.test.index_cache_shard_share", "9gb")
+                .putList("plugins.lance.test.admission_available_memory")
+                .build()
+        );
+        assertTrue("the enabled consumer is registered", ScanAdmission.enabled());
+        assertEquals("the headroom consumer is registered", 5 * GB, ScanAdmission.headroomBytes());
+        assertTrue("the bounded shapes consumer is registered", ScanAdmission.boundedShapesGated());
+        assertEquals("the shard share override consumer is registered", 9 * GB, ScanAdmission.shardShareBytes());
+        assertEquals("the available memory override consumer is registered", 123L, ScanAdmission.availablePhysicalMemoryBytes());
     }
 
     public void testParseMemAvailableConvertsTheKernelValueToBytes() {

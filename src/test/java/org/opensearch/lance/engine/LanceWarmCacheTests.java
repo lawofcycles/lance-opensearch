@@ -20,10 +20,13 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.lance.Dataset;
+import org.opensearch.common.settings.ClusterSettings;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
+import org.opensearch.lance.LanceTestSettings;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceWarmCache.Lease;
@@ -256,6 +259,55 @@ public class LanceWarmCacheTests extends OpenSearchTestCase {
         }
         assertEquals("every request opened the table itself", 2L, cache.datasetOpenCount());
         assertEquals(2L, cache.snapshotBuildCount());
+    }
+
+    public void testFromSettingsReadsTheNodeSettingsAndFollowsTheirUpdates() throws Exception {
+        cache.close();
+        Settings settings = Settings.builder().put("plugins.lance.cache.enabled", true).put("plugins.lance.cache.max_snapshots", 1).build();
+        ClusterSettings clusterSettings = LanceTestSettings.clusterSettings(settings);
+        // The statistics collection runs on the executor handed in; inline
+        // here, so the build of a snapshot pays the collection and its delay.
+        cache = LanceWarmCache.fromSettings(settings, clusterSettings, allocator, 16L * 1024 * 1024, Runnable::run, null);
+
+        assertTrue(cache.isEnabled());
+        assertEquals("the column store takes the budget handed in", 16L * 1024 * 1024, cache.columnStore().limitBytes());
+        long version = latestVersion();
+        Snapshot a;
+        try (Lease lease = acquire(UUID_A, Optional.of(version))) {
+            a = lease.snapshot();
+        }
+        try (Lease lease = acquire(UUID_B, Optional.of(version))) {
+            assertFalse(lease.snapshot().isClosed());
+        }
+        assertEquals("max_snapshots from the settings keeps one snapshot", 1, cache.snapshotCount());
+        assertTrue("the earlier snapshot was evicted", a.isClosed());
+
+        clusterSettings.applySettings(Settings.builder().put("plugins.lance.test.statistics_collect_delay", "300ms").build());
+        String other = LanceTableFactory.writeHintFixtureTable(createTempDir(), "warm-other-" + getTestName(), 1, 50);
+        long start = System.nanoTime();
+        try (
+            Lease lease = cache.acquire(
+                "index-c-uuid",
+                other,
+                StorageOptions.empty(),
+                Optional.empty(),
+                "",
+                LancePrimaryKeyType.NONE,
+                LanceOverrides.EMPTY
+            )
+        ) {
+            assertNotNull(cache.tableStatistics().peek(lease.snapshot().dataset().uri(), lease.snapshot().dataset().version()));
+        }
+        assertTrue(
+            "the delay consumer is registered: the inline collection of the new table waited for it",
+            System.nanoTime() - start >= TimeValue.timeValueMillis(250).nanos()
+        );
+
+        clusterSettings.applySettings(
+            Settings.builder().put("plugins.lance.test.statistics_collect_delay", "300ms").put("plugins.lance.cache.enabled", false).build()
+        );
+        assertFalse("the enabled consumer is registered", cache.isEnabled());
+        assertEquals("turning the cache off retires every snapshot", 0, cache.snapshotCount());
     }
 
     public void testDisablingRetiresEverySnapshot() throws Exception {

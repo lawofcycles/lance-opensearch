@@ -54,6 +54,11 @@ final class LanceResurfaceGuard {
         grace.set(newGrace);
     }
 
+    /** The grace period in force. */
+    TimeValue grace() {
+        return grace.get();
+    }
+
     /**
      * Record that a Lance-backed index was deleted at {@code now}
      * milliseconds, so the poll skips re-surfacing it until the grace

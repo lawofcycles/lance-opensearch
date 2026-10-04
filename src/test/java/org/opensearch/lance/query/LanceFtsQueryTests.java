@@ -43,6 +43,7 @@ import org.opensearch.indices.breaker.HierarchyCircuitBreakerService;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
+import org.opensearch.lance.LanceTestSettings;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory;
@@ -788,6 +789,40 @@ public class LanceFtsQueryTests extends OpenSearchTestCase {
             assertEquals(0L, breaker.getUsed());
         } finally {
             LanceFtsQuery.setSubsetProbeLimit(before);
+        }
+    }
+
+    public void testBindSettingsReadsTheProbeParametersAndFollowsTheirUpdates() {
+        int limitBefore = LanceFtsQuery.subsetProbeLimit();
+        double ratioBefore = LanceFtsQuery.subsetProbeRatio();
+        int minRowsBefore = LanceFtsQuery.subsetProbeMinRows();
+        try {
+            Settings settings = Settings.builder()
+                .put("plugins.lance.fts.subset_probe_limit", 5_000)
+                .put("plugins.lance.fts.subset_probe_ratio", 0.25)
+                .put("plugins.lance.fts.subset_probe_min_rows", 700)
+                .build();
+            ClusterSettings clusterSettings = LanceTestSettings.clusterSettings(settings);
+
+            LanceFtsQuery.bindSettings(settings, clusterSettings);
+            assertEquals(5_000, LanceFtsQuery.subsetProbeLimit());
+            assertEquals(0.25, LanceFtsQuery.subsetProbeRatio(), 0.0);
+            assertEquals(700, LanceFtsQuery.subsetProbeMinRows());
+
+            clusterSettings.applySettings(
+                Settings.builder()
+                    .put("plugins.lance.fts.subset_probe_limit", 6_000)
+                    .put("plugins.lance.fts.subset_probe_ratio", 0.5)
+                    .put("plugins.lance.fts.subset_probe_min_rows", 800)
+                    .build()
+            );
+            assertEquals("the limit consumer is registered", 6_000, LanceFtsQuery.subsetProbeLimit());
+            assertEquals("the ratio consumer is registered", 0.5, LanceFtsQuery.subsetProbeRatio(), 0.0);
+            assertEquals("the min rows consumer is registered", 800, LanceFtsQuery.subsetProbeMinRows());
+        } finally {
+            LanceFtsQuery.setSubsetProbeLimit(limitBefore);
+            LanceFtsQuery.setSubsetProbeRatio(ratioBefore);
+            LanceFtsQuery.setSubsetProbeMinRows(minRowsBefore);
         }
     }
 
