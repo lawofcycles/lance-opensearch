@@ -39,6 +39,19 @@ shape each store puts them in.
 | GCS | `"reason": "X"` | `authError`, `forbidden`, `insufficientPermissions` |
 | Azure Blob Storage | `<Code>X</Code>` | `AuthenticationFailed`, `AuthorizationFailure`, `AuthorizationPermissionMismatch`, `InvalidAuthenticationInfo` |
 
-Any other body (`NoSuchBucket`, a connection refused, a local `Permission denied`) keeps the 500. The
+## A bucket or container the store does not have
+
+The same `openFailure` reports a 400 when the body's code says the bucket or container the URI names
+does not exist: S3 `NoSuchBucket` and Azure `ContainerNotFound`, constants on `LanceInvalidInput`
+pinned by the same test. Lance lists the table's `_versions/` directory to find the latest manifest,
+and a listing against a bucket that is not there fails with the store's body as `Error::IO`, not as
+the not found Lance raises for a missing table in a bucket that exists (which is already a 400). The
+message is `could not open [<table or namespace>]: the object store has no bucket or container of
+that name (bucket names are compared exactly, so check the case): ` followed by the redacted Lance
+message. The case hint is there because `plugins.lance.allowed_table_roots` compares bucket names
+case insensitively while the open uses the URI as written, so `s3://My-Bucket/t` passes an allowlist
+entry written in lower case and reaches the store, which has no bucket of that spelling.
+
+Any other body (a throttling code, a connection refused, a local `Permission denied`) keeps the 500. The
 rule applies only where the credentials arrive: a search that fails because a session token expired
 after the attach runs on the request path, which does not call `openFailure`, and stays a 500.

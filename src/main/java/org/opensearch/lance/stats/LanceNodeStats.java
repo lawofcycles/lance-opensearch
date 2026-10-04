@@ -39,7 +39,8 @@ import org.opensearch.lance.query.ScanAdmission;
  * {@code fetch}, {@code fetch_cache} and {@code indices} objects of one node in
  * {@code GET /_plugins/_lance/stats}. {@code request_cache}
  * is the coordinator result cache ({@link RequestCacheStats}); {@code admission} carries the admission
- * gate's settings in force, its rejections per kind, the estimate,
+ * gate's settings in force, its rejections per kind, the scans it
+ * refused per kind while it was off, the estimate,
  * kind and source (a request or the warm up) of its last decision, the
  * node's available memory and the memory earlier admitted scans
  * retained together with the identity of the scans it is credited to;
@@ -99,7 +100,10 @@ import org.opensearch.lance.query.ScanAdmission;
  * node-local clone list from the base layout and the clone resolution
  * failures from the version 10 block, before the first release, so no
  * reader of an earlier version exists, and writes an empty block so
- * the framing stays one block per version.
+ * the framing stays one block per version; version 13 added the scans
+ * the admission gate refused while it was off, per kind
+ * ({@code admission.refused_while_disabled}), shown as zero by an older
+ * coordinator.
  */
 public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
@@ -112,9 +116,10 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
      * retained pool was filled by, 7 the result cache figures, 8 the fetch
      * take counters, 9 the fetch cache figures, 10 the failure counters,
      * 11 the indexes whose row counts are withheld, 12 removed the
-     * node-local clone figures.
+     * node-local clone figures, 13 the scans refused while the gate was
+     * off.
      */
-    public static final int WIRE_VERSION = 12;
+    public static final int WIRE_VERSION = 13;
 
     private final boolean cacheEnabled;
     private final int snapshotCount;
@@ -147,6 +152,14 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
      * every kind present, zero when it never refused.
      */
     private final Map<String, Long> admissionRejections;
+    /**
+     * Scans the node's admission gate refused while it was off, keyed
+     * by kind like {@link #admissionRejections}; every kind present,
+     * zero when it never refused, and all zero from a node whose plugin
+     * version does not report them. Off, the gate refuses the flat full
+     * text path alone, with a 400 rather than a 429.
+     */
+    private final Map<String, Long> admissionRefusedWhileDisabled;
     private final long admissionLastEstimateBytes;
     private final String admissionLastKind;
     /** {@code request}, {@code warm_up}, or {@code none} before the first decision and from a node that does not report it. */
@@ -827,6 +840,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.indexCacheShardShareBytes = indexCacheShardShareBytes;
         this.ftsSubsetProbeLimit = ftsSubsetProbeLimit;
         this.admissionRejections = Collections.unmodifiableMap(new LinkedHashMap<>(admissionRejections));
+        this.admissionRefusedWhileDisabled = zeroPerKind();
         this.admissionLastEstimateBytes = admissionLastEstimateBytes;
         this.admissionLastKind = admissionLastKind;
         this.admissionLastSource = admissionLastSource;
@@ -852,20 +866,58 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
 
     /** A copy carrying {@code requestCache} as the result cache figures ({@link RequestCacheStats#NONE} for null). */
     public LanceNodeStats withRequestCache(RequestCacheStats requestCache) {
-        return new LanceNodeStats(this, requestCache == null ? RequestCacheStats.NONE : requestCache, this.fetchCache, this.failures);
+        return new LanceNodeStats(
+            this,
+            requestCache == null ? RequestCacheStats.NONE : requestCache,
+            this.fetchCache,
+            this.failures,
+            this.admissionRefusedWhileDisabled
+        );
     }
 
     /** A copy carrying {@code fetchCache} as the fetch cache figures ({@link FetchCacheStats#NONE} for null). */
     public LanceNodeStats withFetchCache(FetchCacheStats fetchCache) {
-        return new LanceNodeStats(this, this.requestCache, fetchCache == null ? FetchCacheStats.NONE : fetchCache, this.failures);
+        return new LanceNodeStats(
+            this,
+            this.requestCache,
+            fetchCache == null ? FetchCacheStats.NONE : fetchCache,
+            this.failures,
+            this.admissionRefusedWhileDisabled
+        );
     }
 
     /** A copy carrying {@code failures} as the failure counters ({@link FailureCounters#NONE} for null). */
     public LanceNodeStats withFailures(FailureCounters failures) {
-        return new LanceNodeStats(this, this.requestCache, this.fetchCache, failures == null ? FailureCounters.NONE : failures);
+        return new LanceNodeStats(
+            this,
+            this.requestCache,
+            this.fetchCache,
+            failures == null ? FailureCounters.NONE : failures,
+            this.admissionRefusedWhileDisabled
+        );
     }
 
-    private LanceNodeStats(LanceNodeStats copy, RequestCacheStats requestCache, FetchCacheStats fetchCache, FailureCounters failures) {
+    /**
+     * A copy carrying {@code refusedWhileDisabled} as the scans the gate
+     * refused while it was off, per kind (every kind zero for null).
+     */
+    public LanceNodeStats withAdmissionRefusedWhileDisabled(Map<String, Long> refusedWhileDisabled) {
+        return new LanceNodeStats(
+            this,
+            this.requestCache,
+            this.fetchCache,
+            this.failures,
+            refusedWhileDisabled == null ? zeroPerKind() : inKindOrder(refusedWhileDisabled)
+        );
+    }
+
+    private LanceNodeStats(
+        LanceNodeStats copy,
+        RequestCacheStats requestCache,
+        FetchCacheStats fetchCache,
+        FailureCounters failures,
+        Map<String, Long> admissionRefusedWhileDisabled
+    ) {
         this.cacheEnabled = copy.cacheEnabled;
         this.snapshotCount = copy.snapshotCount;
         this.retiredSnapshotCount = copy.retiredSnapshotCount;
@@ -909,6 +961,16 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.requestCache = requestCache;
         this.fetchCache = fetchCache;
         this.failures = failures;
+        this.admissionRefusedWhileDisabled = admissionRefusedWhileDisabled;
+    }
+
+    /** Every gate kind at zero, in the gate's kind order: what a node that reports no count stands for. */
+    private static Map<String, Long> zeroPerKind() {
+        Map<String, Long> zeros = new LinkedHashMap<>();
+        for (ScanAdmission.Kind kind : ScanAdmission.Kind.values()) {
+            zeros.put(kind.key(), 0L);
+        }
+        return Collections.unmodifiableMap(zeros);
     }
 
     /**
@@ -1002,6 +1064,12 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         this.indices = withRowsWithheld(readIndices, withheld);
         // Version 12 removed fields and added none; its block is empty.
         reader.block(12, block -> null, null);
+        Map<String, Long> refusedWhileDisabled = reader.block(
+            13,
+            block -> block.readMap(StreamInput::readString, StreamInput::readVLong),
+            null
+        );
+        this.admissionRefusedWhileDisabled = refusedWhileDisabled == null ? zeroPerKind() : inKindOrder(refusedWhileDisabled);
         reader.finish();
     }
 
@@ -1129,6 +1197,13 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         // Version 12 removed the node-local clone figures and added no
         // field; the empty block keeps one block per version.
         WireVersion.writeBlock(out, false, o -> {});
+        // Likewise for the scans refused while the gate was off: an
+        // older coordinator shows the rejections without them.
+        WireVersion.writeBlock(
+            out,
+            false,
+            o -> o.writeMap(admissionRefusedWhileDisabled, StreamOutput::writeString, StreamOutput::writeVLong)
+        );
     }
 
     @Override
@@ -1191,6 +1266,11 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         builder.startObject("rejections");
         for (Map.Entry<String, Long> rejection : admissionRejections.entrySet()) {
             builder.field(rejection.getKey(), rejection.getValue());
+        }
+        builder.endObject();
+        builder.startObject("refused_while_disabled");
+        for (Map.Entry<String, Long> refused : admissionRefusedWhileDisabled.entrySet()) {
+            builder.field(refused.getKey(), refused.getValue());
         }
         builder.endObject();
         builder.endObject();
@@ -1463,6 +1543,15 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
         return total;
     }
 
+    /**
+     * Scans this node's admission gate refused while it was off, per
+     * kind; every kind present, all zero from a node whose plugin
+     * version does not report them.
+     */
+    public Map<String, Long> admissionRefusedWhileDisabled() {
+        return admissionRefusedWhileDisabled;
+    }
+
     /** Estimate of the node's last admission decision, admitted or not. */
     public long admissionLastEstimateBytes() {
         return admissionLastEstimateBytes;
@@ -1559,6 +1648,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             && indexCacheShardShareBytes == other.indexCacheShardShareBytes
             && ftsSubsetProbeLimit == other.ftsSubsetProbeLimit
             && admissionRejections.equals(other.admissionRejections)
+            && admissionRefusedWhileDisabled.equals(other.admissionRefusedWhileDisabled)
             && admissionLastEstimateBytes == other.admissionLastEstimateBytes
             && admissionLastKind.equals(other.admissionLastKind)
             && admissionLastSource.equals(other.admissionLastSource)
@@ -1607,6 +1697,7 @@ public final class LanceNodeStats implements Writeable, ToXContentFragment {
             indexCacheShardShareBytes,
             ftsSubsetProbeLimit,
             admissionRejections,
+            admissionRefusedWhileDisabled,
             admissionLastEstimateBytes,
             admissionLastKind,
             admissionLastSource,

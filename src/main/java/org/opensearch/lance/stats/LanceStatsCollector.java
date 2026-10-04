@@ -239,7 +239,10 @@ public final class LanceStatsCollector {
                 FragmentPlanRefiner.prunedFragments(),
                 freshnessStats,
                 FetchTakeStats.snapshot()
-            ).withRequestCache(requestCacheStats).withFetchCache(fetchCacheStats).withFailures(failureCounters);
+            ).withRequestCache(requestCacheStats)
+                .withFetchCache(fetchCacheStats)
+                .withFailures(failureCounters)
+                .withAdmissionRefusedWhileDisabled(ScanAdmission.refusedWhileDisabledByKind());
         }
         ColumnStore store = warmCache.columnStore();
         return new LanceNodeStats(
@@ -283,7 +286,10 @@ public final class LanceStatsCollector {
             FragmentPlanRefiner.prunedFragments(),
             freshnessStats,
             FetchTakeStats.snapshot()
-        ).withRequestCache(requestCacheStats).withFetchCache(fetchCacheStats).withFailures(failureCounters);
+        ).withRequestCache(requestCacheStats)
+            .withFetchCache(fetchCacheStats)
+            .withFailures(failureCounters)
+            .withAdmissionRefusedWhileDisabled(ScanAdmission.refusedWhileDisabledByKind());
     }
 
     /**

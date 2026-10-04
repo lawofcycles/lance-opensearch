@@ -335,6 +335,34 @@ public class LanceAttachIT extends LanceRestTestCase {
         }
     }
 
+    public void testAttachOfABucketTheStoreDoesNotHaveAnswers400NamingTheTable() throws Exception {
+        // The allowlist compares bucket names case insensitively, so a
+        // URI whose bucket differs in case from the allowed root passes
+        // it, and the open goes to the store with the URI as written. S3
+        // compares bucket names exactly and answers the listing with 404
+        // NoSuchBucket, which Lance raises as an IO error; the attach
+        // reports it as a bad request that names the table and the S3
+        // code. An HTTP listener in the test JVM stands in for the
+        // endpoint; the cluster runs on the same host.
+        String bucket = "Redaction-Bucket";
+        try (NoSuchBucketS3Fixture s3 = new NoSuchBucketS3Fixture(bucket)) {
+            String table = "s3://" + bucket + "/attach-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT) + ".lance";
+            ResponseException failure = expectThrows(
+                ResponseException.class,
+                () -> postJson(
+                    "/_plugins/_lance/attach",
+                    "{\"table\":\"" + table + "\",\"storage_options\":" + s3.storageOptionsJson() + "}"
+                )
+            );
+            int status = failure.getResponse().getStatusLine().getStatusCode();
+            String body = readAll(failure.getResponse());
+            assertEquals("expected 400 for a bucket the store does not have, saw " + status + ": " + body, 400, status);
+            assertFalse("the allowlist lets the differently cased bucket through: " + body, body.contains("allowed_table_roots"));
+            assertTrue("the response names the table: " + body, body.contains("could not open [" + table + "]"));
+            assertTrue("the response names the S3 error: " + body, body.contains("NoSuchBucket"));
+        }
+    }
+
     public void testAttachOmittingStorageOptionsPersistsNothing() throws Exception {
         // Absent storage_options must not seed any
         // index.plugins.lance.storage_options.* setting; callers use the absence

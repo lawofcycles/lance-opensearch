@@ -151,6 +151,30 @@ public class TransportLanceAttachActionTests extends OpenSearchTestCase {
             appender.assertAllExpectationsMatched();
         }
 
+        // A bucket the store does not have is the caller's error too.
+        try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(TransportLanceAttachAction.class))) {
+            appender.addExpectation(
+                new MockLogAppender.SeenEventExpectation(
+                    "a missing bucket is logged as a 400 naming the table",
+                    TransportLanceAttachAction.class.getName(),
+                    Level.INFO,
+                    "lance.attach: attach of table ["
+                        + table
+                        + "] as index [attach] was refused with 400: "
+                        + LanceInvalidInput.COULD_NOT_OPEN_PREFIX
+                        + table
+                        + "]: *NoSuchBucket*"
+                )
+            );
+            Exception reported = TransportLanceAttachAction.reportFailure(
+                new IOException("LanceError(IO): Generic S3 error: <Error><Code>NoSuchBucket</Code></Error>"),
+                table,
+                null
+            );
+            assertEquals(RestStatus.BAD_REQUEST, ExceptionsHelper.status(reported));
+            appender.assertAllExpectationsMatched();
+        }
+
         // A server error writes nothing here; the REST layer's WARN reports it.
         try (MockLogAppender appender = MockLogAppender.createForLoggers(LogManager.getLogger(TransportLanceAttachAction.class))) {
             appender.addExpectation(
@@ -162,7 +186,7 @@ public class TransportLanceAttachActionTests extends OpenSearchTestCase {
                 )
             );
             Exception reported = TransportLanceAttachAction.reportFailure(
-                new IOException("LanceError(IO): Generic S3 error: <Error><Code>NoSuchBucket</Code></Error>"),
+                new IOException("LanceError(IO): Generic S3 error: <Error><Code>SlowDown</Code></Error>"),
                 table,
                 null
             );

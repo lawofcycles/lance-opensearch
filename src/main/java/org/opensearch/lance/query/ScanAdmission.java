@@ -144,8 +144,9 @@ public final class ScanAdmission {
 
     /**
      * The gated paths. The key is the one the 429 message, the stats
-     * block ({@code admission.rejections.<key>}, {@code admission.last_kind})
-     * and {@code docs/admission.md} use.
+     * block ({@code admission.rejections.<key>},
+     * {@code admission.refused_while_disabled.<key>},
+     * {@code admission.last_kind}) and {@code docs/admission.md} use.
      */
     public enum Kind {
         /** A full text scan over an inverted index (the document set rebuild, the row addresses of its SQL prefilter, plus the hits scan buffers). */
@@ -465,9 +466,19 @@ public final class ScanAdmission {
     /** Scans this node refused since it started, per kind. */
     private static final Map<Kind, AtomicLong> REJECTIONS = new EnumMap<>(Kind.class);
 
+    /**
+     * Scans this node refused while the gate was off, per kind. Off,
+     * the gate judges no memory and the only refusal is the flat full
+     * text path's 400 ({@link #admitFlat}); the count is kept apart
+     * from {@link #REJECTIONS}, which are the 429s of a gate that is
+     * on, so an operator can tell the two apart in the stats.
+     */
+    private static final Map<Kind, AtomicLong> REFUSED_WHILE_DISABLED = new EnumMap<>(Kind.class);
+
     static {
         for (Kind kind : Kind.values()) {
             REJECTIONS.put(kind, new AtomicLong());
+            REFUSED_WHILE_DISABLED.put(kind, new AtomicLong());
         }
     }
 
@@ -808,6 +819,26 @@ public final class ScanAdmission {
         Map<String, Long> counts = new LinkedHashMap<>();
         for (Kind kind : Kind.values()) {
             counts.put(kind.key(), REJECTIONS.get(kind).get());
+        }
+        return counts;
+    }
+
+    /** Cumulative count of the scans of one kind refused while the gate was off. */
+    public static long refusedWhileDisabled(Kind kind) {
+        return REFUSED_WHILE_DISABLED.get(kind).get();
+    }
+
+    /**
+     * Cumulative scans refused while the gate was off, per kind in
+     * declaration order, every kind present even at zero, keyed by
+     * {@link Kind#key()}, for {@code GET /_plugins/_lance/stats}. Only
+     * {@link Kind#FTS_FLAT} is refused off today; the other kinds stay
+     * at zero.
+     */
+    public static Map<String, Long> refusedWhileDisabledByKind() {
+        Map<String, Long> counts = new LinkedHashMap<>();
+        for (Kind kind : Kind.values()) {
+            counts.put(kind.key(), REFUSED_WHILE_DISABLED.get(kind).get());
         }
         return counts;
     }
@@ -2101,6 +2132,7 @@ public final class ScanAdmission {
         names.sort(null);
         String columnList = String.join(", ", names);
         if (!enabled) {
+            REFUSED_WHILE_DISABLED.get(Kind.FTS_FLAT).incrementAndGet();
             throw new IllegalArgumentException(
                 "["
                     + LABEL
@@ -3051,6 +3083,9 @@ public final class ScanAdmission {
         nativeLimitProbe = ScanAdmission::readNativeMemoryLimit;
         tableStatistics = null;
         for (AtomicLong counter : REJECTIONS.values()) {
+            counter.set(0L);
+        }
+        for (AtomicLong counter : REFUSED_WHILE_DISABLED.values()) {
             counter.set(0L);
         }
         LAST_ESTIMATE_BYTES.set(0L);

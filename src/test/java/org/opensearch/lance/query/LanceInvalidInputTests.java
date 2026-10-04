@@ -283,6 +283,53 @@ public class LanceInvalidInputTests extends OpenSearchTestCase {
             new String[] { "AuthenticationFailed", "AuthorizationFailure", "AuthorizationPermissionMismatch", "InvalidAuthenticationInfo" },
             LanceInvalidInput.AZURE_CREDENTIAL_ERROR_CODES
         );
+        assertArrayEquals(new String[] { "NoSuchBucket" }, LanceInvalidInput.S3_MISSING_BUCKET_ERROR_CODES);
+        assertArrayEquals(new String[] { "ContainerNotFound" }, LanceInvalidInput.AZURE_MISSING_CONTAINER_ERROR_CODES);
+    }
+
+    /**
+     * A bucket or container the store does not have, in the body shape
+     * of its store and inside the {@code Error::IO} Lance raises for the
+     * listing that failed, is reported as a 400 that names the table,
+     * says the bucket is not there and keeps the store's code, without
+     * the access key id the S3 body echoes. A missing table inside a
+     * bucket that exists is not this path: Lance raises its own not
+     * found for it, which is already a 400.
+     */
+    public void testOpenFailureMapsAMissingBucketToBadRequest() {
+        for (String code : LanceInvalidInput.S3_MISSING_BUCKET_ERROR_CODES) {
+            assertMissingBucket(code, new IOException(s3Failure(code)));
+        }
+        for (String code : LanceInvalidInput.AZURE_MISSING_CONTAINER_ERROR_CODES) {
+            assertMissingBucket(code, new IOException(azureFailure(code)));
+        }
+        // Behind a wrapper, as a namespace initialise hands it back.
+        IOException store = new IOException(s3Failure("NoSuchBucket"));
+        Exception wrapped = new RuntimeException("namespace initialise failed", new IllegalStateException("privileged call failed", store));
+        assertEquals("NoSuchBucket", LanceInvalidInput.missingBucketErrorCode(wrapped));
+        assertEquals(RestStatus.BAD_REQUEST, ExceptionsHelper.status(LanceInvalidInput.openFailure(wrapped, "cat")));
+        assertNull(LanceInvalidInput.missingBucketErrorCode(null));
+        // A refused credential wins over a missing bucket when a chain
+        // quotes both: the caller's credentials are judged first.
+        assertNull(LanceInvalidInput.missingBucketErrorCode(new IOException(s3Failure("AccessDenied"))));
+    }
+
+    private static void assertMissingBucket(String code, Exception failure) {
+        assertNull(code + " is not a credential code", LanceInvalidInput.credentialErrorCode(failure));
+        assertEquals(code, LanceInvalidInput.missingBucketErrorCode(failure));
+        Exception reported = LanceInvalidInput.openFailure(failure, TABLE);
+        assertTrue(code + ": " + reported, reported instanceof IllegalArgumentException);
+        assertEquals(code, RestStatus.BAD_REQUEST, ExceptionsHelper.status(reported));
+        String message = reported.getMessage();
+        assertTrue(code + ": " + message, message.startsWith(LanceInvalidInput.COULD_NOT_OPEN_PREFIX + TABLE + "]: "));
+        assertTrue(code + ": " + message, message.contains("has no bucket or container of that name"));
+        assertTrue(code + ": " + message, message.contains(code));
+        assertFalse(code + ": the key id must not be reported: " + message, message.contains(KEY_ID));
+        Throwable cause = reported.getCause();
+        assertNotNull(code + ": the cause is kept", cause);
+        assertTrue(code + ": " + cause.getMessage(), cause.getMessage().contains(code));
+        assertFalse(code + ": the cause must not carry the key id: " + cause.getMessage(), cause.getMessage().contains(KEY_ID));
+        assertTrue(failure.getMessage().contains(code));
     }
 
     /**
@@ -347,12 +394,13 @@ public class LanceInvalidInputTests extends OpenSearchTestCase {
      * failure. The redaction of the message still applies.
      */
     public void testOpenFailureLeavesOtherFailuresAtTheirStatus() {
-        IOException noSuchBucket = new IOException(s3Failure("NoSuchBucket"));
-        assertNull(LanceInvalidInput.credentialErrorCode(noSuchBucket));
-        Exception reportedBucket = LanceInvalidInput.openFailure(noSuchBucket, TABLE);
-        assertEquals(RestStatus.INTERNAL_SERVER_ERROR, ExceptionsHelper.status(reportedBucket));
-        assertFalse(reportedBucket.getMessage(), reportedBucket.getMessage().contains(KEY_ID));
-        assertTrue(reportedBucket.getMessage(), reportedBucket.getMessage().contains("NoSuchBucket"));
+        IOException slowDown = new IOException(s3Failure("SlowDown"));
+        assertNull(LanceInvalidInput.credentialErrorCode(slowDown));
+        assertNull(LanceInvalidInput.missingBucketErrorCode(slowDown));
+        Exception reportedSlowDown = LanceInvalidInput.openFailure(slowDown, TABLE);
+        assertEquals(RestStatus.INTERNAL_SERVER_ERROR, ExceptionsHelper.status(reportedSlowDown));
+        assertFalse(reportedSlowDown.getMessage(), reportedSlowDown.getMessage().contains(KEY_ID));
+        assertTrue(reportedSlowDown.getMessage(), reportedSlowDown.getMessage().contains("SlowDown"));
 
         IOException wordOnly = new IOException("LanceError(IO): AccessDenied while reading /tables/attach.lance");
         assertNull(LanceInvalidInput.credentialErrorCode(wordOnly));

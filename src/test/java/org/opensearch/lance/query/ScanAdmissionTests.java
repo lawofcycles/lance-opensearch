@@ -341,9 +341,10 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         ScanAdmission.setEnabled(false);
         ScanAdmission.Shape shape = new ScanAdmission.Shape(true, false, 10L, 1, 0, Set.of("body"));
         long flatBefore = ScanAdmission.rejections(ScanAdmission.Kind.FTS_FLAT);
+        long refusedBefore = ScanAdmission.refusedWhileDisabled(ScanAdmission.Kind.FTS_FLAT);
         // Off, the gate cannot bound the flat scan, so the path is not
         // admitted: the refusal is a client error naming the setting,
-        // not a 429, and it is not counted as a memory rejection.
+        // not a 429, and it is counted apart from the memory rejections.
         IllegalArgumentException refused = expectThrows(
             IllegalArgumentException.class,
             () -> ScanAdmission.admit("demo", 1_000L, shape, Set.of(), Optional.empty(), null)
@@ -355,6 +356,9 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
             refused.getMessage()
         );
         assertEquals(flatBefore, ScanAdmission.rejections(ScanAdmission.Kind.FTS_FLAT));
+        assertEquals(refusedBefore + 1, ScanAdmission.refusedWhileDisabled(ScanAdmission.Kind.FTS_FLAT));
+        assertEquals(refusedBefore + 1, ScanAdmission.refusedWhileDisabledByKind().get("fts_flat").longValue());
+        assertEquals(0L, ScanAdmission.refusedWhileDisabledByKind().get("fts").longValue());
 
         // Several columns: all are named.
         ScanAdmission.Shape two = new ScanAdmission.Shape(true, false, 10L, 2, 0, new LinkedHashSet<>(List.of("title", "body")));
@@ -364,6 +368,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         );
         assertTrue(twice.getMessage(), twice.getMessage().contains("on columns [body, title] is refused"));
         assertTrue(twice.getMessage(), twice.getMessage().contains("create an inverted index on the columns with"));
+        assertEquals(refusedBefore + 2, ScanAdmission.refusedWhileDisabled(ScanAdmission.Kind.FTS_FLAT));
 
         // The indexed path of the same shape is admitted, off, as every
         // other kind is: no memory is judged and nothing is thrown.
