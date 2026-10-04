@@ -64,6 +64,25 @@ public class RestNamespaceActionTests extends OpenSearchTestCase {
         );
     }
 
+    public void testParseConfigRejectsOneByteAboveTheKeyBoundReachedByAMultiByteCharacter() {
+        // The key is MAX_KEY_BYTES chars long but one byte over: the
+        // bound counts UTF 8 bytes, not chars, on the namespace path too.
+        String key = "k".repeat(StorageOptions.MAX_KEY_BYTES - 1) + "\u00e9";
+        assertEquals(StorageOptions.MAX_KEY_BYTES, key.length());
+        Map<String, Object> config = new LinkedHashMap<>();
+        config.put(key, "v");
+        Exception e = expectThrows(IllegalArgumentException.class, () -> RestNamespaceAction.parseConfig(config));
+        assertEquals(
+            "[lance_namespace] config key ["
+                + key
+                + "] is ["
+                + (StorageOptions.MAX_KEY_BYTES + 1)
+                + "] bytes, the limit is "
+                + StorageOptions.MAX_KEY_BYTES,
+            e.getMessage()
+        );
+    }
+
     public void testParseConfigAcceptsTheValueBound() {
         String value = "v".repeat(StorageOptions.MAX_VALUE_BYTES);
         Map<String, Object> config = new LinkedHashMap<>();
