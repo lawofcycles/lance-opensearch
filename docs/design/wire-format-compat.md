@@ -96,10 +96,12 @@ plugin versions at once is not a supported state. Removing or retyping a field, 
 default a retired field is still written with, are not covered by this note; a policy for them
 comes with the first release that needs one.
 
-The message classes that only execute on the node that received the REST call
-(`LanceExplainRequest`, `LanceRefsRequest`, `LanceNamespaceListRequest` at the top level, and
-their responses) carry no marker: a `HandledTransportAction` invoked through
-the node client never serialises them. `LanceNamespaceMetadata` is cluster state, versioned and
+The three request classes that only execute on the node that received the REST call
+(`LanceExplainRequest`, `LanceRefsRequest`, `LanceNamespaceListRequest` at the top level) and two of
+their responses (`LanceRefsResponse`, `LanceNamespaceListResponse`) carry no marker: a
+`HandledTransportAction` invoked through the node client never serialises them.
+`LanceExplainResponse` does carry one and is listed in the version history below.
+`LanceNamespaceMetadata` is cluster state, versioned and
 published by OpenSearch's own mechanism, and keeps the policy written on the class.
 
 ## Version history
