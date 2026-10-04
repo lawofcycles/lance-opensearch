@@ -987,9 +987,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         ScanAdmission.setTableStatistics(cache);
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
             long version = dataset.version();
-            assertNull(
-                cache.lookup(dataset.uri(), version, () -> LanceRegistry.openDataset(uri, StorageOptions.empty(), Optional.of(version)))
-            );
+            assertNull(cache.lookup(dataset.uri(), version, () -> LanceRegistry.openDatasetAt(uri, StorageOptions.empty(), version)));
             TableStatistics statistics = cache.lookup(dataset.uri(), version, () -> { throw new AssertionError("already collected"); });
             assertNotNull(statistics);
             long embeddingEstimate = ScanAdmission.vectorIndexFor("embedding", statistics).get().sizeBytes().getAsLong()
@@ -1527,9 +1525,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
             // The cache collects on the miss (the test cache runs its
             // collections on the calling thread); the second lookup hits.
             long version = dataset.version();
-            assertNull(
-                cache.lookup(dataset.uri(), version, () -> LanceRegistry.openDataset(uri, StorageOptions.empty(), Optional.of(version)))
-            );
+            assertNull(cache.lookup(dataset.uri(), version, () -> LanceRegistry.openDatasetAt(uri, StorageOptions.empty(), version)));
             TableStatistics statistics = cache.lookup(dataset.uri(), version, () -> { throw new AssertionError("already collected"); });
             assertNotNull(statistics);
             ColumnStatistics.IndexSummary index = ScanAdmission.vectorIndexFor("embedding", statistics).get();

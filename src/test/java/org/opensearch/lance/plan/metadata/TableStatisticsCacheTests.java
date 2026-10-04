@@ -56,7 +56,7 @@ public class TableStatisticsCacheTests extends OpenSearchTestCase {
     }
 
     private Supplier<Dataset> openerAt(long version) {
-        return () -> LanceRegistry.openDataset(uri, StorageOptions.empty(), Optional.of(version));
+        return () -> LanceRegistry.openDatasetAt(uri, StorageOptions.empty(), version);
     }
 
     /** Commit a new manifest version by deleting one row. */
@@ -362,19 +362,19 @@ public class TableStatisticsCacheTests extends OpenSearchTestCase {
         try (Dataset dataset = LanceRegistry.openDataset(a, StorageOptions.empty())) {
             uriA = dataset.uri();
             versionA = dataset.version();
-            lookupNow(cache, dataset, () -> LanceRegistry.openDataset(a, StorageOptions.empty(), Optional.of(versionA)));
+            lookupNow(cache, dataset, () -> LanceRegistry.openDatasetAt(a, StorageOptions.empty(), versionA));
         }
         try (Dataset dataset = LanceRegistry.openDataset(b, StorageOptions.empty())) {
             uriB = dataset.uri();
             versionB = dataset.version();
-            lookupNow(cache, dataset, () -> LanceRegistry.openDataset(b, StorageOptions.empty(), Optional.of(versionB)));
+            lookupNow(cache, dataset, () -> LanceRegistry.openDatasetAt(b, StorageOptions.empty(), versionB));
         }
         try (Dataset dataset = LanceRegistry.openDataset(a, StorageOptions.empty())) {
-            lookupNow(cache, dataset, () -> LanceRegistry.openDataset(a, StorageOptions.empty(), Optional.of(versionA)));
+            lookupNow(cache, dataset, () -> LanceRegistry.openDatasetAt(a, StorageOptions.empty(), versionA));
         }
         try (Dataset dataset = LanceRegistry.openDataset(c, StorageOptions.empty())) {
             long versionC = dataset.version();
-            lookupNow(cache, dataset, () -> LanceRegistry.openDataset(c, StorageOptions.empty(), Optional.of(versionC)));
+            lookupNow(cache, dataset, () -> LanceRegistry.openDatasetAt(c, StorageOptions.empty(), versionC));
         }
         assertEquals(2, cache.size());
         assertNotNull("a was touched after b", cache.peek(uriA, versionA));

@@ -532,7 +532,7 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
 
     /**
      * {@link #pinnedVersion()} in the shape
-     * {@link org.opensearch.lance.LanceRegistry#openDataset(String, StorageOptions, Optional)}
+     * {@link org.opensearch.lance.LanceRegistry#openDatasetAt(String, StorageOptions, long)}
      * takes: empty when no version was resolved.
      */
     public Optional<Long> pinnedVersionOrEmpty() {

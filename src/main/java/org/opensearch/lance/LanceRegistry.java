@@ -6,7 +6,6 @@
 package org.opensearch.lance;
 
 import java.util.Map;
-import java.util.Optional;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -20,8 +19,9 @@ import org.lance.Session;
  * plugin-owned code path that needs to open a Lance dataset, plus the
  * single-source helper for constructing that {@link Dataset} instance.
  * Every call site goes through {@link #openDataset(String, StorageOptions)}
- * so the storage-options plumbing and the Session sharing both live in
- * one place.
+ * or {@link #openDatasetAt(String, StorageOptions, long)} so the
+ * storage-options plumbing and the Session sharing both live in one
+ * place.
  *
  * <p>Sharing one {@link Session} across every {@code Dataset} on the node
  * keeps Lance's inverted-index and metadata caches native-side and node
@@ -153,25 +153,30 @@ public final class LanceRegistry {
      * the shared Session.
      */
     public static Dataset openDataset(String uri, StorageOptions storageOptions) {
-        return openDataset(uri, storageOptions, Optional.empty());
+        return open(uri, storageOptions, null);
     }
 
     /**
-     * Open a Lance dataset at a specific manifest version. When
-     * {@code pinnedVersion} is non-empty, the returned dataset is
-     * pinned to that Lance version and will not follow subsequent
+     * Open a Lance dataset at manifest {@code version}. The returned
+     * dataset is pinned to that version and does not follow subsequent
      * appends. An index pinned this way carries {@code index.plugins.lance.version},
      * which keeps it out of the freshness checks (see
      * {@code LanceIndexFreshnessService}) so refresh does not race with a
-     * manifest advance.
+     * manifest advance. The Session sharing is as in
+     * {@link #openDataset(String, StorageOptions)}.
      *
      * <p>Storage options and version pinning both go through
-     * {@link ReadOptions}, so this method combines them into a single
+     * {@link ReadOptions}, so the two are combined into a single
      * {@code ReadOptions} rather than round-tripping through
      * {@link StorageOptions#toReadOptionsOrNull} (which would drop
      * the version silently).
      */
-    public static Dataset openDataset(String uri, StorageOptions storageOptions, Optional<Long> pinnedVersion) {
+    public static Dataset openDatasetAt(String uri, StorageOptions storageOptions, long version) {
+        return open(uri, storageOptions, version);
+    }
+
+    /** The open behind the two public entries; {@code version} is null for the latest manifest. */
+    private static Dataset open(String uri, StorageOptions storageOptions, Long version) {
         OpenDatasetBuilder builder = Dataset.open().allocator(ALLOCATOR).uri(uri);
         Session session = SESSION;
         if (session != null && !session.isClosed()) {
@@ -179,12 +184,14 @@ public final class LanceRegistry {
         }
         Map<String, String> storageMap = storageOptions == null ? null : storageOptions.asMap();
         boolean hasStorage = storageMap != null && !storageMap.isEmpty();
-        if (hasStorage || pinnedVersion.isPresent()) {
+        if (hasStorage || version != null) {
             ReadOptions.Builder roBuilder = new ReadOptions.Builder();
             if (hasStorage) {
                 roBuilder.setStorageOptions(storageMap);
             }
-            pinnedVersion.ifPresent(roBuilder::setVersion);
+            if (version != null) {
+                roBuilder.setVersion(version);
+            }
             builder = builder.readOptions(roBuilder.build());
         }
         return builder.build();
@@ -196,7 +203,7 @@ public final class LanceRegistry {
      * one manifest, so the table is opened at its latest version first and
      * {@code Dataset.tags().getVersion(tag)} is read from there. Callers
      * then pass the returned version through
-     * {@link #openDataset(String, StorageOptions, java.util.Optional)} to
+     * {@link #openDatasetAt(String, StorageOptions, long)} to
      * read the tagged snapshot; this keeps tag following a two step
      * "resolve, then open at version" so the version-pinned open path is
      * the only place that checks out a specific manifest.

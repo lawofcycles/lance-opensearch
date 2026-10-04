@@ -576,7 +576,9 @@ public final class LanceWarmCache implements Closeable {
             throw new IllegalStateException("the snapshot cache is closed");
         }
         if (!enabled) {
-            Dataset dataset = openDataset(tableUri, storageOptions, version);
+            Dataset dataset = version.isPresent()
+                ? openDatasetAt(tableUri, storageOptions, version.get())
+                : openDataset(tableUri, storageOptions);
             Snapshot transientSnapshot;
             try {
                 transientSnapshot = build(new SnapshotKey(indexUuid, dataset.version()), dataset, pkField, pkType, overrides, false);
@@ -618,7 +620,7 @@ public final class LanceWarmCache implements Closeable {
         }
         // Build. When the version is still unknown the open resolves the
         // latest manifest and its version becomes the key.
-        Dataset dataset = openDataset(tableUri, storageOptions, resolved >= 0 ? Optional.of(resolved) : Optional.empty());
+        Dataset dataset = resolved >= 0 ? openDatasetAt(tableUri, storageOptions, resolved) : openDataset(tableUri, storageOptions);
         SnapshotKey key = new SnapshotKey(indexUuid, dataset.version());
         BuildLock lock = enterBuildLock(key);
         try {
@@ -706,28 +708,30 @@ public final class LanceWarmCache implements Closeable {
     private void prefetchTableStatistics(Dataset dataset, String tableUri, StorageOptions storageOptions) {
         try {
             long version = dataset.version();
-            tableStatistics.prefetch(
-                dataset.uri(),
-                version,
-                () -> LanceRegistry.openDataset(tableUri, storageOptions, Optional.of(version))
-            );
+            tableStatistics.prefetch(dataset.uri(), version, () -> LanceRegistry.openDatasetAt(tableUri, storageOptions, version));
         } catch (RuntimeException e) {
             LOGGER.debug("could not start the table statistics collection for {}", tableUri, e);
         }
     }
 
     /**
-     * Open {@code tableUri} at {@code version} (the latest manifest when
-     * empty) and count it in {@link #datasetOpenCount()}. The snapshot
-     * builds open through here, and so does the coordinator's fan-out
+     * Open {@code tableUri} at its latest manifest and count it in
+     * {@link #datasetOpenCount()}. The snapshot builds open through here
+     * and {@link #openDatasetAt}, and so does the coordinator's fan-out
      * for the table it enumerates fragments from, so the counter is
      * every open a request pays on this node; the opens elsewhere (the
      * statistics collection, the freshness poll, the tag resolution,
      * attach) are not counted.
      */
-    public Dataset openDataset(String tableUri, StorageOptions storageOptions, Optional<Long> version) {
+    public Dataset openDataset(String tableUri, StorageOptions storageOptions) {
         datasetOpens.incrementAndGet();
-        return LanceRegistry.openDataset(tableUri, storageOptions, version);
+        return LanceRegistry.openDataset(tableUri, storageOptions);
+    }
+
+    /** As {@link #openDataset}, at manifest {@code version}. */
+    public Dataset openDatasetAt(String tableUri, StorageOptions storageOptions, long version) {
+        datasetOpens.incrementAndGet();
+        return LanceRegistry.openDatasetAt(tableUri, storageOptions, version);
     }
 
     private Snapshot build(

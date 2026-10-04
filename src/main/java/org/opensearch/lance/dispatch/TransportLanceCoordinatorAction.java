@@ -858,7 +858,11 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
             done.onResponse(null);
             return;
         }
-        try (Dataset dataset = warmCache.openDataset(target.tableUri(), target.storageOptions(), pinned)) {
+        try (
+            Dataset dataset = pinned.isPresent()
+                ? warmCache.openDatasetAt(target.tableUri(), target.storageOptions(), pinned.get())
+                : warmCache.openDataset(target.tableUri(), target.storageOptions())
+        ) {
             observedVersion = dataset.version();
             // The mapping may not know this version yet (a column the
             // table gained since the last freshness check): the shard's
