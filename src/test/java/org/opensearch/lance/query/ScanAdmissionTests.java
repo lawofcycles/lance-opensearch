@@ -315,7 +315,8 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
             message,
             message.contains("Create an inverted index on column [body] with the table's writer (pylance create_scalar_index)")
         );
-        assertTrue(message, message.contains("plugins.lance.admission.headroom / plugins.lance.admission.enabled"));
+        assertTrue(message, message.contains("or relax plugins.lance.admission.headroom."));
+        assertFalse("turning the gate off refuses this kind, so it is no remedy", message.contains("plugins.lance.admission.enabled"));
         assertFalse("the indexed wording is not used", message.contains("inverted index document set"));
         assertEquals(1_000L * ScanAdmission.FLAT_FTS_BYTES_PER_ROW, ScanAdmission.lastEstimateBytes());
         assertEquals("fts_flat", ScanAdmission.lastKind());
@@ -332,6 +333,73 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
         assertTrue(twice.getMessage(), twice.getMessage().contains("on each of columns [body, title]"));
         assertTrue(twice.getMessage(), twice.getMessage().contains("Create an inverted index on columns [body, title]"));
         assertEquals(2L * 1_000L * ScanAdmission.FLAT_FTS_BYTES_PER_ROW, ScanAdmission.lastEstimateBytes());
+    }
+
+    public void testDisabledGateRefusesTheFlatPathWithA400AndNamesTheSetting() {
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(1, ByteSizeUnit.BYTES));
+        ScanAdmission.setHeadroom(new ByteSizeValue(Long.MAX_VALUE / 2, ByteSizeUnit.BYTES));
+        ScanAdmission.setEnabled(false);
+        ScanAdmission.Shape shape = new ScanAdmission.Shape(true, false, 10L, 1, 0, Set.of("body"));
+        long flatBefore = ScanAdmission.rejections(ScanAdmission.Kind.FTS_FLAT);
+        // Off, the gate cannot bound the flat scan, so the path is not
+        // admitted: the refusal is a client error naming the setting,
+        // not a 429, and it is not counted as a memory rejection.
+        IllegalArgumentException refused = expectThrows(
+            IllegalArgumentException.class,
+            () -> ScanAdmission.admit("demo", 1_000L, shape, Set.of(), Optional.empty(), null)
+        );
+        assertEquals(
+            "[lance_admission] full text scan without an inverted index on column [body] is refused while "
+                + "plugins.lance.admission.enabled is false; create an inverted index on the column with the table's writer, "
+                + "or enable admission",
+            refused.getMessage()
+        );
+        assertEquals(flatBefore, ScanAdmission.rejections(ScanAdmission.Kind.FTS_FLAT));
+
+        // Several columns: all are named.
+        ScanAdmission.Shape two = new ScanAdmission.Shape(true, false, 10L, 2, 0, new LinkedHashSet<>(List.of("title", "body")));
+        IllegalArgumentException twice = expectThrows(
+            IllegalArgumentException.class,
+            () -> ScanAdmission.admit("demo", 1_000L, two, Set.of(), Optional.empty(), null)
+        );
+        assertTrue(twice.getMessage(), twice.getMessage().contains("on columns [body, title] is refused"));
+        assertTrue(twice.getMessage(), twice.getMessage().contains("create an inverted index on the columns with"));
+
+        // The indexed path of the same shape is admitted, off, as every
+        // other kind is: no memory is judged and nothing is thrown.
+        ScanAdmission.admit("demo", 1_000L, shape, Set.of("body"), Optional.empty(), null);
+        assertEquals("fts", ScanAdmission.lastKind());
+        // A mixed shape refuses on its flat column after admitting the
+        // indexed one.
+        IllegalArgumentException mixed = expectThrows(
+            IllegalArgumentException.class,
+            () -> ScanAdmission.admit("demo", 1_000L, two, Set.of("body"), Optional.empty(), null)
+        );
+        assertTrue(mixed.getMessage(), mixed.getMessage().contains("on column [title] is refused"));
+    }
+
+    public void testEnabledGateJudgesTheFlatPathOnItsEstimate() {
+        ScanAdmission.setIndexCacheShardShareOverride(new ByteSizeValue(1, ByteSizeUnit.BYTES));
+        ScanAdmission.setHeadroom(new ByteSizeValue(8, ByteSizeUnit.GB));
+        ScanAdmission.setEnabled(true);
+        ScanAdmission.Shape shape = new ScanAdmission.Shape(true, false, 10L, 1, 0, Set.of("body"));
+        long estimate = 1_000L * ScanAdmission.FLAT_FTS_BYTES_PER_ROW;
+        // On, one byte short of the estimate after the headroom, the
+        // flat scan is the 429 of the gate.
+        ScanAdmission.setMemoryProbeForTests(() -> 8 * GB + estimate - 1L);
+        CircuitBreakingException rejection = expectThrows(
+            CircuitBreakingException.class,
+            () -> ScanAdmission.admit("demo", 1_000L, shape, Set.of(), Optional.empty(), null)
+        );
+        assertTrue(rejection.getMessage(), rejection.getMessage().startsWith("[lance_admission] fts_flat estimate"));
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.FTS_FLAT));
+        // With the memory to hold it the same scan is admitted on its
+        // estimate and recorded under its kind.
+        ScanAdmission.setMemoryProbeForTests(() -> 8 * GB + estimate);
+        ScanAdmission.admit("demo", 1_000L, shape, Set.of(), Optional.empty(), null);
+        assertEquals("fts_flat", ScanAdmission.lastKind());
+        assertEquals(estimate, ScanAdmission.lastEstimateBytes());
+        assertEquals(1L, ScanAdmission.rejections(ScanAdmission.Kind.FTS_FLAT));
     }
 
     public void testColumnWithAnIndexKeepsTheFtsJudgementAndAFlatColumnNextToItIsJudgedAfterIt() {

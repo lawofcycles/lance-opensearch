@@ -101,6 +101,15 @@ public final class ReaderWrapperProbe {
         }
     }
 
+    /**
+     * Whether a reader wrapper is installed on exactly {@code indexService};
+     * for a caller that holds the index's own service, such as its engine,
+     * and must not fall through to another index of the node.
+     */
+    public static boolean installedOn(IndexService indexService) {
+        return hasWrapper(indexService);
+    }
+
     private static boolean hasWrapper(IndexService indexService) {
         try {
             return GET_READER_WRAPPER.invoke(indexService) != null;
