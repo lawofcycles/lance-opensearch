@@ -449,12 +449,13 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         LanceAggregateResults.bindSettings(settings, clusterSettings);
 
         // 5. The action filters and the namespace service. The dispatch
-        // filter intercepts every _search against a Lance backed index
-        // and hands it to the plugin's coordinator; the shard fan out
-        // through ReadOnlyEngine runs only for the shapes the fragment
-        // executor cannot answer yet. The clear cache filter drops the
-        // entries of a Lance backed index from every node's result cache
-        // before OpenSearch's own action clears the shard caches.
+        // filter intercepts every _search whose targets are all Lance
+        // backed and hands it to the plugin's coordinator, whatever the
+        // body; only a request that names a Lance backed index next to
+        // one that is not proceeds to the stock shard fan out. The clear
+        // cache filter drops the entries of a Lance backed index from
+        // every node's result cache before OpenSearch's own action clears
+        // the shard caches.
         this.dispatchActionFilter = new LanceDispatchActionFilter(clusterService, indexNameExpressionResolver, client, threadPool);
         this.createIndexActionFilter = new LanceCreateIndexActionFilter(threadPool);
         this.clearCacheActionFilter = new LanceClearCacheActionFilter(clusterService, indexNameExpressionResolver, client);
