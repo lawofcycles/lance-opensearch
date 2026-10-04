@@ -293,8 +293,8 @@ public final class ScanAdmission {
      * between scans. The figure is pinned to the one measurement so
      * far: a {@code match} over a 1B row Utf8 column without an index
      * on one 128 GB node took 390 s and grew the resident set by about
-     * 100 GB, 100 bytes per row. QA fits it as further measurements
-     * come in.
+     * 100 GB, 100 bytes per row. The coefficient is fitted as further
+     * measurements come in.
      */
     static final long FLAT_FTS_BYTES_PER_ROW = 100L;
 

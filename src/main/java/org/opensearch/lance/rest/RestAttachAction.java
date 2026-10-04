@@ -239,7 +239,7 @@ public class RestAttachAction extends BaseRestHandler {
         java.util.Set<String> keywordOverrides = effective.keywordColumns();
         java.util.Set<String> ipOverrides = effective.ipColumns();
         java.util.Set<String> wildcardOverrides = effective.wildcardColumns();
-        java.util.Set<String> lanceTextOverrides = effective.lanceTextColumns();
+        Set<String> lanceTextOverrides = effective.lanceTextColumns();
         Map<String, String> geoPointOverrides = effective.geoPointColumns();
         for (LanceField field : lanceSchema.fields()) {
             ArrowType type = field.getType();
