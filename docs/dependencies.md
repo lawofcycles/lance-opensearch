@@ -11,6 +11,7 @@ declarations, grouped the same way as below, are in `build.gradle`.
 - [Third party audit](#third-party-audit)
 - [Licenses and notices](#licenses-and-notices)
 - [Security policy](#security-policy)
+- [Constants copied from Lance](#constants-copied-from-lance)
 - [Checking a dependency change](#checking-a-dependency-change)
 
 ## How the closure is built
@@ -269,6 +270,38 @@ any other system property. It does not expand `${/}` or single brace
 `${property}` names there, and it has no `${path.data}` style expansion,
 which is why the core grants the data path itself. The `${codebase.<jar>}`
 names of the plugin's own jars are expanded in codebase URLs only.
+
+## Constants copied from Lance
+
+The plugin reproduces a few of Lance's sizing rules in Java so that it can
+size the Session caches and estimate scans without calling into the
+native library. Each is a copy of a value or a function in the Lance
+source tree, and Lance can change its side without any signal on the
+plugin's. When `lance-core` moves to a new version, read the Lance file
+named in the table and confirm that the plugin's constant still matches;
+the Javadoc of each constant names the same source. The paths are under
+`rust/` in the Lance repository.
+
+| plugin constant | copies | Lance source |
+|---|---|---|
+| `NativeMemoryLimit.recommendedShards`, `MIN_SHARD_SHARE_BYTES`, `MAX_SHARDS` | `recommended_cache_shards`, `MIN_SHARD_SHARE` (4 GiB), the `clamp(1, 1024)` | `lance-core/src/cache/quick.rs` |
+| `NativeMemoryLimit.INDEX_SHARE`, `METADATA_SHARE` | The 6 to 1 ratio of `DEFAULT_INDEX_CACHE_SIZE` (6 GiB) to `DEFAULT_METADATA_CACHE_SIZE` (1 GiB) | `lance/src/dataset.rs` |
+| `ScanAdmission.SCAN_BATCH_ROWS` | `BATCH_SIZE_FALLBACK` (8192 rows) | `lance/src/dataset/scanner.rs` |
+| `ScanAdmission.IO_BUFFER_BYTES_PER_SCAN` | `DEFAULT_IO_BUFFER_SIZE_VALUE` (2 GiB) | `lance/src/dataset/scanner.rs` |
+| `ScanAdmission.BTREE_BYTES_PER_ROW` | The `[values, ids]` page schema and `DEFAULT_BTREE_BATCH_SIZE` (4096 rows per page) | `lance-index/src/scalar/btree.rs` |
+| `ScanAdmission.ZONEMAP_ROWS_PER_ZONE` | `ROWS_PER_ZONE_DEFAULT` (8192 rows) | `lance-index/src/scalar/zonemap.rs` |
+
+`NativeMemoryLimit.INVERTED_INDEX_BYTES_PER_ROW` (52 bytes) is not a copy
+of a constant but a measurement of the index cache entry of an inverted
+index, which Lance keeps as one `DocSet` per index: `row_ids`,
+`num_tokens`, `inv` and `doc_indices` (`lance-index/src/scalar/inverted`).
+A change to that layout changes the bytes per row, so a Lance upgrade
+is also the time to measure the entry of a large table again
+(`session.size_bytes()` once the index is resident) and compare it with
+the constant. The same holds for the measured estimator constants in
+`ScanAdmission` (`FLAT_FTS_BYTES_PER_ROW`, `FILTER_SCAN_BYTES_PER_MATCHING_ROW`,
+`PHRASE_POSITION_BYTES_PER_ROW`), whose Javadoc names the Lance code path
+each one models.
 
 ## Checking a dependency change
 
