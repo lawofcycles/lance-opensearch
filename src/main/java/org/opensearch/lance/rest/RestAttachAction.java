@@ -47,7 +47,8 @@ import org.opensearch.transport.client.node.NodeClient;
  * <p>Attach always creates a single-shard index because the fragment path
  * (see {@code LanceDispatchActionFilter}) is the only search implementation
  * left, and it fans out to fragments regardless of shard count. Requests
- * carrying {@code number_of_shards} are rejected with 400.
+ * carrying {@code number_of_shards} are rejected with 400, as is any body
+ * carrying a top level key outside {@link #ACCEPTED_KEYS}.
  *
  * <p>The handler parses the body and hands a {@link LanceAttachRequest} to
  * {@link LanceAttachAction}; opening the table, deriving the mapping, and
@@ -59,6 +60,21 @@ import org.opensearch.transport.client.node.NodeClient;
 public class RestAttachAction extends BaseRestHandler {
 
     private static final String PK_METADATA_KEY = "lance-schema:unenforced-primary-key";
+
+    /**
+     * The top level keys {@link #prepareRequest} reads, in the order it
+     * reads them. Any other key is a 400 naming it and this list.
+     */
+    static final List<String> ACCEPTED_KEYS = List.of(
+        "table",
+        "name",
+        "number_of_shards",
+        "version",
+        "tag",
+        "storage_options",
+        "overrides",
+        "multi_fields"
+    );
 
     @Override
     public String getName() {
@@ -73,8 +89,13 @@ public class RestAttachAction extends BaseRestHandler {
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) {
         Map<String, Object> body = request.hasContent()
-            ? XContentHelper.convertToMap(request.content(), false, request.getMediaType()).v2()
+            ? XContentHelper.convertToMap(request.content(), true, request.getMediaType()).v2()
             : Map.of();
+        // Thrown, not caught: the REST controller turns it into a 400
+        // illegal_argument_exception, the shape core uses for an unknown
+        // field in a request body. The body is read in document order so
+        // the key named is the first unknown one the caller wrote.
+        RestBodyKeys.rejectUnknown(getName(), body, ACCEPTED_KEYS);
 
         String table;
         String explicitName;
