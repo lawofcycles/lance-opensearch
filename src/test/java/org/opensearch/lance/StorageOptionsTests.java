@@ -176,6 +176,25 @@ public class StorageOptionsTests extends OpenSearchTestCase {
         assertFalse("the value must not be quoted: " + e.getMessage(), e.getMessage().contains("vvvv"));
     }
 
+    public void testParseFromRequestFieldRejectsOneByteAboveTheValueBoundReachedByAMultiByteCharacter() {
+        // The value is MAX_VALUE_BYTES chars long but one byte over: the
+        // bound counts UTF 8 bytes, not chars, on the attach path too.
+        String value = "v".repeat(StorageOptions.MAX_VALUE_BYTES - 1) + "\u00e9";
+        assertEquals(StorageOptions.MAX_VALUE_BYTES, value.length());
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("aws_session_token", value);
+        Exception e = expectThrows(IllegalArgumentException.class, () -> StorageOptions.parseFromRequestField(body, "[lance_attach]"));
+        assertEquals(
+            "[lance_attach] storage_options value for [aws_session_token] is ["
+                + (StorageOptions.MAX_VALUE_BYTES + 1)
+                + "] bytes, the limit is "
+                + StorageOptions.MAX_VALUE_BYTES,
+            e.getMessage()
+        );
+        assertFalse("the value must not be quoted: " + e.getMessage(), e.getMessage().contains("vvvv"));
+        assertFalse("the value must not be quoted: " + e.getMessage(), e.getMessage().contains("\u00e9"));
+    }
+
     public void testFromIndexSettingsAndWriteToSettingsRoundTrip() {
         StorageOptions original = StorageOptions.of(Map.of("aws_region", "us-west-2", "aws_endpoint", "https://s3.example"));
         Settings.Builder builder = Settings.builder();
@@ -356,6 +375,53 @@ public class StorageOptionsTests extends OpenSearchTestCase {
         );
         assertTrue("the request id is not a credential: " + redacted, redacted.contains("7A9E3F0C2B1D4E5F"));
         assertTrue("the Rust location stays: " + redacted, redacted.contains("object_store.rs:1234:56"));
+    }
+
+    public void testRedactCredentialsReplacesAnUnclosedSigningElementUpToTheEndOfTheMessage() {
+        // A body cut short inside StringToSign: the opening tag is there,
+        // the closing tag never arrives. Everything after the opening tag
+        // is the element's content and is redacted to the end.
+        String stringToSign = "AWS4-HMAC-SHA256\n20260927T015900Z\n20260927/us-east-1/s3/aws4_request\n" + "ab".repeat(32);
+        String truncated = "Generic S3 error: Client error with status 403 Forbidden: <Error><Code>SignatureDoesNotMatch</Code>"
+            + "<StringToSign>"
+            + stringToSign;
+        String redacted = StorageOptions.redactCredentials(truncated);
+        assertFalse("the credential scope must not survive: " + redacted, redacted.contains("aws4_request"));
+        assertFalse("the content must not survive: " + redacted, redacted.contains("ab".repeat(32)));
+        assertEquals(
+            "Generic S3 error: Client error with status 403 Forbidden: <Error><Code>SignatureDoesNotMatch</Code><StringToSign>***",
+            redacted
+        );
+    }
+
+    public void testRedactCredentialsReplacesAnUnclosedSigningElementUpToTheNextTag() {
+        // A body whose StringToSign has no closing tag and runs into the
+        // next element: the content stops at that element's opening tag,
+        // and the next element is redacted on its own terms.
+        String signature = "9f" + "e3".repeat(31);
+        String stringToSign = "AWS4-HMAC-SHA256\n20260927T015900Z\n20260927/us-east-1/s3/aws4_request\n" + "ab".repeat(32);
+        String body = "<Error><Code>SignatureDoesNotMatch</Code>"
+            + "<StringToSign>"
+            + stringToSign
+            + "<SignatureProvided>"
+            + signature
+            + "</SignatureProvided>"
+            + "<RequestId>7A9E3F0C2B1D4E5F</RequestId></Error>";
+        String redacted = StorageOptions.redactCredentials(body);
+        assertFalse("the credential scope must not survive: " + redacted, redacted.contains("aws4_request"));
+        assertFalse("the signature must not survive: " + redacted, redacted.contains(signature));
+        assertEquals(
+            "<Error><Code>SignatureDoesNotMatch</Code><StringToSign>***<SignatureProvided>***</SignatureProvided>"
+                + "<RequestId>7A9E3F0C2B1D4E5F</RequestId></Error>",
+            redacted
+        );
+    }
+
+    public void testRedactCredentialsLeavesTheSigningElementNamesInProseAlone() {
+        // The element names without angle brackets are words, not
+        // elements: nothing matches and the message comes back as is.
+        String prose = "the StringToSign was wrong, the SignatureProvided did not match and the CanonicalRequest had no host";
+        assertSame(prose, StorageOptions.redactCredentials(prose));
     }
 
     public void testRedactCredentialsReplacesAccessKeyIdsWhereverTheyAppear() {

@@ -164,10 +164,17 @@ public final class StorageOptions {
      * id's credential scope. {@code StringToSign} and
      * {@code CanonicalRequest} are newline separated and span lines,
      * so the match runs in DOTALL mode and stops at the element's own
-     * closing tag.
+     * closing tag. An opening tag with no closing tag anywhere after
+     * it (a body cut short by a message length limit, or a body that
+     * moves on to another element) is redacted from the opening tag
+     * to the next {@code <} or to the end of the message, so a
+     * truncated body does not leak the part it kept. Group 3 is
+     * absent in that case and the replacement adds nothing after the
+     * placeholder. The element name in prose, with no angle brackets,
+     * is not a match.
      */
     private static final Pattern XML_SIGNING_ELEMENTS = Pattern.compile(
-        "(<(StringToSign|SignatureProvided|CanonicalRequest)>).*?(</\\2>)",
+        "(<(StringToSign|SignatureProvided|CanonicalRequest)>)(?:.*?(</\\2>)|[^<]*)",
         Pattern.DOTALL
     );
 
