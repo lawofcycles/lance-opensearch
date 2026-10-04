@@ -115,6 +115,7 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 | `LanceExplainResponse` | 1 | Retired layout: index, route (`fragment` or `shard_path`), shard path reasons, logical and physical text, optional fragment plan, optional unplanned message, refinements, traits. Read by the current version and never written |
 | | 2 | Base: index, route (`fragment` or `unsupported`), optional logical and physical text, optional fragment plan, optional unplanned message, refinements, optional traits |
 | | 3 | Block, optional: whether the result cache would serve the body and the reason when not (optional `cacheable`, `reason`; fallback absent) |
+| | 4 | Block, optional: how the pushed full text clause runs, the `fts_index` word (`inverted`, `none` or `mixed`; optional string, fallback absent, which is also what a plan without a full text clause writes) |
 | `LanceFragmentQueryRequest` | 1 | Base: table URI, index name, storage options, pinned version, the fragment plan, optional query and post filter, sorts, search after, size, aggregations, fragment ids, track scores, track total hits up to, min score, terminate after, hit projection, rescores, collapse |
 | | 2 | Block, optional: whether the executor defers its hits to the fetch round (one boolean; fallback false, the executor renders its hits and the coordinator merges them next to deferred ones) |
 | `LanceFragmentQueryResponse` | 1 | Base: matched, matched is lower bound, fragment count, hits, row addresses, aggregations, terminated early |
@@ -122,6 +123,7 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 | | 3 | Block, optional: the columns the executor's take scans projected, summed over the scans (one counter, fallback zero) |
 | | 4 | Block, optional: the Lance full text scans the request ran on the executor (one counter, fallback zero) |
 | | 5 | Block, optional: the deferred hits (row addresses, scores, raw sort values per hit, the sort's doc value formats; fallback none, which is also what an executor writes for a request that did not ask for them) |
+| | 6 | Block, optional: the admission kind the executor's full text gate judged the request under (`fts` or `fts_flat`; optional string, fallback absent, which is also what an executor writes for a request without a full text clause) |
 | `LanceFragmentFetchRequest` | 1 | Base: table URI, index name, storage options, the version the query round read, row addresses, hit projection |
 | `LanceFragmentFetchResponse` | 1 | Base: the rendered hits in request order, the fetch round profile (fetch milliseconds, take scans, rows addressed, take milliseconds, columns projected) |
 | `LanceNodeStats` | 1 | Base: every figure of the node stats but the pruned fragment counter and the admission source, then the freshness stats |
@@ -155,7 +157,8 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 `LanceExplainResponse` version 1 predates the block layout and changed the base fields, which the
 rules above no longer allow; it is decoded by a branch on the marker that maps a shard path answer
 to an unsupported answer with the message `LanceExplainResponse.SHARD_PATH_RETIRED`, and a
-fragment answer field by field. Its blocks start at version 3, the cacheability block.
+fragment answer field by field. Its blocks start at version 3, the cacheability block, followed by
+version 4, the `fts_index` word.
 
 ## Compatibility matrix
 
