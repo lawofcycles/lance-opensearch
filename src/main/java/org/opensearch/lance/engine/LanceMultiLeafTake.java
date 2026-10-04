@@ -11,6 +11,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 import org.apache.arrow.vector.FieldVector;
@@ -22,6 +23,7 @@ import org.apache.logging.log4j.Logger;
 import org.lance.Dataset;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.lance.engine.LanceFragmentSchema.TakeProjection;
 import org.opensearch.lance.query.LanceHitsAccounting;
 import org.opensearch.lance.query.ScanAdmission;
@@ -70,8 +72,16 @@ public final class LanceMultiLeafTake {
      * renders no column ({@code _source: false} on a table without a
      * key) calls into Lance for nothing and lets every leaf record its
      * rows as empty the way its own take does.
+     *
+     * <p>{@code cancellation} is the task the fetch round runs under and
+     * is checked after every batch the take returns, so a cancelled
+     * round gives the thread back at the next batch boundary instead of
+     * at the end of the chunk; the check throws
+     * {@link TaskCancelledException}, which closes the scanner through
+     * the try-with-resources. Null is not accepted.
      */
-    public static void prefetchRows(Map<LanceFragmentLeafReader, int[]> docIdsByLeaf) throws IOException {
+    public static void prefetchRows(Map<LanceFragmentLeafReader, int[]> docIdsByLeaf, LanceCancellation cancellation) throws IOException {
+        Objects.requireNonNull(cancellation, "cancellation");
         if (docIdsByLeaf.isEmpty()) {
             return;
         }
@@ -79,7 +89,7 @@ public final class LanceMultiLeafTake {
         List<String> takeColumns = first.takeProjection().columns();
         if (takeColumns.isEmpty()) {
             for (Map.Entry<LanceFragmentLeafReader, int[]> entry : docIdsByLeaf.entrySet()) {
-                entry.getKey().prefetchRows(entry.getValue());
+                entry.getKey().prefetchRows(entry.getValue(), cancellation);
             }
             return;
         }
@@ -133,6 +143,10 @@ public final class LanceMultiLeafTake {
             long start = System.nanoTime();
             try (LanceScanner scanner = dataset.newScan(options); ArrowReader reader = scanner.scanBatches()) {
                 while (reader.loadNextBatch()) {
+                    // A cancelled round stops at the batch boundary; the
+                    // batch itself runs in native code and cannot be
+                    // interrupted.
+                    cancellation.checkCancelled();
                     VectorSchemaRoot root = reader.getVectorSchemaRoot();
                     UInt8Vector rowAddr = (UInt8Vector) root.getVector("_rowaddr");
                     FieldVector[] vectors = new FieldVector[takeColumns.size()];
@@ -154,7 +168,7 @@ public final class LanceMultiLeafTake {
                         owner.recordTakenRow(address, row);
                     }
                 }
-            } catch (IOException e) {
+            } catch (IOException | TaskCancelledException e) {
                 throw e;
             } catch (Exception e) {
                 throw new IOException(e);

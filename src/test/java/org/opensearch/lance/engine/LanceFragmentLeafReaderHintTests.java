@@ -831,7 +831,7 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
         FetchTakeStats.Accumulator takes = new FetchTakeStats.Accumulator();
         leaf.setTakeAccumulator(takes);
         int[] docIds = { 0, 5, 9 };
-        leaf.prefetchRows(docIds);
+        leaf.prefetchRows(docIds, LanceCancellation.NONE);
         LanceNodeStats.FetchStats after = FetchTakeStats.snapshot();
         assertEquals("one stored fields take", before.storedFieldsTakes() + 1, after.storedFieldsTakes());
         assertEquals(before.takeCount() + 1, after.takeCount());
@@ -844,7 +844,7 @@ public class LanceFragmentLeafReaderHintTests extends OpenSearchTestCase {
 
         // The rows are held for the request, so prefetching them again
         // issues no take.
-        leaf.prefetchRows(docIds);
+        leaf.prefetchRows(docIds, LanceCancellation.NONE);
         assertEquals(after.takeCount(), FetchTakeStats.snapshot().takeCount());
         assertEquals(1L, takes.takeCount());
     }
