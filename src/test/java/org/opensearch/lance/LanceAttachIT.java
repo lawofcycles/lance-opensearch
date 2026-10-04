@@ -8,6 +8,7 @@ package org.opensearch.lance;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Locale;
 
 import org.opensearch.client.Request;
@@ -332,6 +333,34 @@ public class LanceAttachIT extends LanceRestTestCase {
             );
             assertTrue("the response names the S3 error: " + body, body.contains("InvalidAccessKeyId"));
             assertFalse("the response must not carry the key id: " + body, body.contains(keyId));
+        }
+    }
+
+    public void testAttachOfABucketTheStoreDoesNotHaveAnswers400NamingTheTable() throws Exception {
+        // The allowlist compares bucket names case insensitively, so a
+        // URI whose bucket differs in case from the allowed root passes
+        // it, and the open goes to the store with the URI as written. S3
+        // compares bucket names exactly and answers the listing with 404
+        // NoSuchBucket, which Lance raises as an IO error; the attach
+        // reports it as a bad request that names the table and the S3
+        // code. An HTTP listener in the test JVM stands in for the
+        // endpoint; the cluster runs on the same host.
+        String bucket = "Redaction-Bucket";
+        try (NoSuchBucketS3Fixture s3 = new NoSuchBucketS3Fixture(bucket)) {
+            String table = "s3://" + bucket + "/attach-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT) + ".lance";
+            ResponseException failure = expectThrows(
+                ResponseException.class,
+                () -> postJson(
+                    "/_plugins/_lance/attach",
+                    "{\"table\":\"" + table + "\",\"storage_options\":" + s3.storageOptionsJson() + "}"
+                )
+            );
+            int status = failure.getResponse().getStatusLine().getStatusCode();
+            String body = readAll(failure.getResponse());
+            assertEquals("expected 400 for a bucket the store does not have, saw " + status + ": " + body, 400, status);
+            assertFalse("the allowlist lets the differently cased bucket through: " + body, body.contains("allowed_table_roots"));
+            assertTrue("the response names the table: " + body, body.contains("could not open [" + table + "]"));
+            assertTrue("the response names the S3 error: " + body, body.contains("NoSuchBucket"));
         }
     }
 
@@ -839,6 +868,17 @@ public class LanceAttachIT extends LanceRestTestCase {
                 () -> client().performRequest(new Request("GET", "/" + wrapped + "/_doc/99"))
             );
             assertEquals(404, absent.getResponse().getStatusLine().getStatusCode());
+
+            // The FLS side: the wrapper drops meta.region from the leaves'
+            // field infos and answers no doc values for it, so a terms
+            // aggregation over it, which the Lucene aggregators run under
+            // a wrapper, has no bucket, while the plain index answers
+            // east, west and south.
+            String termsAgg = "{\"size\":0,\"aggs\":{\"regions\":{\"terms\":{\"field\":\"meta.region\"}}}}";
+            String wrappedAgg = readAll(postJson("/" + wrapped + "/_search?request_cache=false", termsAgg));
+            assertEquals("the hidden column has no bucket through the wrapper: " + wrappedAgg, List.of(), bucketsOf(wrappedAgg, "regions"));
+            String plainAgg = readAll(postJson("/" + plain + "/_search?request_cache=false", termsAgg));
+            assertEquals(List.of("east=3", "west=2", "south=1"), bucketsOf(plainAgg, "regions"));
         } finally {
             setHidingWrapperIndexPrefix(null);
             for (String index : new String[] { wrapped, plain }) {

@@ -140,6 +140,7 @@ Every message that crosses nodes, its current `WIRE_VERSION`, and what each vers
 | | 10 | Block, optional: the failure counters (table statistics collections failed; zone map reads failed; fallback zero) |
 | | 11 | Block, optional: the names of the indexes whose row counts are withheld because a reader wrapper is installed; the base layout carries such an index with zero counts (fallback empty, no index withheld) |
 | | 12 | Block, optional, empty. Removed the node-local clone list from the base layout and the clone resolution failures from block 10, before 0.1.0; a version 11 reader is not a compatibility target |
+| | 13 | Block, optional: the scans the admission gate refused while it was off, kind to counter (fallback every kind zero) |
 | `LanceStatsNodeRequest` | 1 | Base: nothing after the marker |
 | `LanceRequestCacheClearNodeRequest` | 1 | Base: the index uuids whose result cache entries the node drops |
 | `LanceRequestCacheClearNodeResponse` | 1 | Base: how many entries the node dropped |

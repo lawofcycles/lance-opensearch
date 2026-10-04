@@ -78,9 +78,28 @@ public final class HidingReaderWrapper implements CheckedFunction<DirectoryReade
         /**
          * The rule of a setting value, or {@code null} for the empty value
          * (no wrapper). Anything but four non empty colon separated parts
-         * with an integer last part is refused.
+         * with a long last part is refused.
          */
         public static Rule parse(String value) {
+            String[] parts = parts(value);
+            return parts == null ? null : new Rule(parts[0], parts[1], parts[2], Long.parseLong(parts[3]));
+        }
+
+        /**
+         * Refuses a setting value {@link #parse} would refuse, without
+         * building the rule: the setting's validator, so a value is
+         * checked once when it is applied and parsed once when an index
+         * module reads it.
+         */
+        public static void validate(String value) {
+            parts(value);
+        }
+
+        /**
+         * The four parts of {@code value}, the last one checked to be a
+         * long; {@code null} for the empty value.
+         */
+        private static String[] parts(String value) {
             if (value == null || value.isEmpty()) {
                 return null;
             }
@@ -99,16 +118,15 @@ public final class HidingReaderWrapper implements CheckedFunction<DirectoryReade
                     );
                 }
             }
-            long minimum;
             try {
-                minimum = Long.parseLong(parts[3]);
+                Long.parseLong(parts[3]);
             } catch (NumberFormatException e) {
                 throw new IllegalArgumentException(
-                    "[plugins.lance.test.hiding_wrapper_index_prefix] minimum must be an integer in [" + value + "]",
+                    "[plugins.lance.test.hiding_wrapper_index_prefix] minimum must be a long in [" + value + "]",
                     e
                 );
             }
-            return new Rule(parts[0], parts[1], parts[2], minimum);
+            return parts;
         }
 
         /** Whether the wrapper is installed on the index named {@code indexName}. */

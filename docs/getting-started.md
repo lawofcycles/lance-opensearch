@@ -707,7 +707,7 @@ curl -X POST http://localhost:9200/_plugins/_lance/attach \
   -d '{"table":"/nvme/tables/t.lance"}'
 ```
 
-Every data node needs the whole table, not only the fragments it happens to execute: the fragment share of a node changes with cluster membership, and index files are read on every node. The project's 1B row table (750 GB) syncs to one r7gd.16xlarge in about 24 minutes (1,413 s and 1,434 s in two runs).
+Every data node needs the whole table, not only the fragments it happens to execute: the fragment share of a node changes with cluster membership, and index files are read on every node. `POST /_plugins/_lance/attach` opens the table on the elected cluster manager to derive the mapping, so a table attached by local path has to be at the same path on the manager as well, which matters when the manager is a dedicated node that holds no data. The project's 1B row table (750 GB) syncs to one r7gd.16xlarge in about 24 minutes (1,413 s and 1,434 s in two runs).
 
 Rerun `aws s3 sync` after the writer commits; it fetches only the files the new version added, because Lance never rewrites a data file, an index file, a deletion file or a manifest under `_versions/`. The freshness check picks the new version up on its next cadence from the local path exactly as it would from S3; files a Lance cleanup removed from the bucket stay on disk unless the sync runs with `--delete`.
 

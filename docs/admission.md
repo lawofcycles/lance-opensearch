@@ -157,4 +157,5 @@ Who is credited:
 
 - The 429 message names the credited figure next to the available memory and the headroom.
 - `GET /_plugins/_lance/stats` reports the pool as `admission.retained_bytes` and its identity as `admission.retained_scope` (`kind:table:columns`), the last decision under `admission.last_estimate_bytes`, `admission.last_kind` and `admission.last_source`, and the refusals per kind under `admission.rejections`. The full shape of the `admission` object is under [Cache statistics](features.md#cache-statistics).
+- With `plugins.lance.admission.enabled: false` the gate judges no memory and the 400 that refuses a full text scan over a column without an inverted index is its only refusal; those are counted per kind under `admission.refused_while_disabled` (today `fts_flat` alone moves), apart from the 429s of `admission.rejections`.
 - The metadata warm up's full text probe is judged by the same gate and skipped, not refused, when it does not fit; see [Index warm-up](features.md#index-warm-up).

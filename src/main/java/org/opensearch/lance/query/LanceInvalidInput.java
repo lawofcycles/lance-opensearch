@@ -50,8 +50,14 @@ import org.opensearch.lance.StorageOptions;
  * ({@link #S3_CREDENTIAL_ERROR_CODES}, {@link #GCS_CREDENTIAL_ERROR_REASONS},
  * {@link #AZURE_CREDENTIAL_ERROR_CODES}) and reports an
  * {@link IllegalArgumentException} whose message quotes the redacted
- * body. {@link #openFailure} is what the attach action and the
- * namespace service call on the failure they are about to report.
+ * body. A third covers a bucket or container the URI names that the
+ * store does not have ({@link #S3_MISSING_BUCKET_ERROR_CODES},
+ * {@link #AZURE_MISSING_CONTAINER_ERROR_CODES}): Lance lists the
+ * table's directory to find the latest manifest and the listing fails
+ * with the store's body as {@code Error::IO}, so {@link #missingBucket}
+ * reports it as a 400 that names the table. {@link #openFailure} is
+ * what the attach action and the namespace service call on the failure
+ * they are about to report.
  */
 public final class LanceInvalidInput {
 
@@ -116,6 +122,31 @@ public final class LanceInvalidInput {
     public static final String CREDENTIALS_REJECTED_PREFIX = "object store rejected the credentials of [";
 
     /**
+     * The {@code <Code>} value of an S3 error body that says the bucket
+     * the URI names does not exist. S3 compares bucket names exactly,
+     * so a URI whose bucket differs in case from the real one gets this
+     * code; the allowlist of {@code plugins.lance.allowed_table_roots}
+     * compares bucket names case insensitively and the open uses the
+     * URI as written. MinIO and the other S3 compatible stores answer
+     * the same code. {@code LanceInvalidInputTests} pins the list.
+     */
+    public static final String[] S3_MISSING_BUCKET_ERROR_CODES = { "NoSuchBucket" };
+
+    /**
+     * The {@code <Code>} value of an Azure Blob Storage error body that
+     * says the container the URI names does not exist.
+     * {@code LanceInvalidInputTests} pins the list.
+     */
+    public static final String[] AZURE_MISSING_CONTAINER_ERROR_CODES = { "ContainerNotFound" };
+
+    /**
+     * What a message reporting a bucket or container the store does not
+     * have opens with; the table or namespace follows in brackets, then
+     * the redacted store error.
+     */
+    public static final String COULD_NOT_OPEN_PREFIX = "could not open [";
+
+    /**
      * Matches the error code of a refused credential where the object
      * store puts it in its error body, which Lance quotes in its
      * message: the {@code <Code>} element of an S3 or Azure XML body,
@@ -128,6 +159,19 @@ public final class LanceInvalidInput {
             + ")</Code>|\"reason\"\\s*:\\s*\"("
             + alternatives(GCS_CREDENTIAL_ERROR_REASONS)
             + ")\""
+    );
+
+    /**
+     * Matches the error code of a bucket or container the store does
+     * not have, in the {@code <Code>} element of an S3 or Azure XML
+     * body. Lance lists the table's {@code _versions/} directory to
+     * find the latest manifest, and a listing against a bucket that
+     * does not exist fails with this body as an IO error, not as the
+     * not found Lance raises for a missing table in a bucket that
+     * exists.
+     */
+    private static final Pattern MISSING_BUCKET_ERROR_CODE = Pattern.compile(
+        "<Code>(" + alternatives(S3_MISSING_BUCKET_ERROR_CODES, AZURE_MISSING_CONTAINER_ERROR_CODES) + ")</Code>"
     );
 
     /** Bound on the cause chain walk, in case a chain is cyclic. */
@@ -220,7 +264,7 @@ public final class LanceInvalidInput {
      * out.
      */
     public static String credentialErrorCode(Throwable t) {
-        String message = credentialErrorMessage(t);
+        String message = firstMessageMatching(t, CREDENTIAL_ERROR_CODE);
         if (message == null) {
             return null;
         }
@@ -230,14 +274,32 @@ public final class LanceInvalidInput {
     }
 
     /**
-     * The first message in the cause chain of {@code t} that quotes a
-     * refused credential's error code, or {@code null}.
+     * The error code of a bucket or container the store does not have,
+     * quoted in the message of {@code t} or of an exception in its
+     * cause chain (one of {@link #S3_MISSING_BUCKET_ERROR_CODES} or
+     * {@link #AZURE_MISSING_CONTAINER_ERROR_CODES}), or {@code null}
+     * when no message quotes one. {@code null} in gives {@code null}
+     * out.
      */
-    private static String credentialErrorMessage(Throwable t) {
+    public static String missingBucketErrorCode(Throwable t) {
+        String message = firstMessageMatching(t, MISSING_BUCKET_ERROR_CODE);
+        if (message == null) {
+            return null;
+        }
+        Matcher matcher = MISSING_BUCKET_ERROR_CODE.matcher(message);
+        matcher.find();
+        return matcher.group(1);
+    }
+
+    /**
+     * The first message in the cause chain of {@code t} that
+     * {@code pattern} finds a match in, or {@code null}.
+     */
+    private static String firstMessageMatching(Throwable t, Pattern pattern) {
         Throwable current = t;
         for (int depth = 0; current != null && depth < MAX_DEPTH; depth++) {
             String message = current.getMessage();
-            if (message != null && CREDENTIAL_ERROR_CODE.matcher(message).find()) {
+            if (message != null && pattern.matcher(message).find()) {
                 return message;
             }
             Throwable cause = current.getCause();
@@ -262,7 +324,7 @@ public final class LanceInvalidInput {
      */
     public static IllegalArgumentException credentialRejection(Exception failure, String subject) {
         Objects.requireNonNull(failure, "failure must not be null");
-        String store = credentialErrorMessage(failure);
+        String store = firstMessageMatching(failure, CREDENTIAL_ERROR_CODE);
         if (store == null) {
             return null;
         }
@@ -273,18 +335,52 @@ public final class LanceInvalidInput {
     }
 
     /**
+     * The exception to report when {@code failure} says the bucket or
+     * container the URI of {@code subject} (a table or a namespace)
+     * names does not exist: an {@link IllegalArgumentException}, so the
+     * status is 400, whose message opens with
+     * {@link #COULD_NOT_OPEN_PREFIX}, names the subject, says the bucket
+     * is not there and quotes the store's error after
+     * {@link StorageOptions#redactCredentials(String)}, and whose cause
+     * is the redacted copy of {@code failure} with its frames.
+     * {@code null} when {@link #missingBucketErrorCode} finds no code
+     * in the chain. {@code failure} must not be null.
+     */
+    public static IllegalArgumentException missingBucket(Exception failure, String subject) {
+        Objects.requireNonNull(failure, "failure must not be null");
+        String store = firstMessageMatching(failure, MISSING_BUCKET_ERROR_CODE);
+        if (store == null) {
+            return null;
+        }
+        return new IllegalArgumentException(
+            COULD_NOT_OPEN_PREFIX
+                + subject
+                + "]: the object store has no bucket or container of that name (bucket names are compared exactly, "
+                + "so check the case): "
+                + StorageOptions.redactCredentials(store),
+            StorageOptions.redactCredentials(failure)
+        );
+    }
+
+    /**
      * The exception to report for a failure to open or list
      * {@code subject} (a table or a namespace) at the point where the
-     * caller handed its credentials in: {@link #credentialRejection}
-     * when the store refused the credentials, otherwise the redacted
-     * copy {@link StorageOptions#redactCredentials(Exception)} gives,
-     * which keeps the status of {@code failure}. A search that fails
-     * because a credential expired after the attach is not routed
-     * through here; the request path keeps its status. {@code failure}
-     * must not be null.
+     * caller handed its URI and credentials in: {@link #credentialRejection}
+     * when the store refused the credentials, {@link #missingBucket}
+     * when the store has no bucket or container of the name the URI
+     * carries, otherwise the redacted copy
+     * {@link StorageOptions#redactCredentials(Exception)} gives, which
+     * keeps the status of {@code failure}. A search that fails because
+     * a credential expired after the attach is not routed through
+     * here; the request path keeps its status. {@code failure} must not
+     * be null.
      */
     public static Exception openFailure(Exception failure, String subject) {
         IllegalArgumentException rejected = credentialRejection(failure, subject);
-        return rejected != null ? rejected : StorageOptions.redactCredentials(failure);
+        if (rejected != null) {
+            return rejected;
+        }
+        IllegalArgumentException missing = missingBucket(failure, subject);
+        return missing != null ? missing : StorageOptions.redactCredentials(failure);
     }
 }

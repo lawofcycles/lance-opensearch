@@ -141,7 +141,8 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             new LanceNodeStats.FetchStats(11L, 1_234L, 33L, 456L, 78L, 8L, 3L)
         ).withRequestCache(new LanceNodeStats.RequestCacheStats(true, 2048L, 1_048_576L, 3, 11L, 4L, 1L, 2L, 6L))
             .withFetchCache(new LanceNodeStats.FetchCacheStats(true, 8192L, 2_097_152L, 40, 120L, 30L, 5L, 9L, 7L, 25L))
-            .withFailures(new LanceNodeStats.FailureCounters(2L, 1L));
+            .withFailures(new LanceNodeStats.FailureCounters(2L, 1L))
+            .withAdmissionRefusedWhileDisabled(refusedWhileDisabled(3L));
     }
 
     /** The admission rejections in the gate's key order, one per kind. */
@@ -153,6 +154,15 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
         counts.put("filter_scan", filterScan);
         counts.put("aggregate_scan", 0L);
         counts.put("column_load", 0L);
+        return counts;
+    }
+
+    /** The scans refused while the gate was off, in the gate's key order: the flat full text kind alone is ever refused off. */
+    private static Map<String, Long> refusedWhileDisabled(long ftsFlat) {
+        Map<String, Long> counts = new LinkedHashMap<>();
+        for (ScanAdmission.Kind kind : ScanAdmission.Kind.values()) {
+            counts.put(kind.key(), kind == ScanAdmission.Kind.FTS_FLAT ? ftsFlat : 0L);
+        }
         return counts;
     }
 
@@ -214,7 +224,9 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                     + "\"retained_bytes\":268435456,\"retained_scope\":\"fts:s3://bucket/perf.lance:body\","
                     + "\"last_estimate_bytes\":832,\"last_kind\":\"fts\",\"last_source\":\"warm_up\","
                     + "\"rejections\":{\"fts\":7,\"scalar_index\":0,\"vector_index\":0,\"filter_scan\":1,\"aggregate_scan\":0,"
-                    + "\"column_load\":0}},"
+                    + "\"column_load\":0},"
+                    + "\"refused_while_disabled\":{\"fts\":0,\"fts_flat\":3,\"scalar_index\":0,\"vector_index\":0,\"filter_scan\":0,"
+                    + "\"aggregate_scan\":0,\"column_load\":0,\"fetch_take\":0}},"
                     + "\"warm_up\":{\"mode\":\"metadata\",\"tables\":[{\"index\":\"perf\",\"table\":\"s3://bucket/perf.lance\","
                     + "\"version\":8,\"mode\":\"metadata\",\"state\":\"done\",\"started_at\":\"2023-11-14T22:13:20Z\",\"seconds\":3.46,"
                     + "\"indexes\":[{\"name\":\"rating_idx\",\"type\":\"BTree\",\"column\":\"rating\",\"state\":\"done\",\"seconds\":0.4},"
@@ -280,7 +292,9 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 json,
                 json.contains(
                     "\"rejections\":{\"fts\":7,\"scalar_index\":0,\"vector_index\":0,\"filter_scan\":1,\"aggregate_scan\":0,"
-                        + "\"column_load\":0}},\"warm_up\":{\"mode\":\"metadata\""
+                        + "\"column_load\":0},\"refused_while_disabled\":{\"fts\":0,\"fts_flat\":3,\"scalar_index\":0,"
+                        + "\"vector_index\":0,\"filter_scan\":0,\"aggregate_scan\":0,\"column_load\":0,\"fetch_take\":0}},"
+                        + "\"warm_up\":{\"mode\":\"metadata\""
                 )
             );
             assertTrue(json, json.endsWith("\"wrapped\":{\"lucene_bound_exceeded\":false}}}}}"));
@@ -307,7 +321,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 assertEquals(LanceNodeStats.WIRE_VERSION, in.readVInt());
             }
         }
-        // The stream a version 13 data node would return: today's fields
+        // The stream a version 14 data node would return: today's fields
         // and one optional block this coordinator steps over.
         BytesReference newer = WireVersionTestSupport.asNextVersion(
             sample(),
@@ -533,6 +547,26 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
         }
     }
 
+    public void testMixedPluginVersionAVersion12CoordinatorReadsTodaysStatsWithoutTheRefusedWhileDisabledCounters() throws Exception {
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            sample().writeTo(out);
+            try (StreamInput in = out.bytes().streamInput()) {
+                LanceNodeStats asVersion12 = LanceNodeStats.read(in, 12);
+                assertEquals(9L, asVersion12.planPrunedFragments());
+                assertEquals(sample().freshness(), asVersion12.freshness());
+                assertEquals(sample().failures(), asVersion12.failures());
+                assertEquals("the blocks version 12 knows are read", sample().indices(), asVersion12.indices());
+                assertEquals(sample().admissionRejections(), asVersion12.admissionRejections());
+                assertEquals(
+                    "the block it does not know is stepped over and every kind reads as zero",
+                    refusedWhileDisabled(0L),
+                    asVersion12.admissionRefusedWhileDisabled()
+                );
+                assertEquals("the reader consumed the blocks", -1, in.read());
+            }
+        }
+    }
+
     /** {@code indices} as a coordinator before version 11 reads them: the withheld entries with their zero counts and no flag. */
     private static List<LanceNodeStats.IndexReaderStats> unflagged(List<LanceNodeStats.IndexReaderStats> indices) {
         return indices.stream()
@@ -566,8 +600,14 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             // pool's scope, 7 the result cache, 8 the fetch take counters,
             // 9 the fetch cache, 10 the failure counters, 11 the indexes
             // whose counts are withheld, 12 the empty block of the version
-            // that removed the node-local clone figures, in that order.
+            // that removed the node-local clone figures, 13 the scans
+            // refused while the gate was off, in that order.
             int trailing = 0;
+            if (marker < 13) {
+                trailing += blockSize(
+                    o -> o.writeMap(stats.admissionRefusedWhileDisabled(), StreamOutput::writeString, StreamOutput::writeVLong)
+                );
+            }
             if (marker < 12) {
                 trailing += blockSize(o -> {});
             }
@@ -801,6 +841,23 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
         }
     }
 
+    public void testMixedPluginVersionTodaysCoordinatorReadsAVersion12NodesStats() throws Exception {
+        // The stream a version 12 data node writes: every block up to the
+        // empty version 12 block, no refused while disabled block. Such a
+        // node counts no refusal off, so every kind reads as zero.
+        BytesReference version12 = asWrittenByVersion(sample(), 12);
+        try (StreamInput in = version12.streamInput()) {
+            LanceNodeStats restored = new LanceNodeStats(in);
+            assertEquals(9L, restored.planPrunedFragments());
+            assertEquals(sample().freshness(), restored.freshness());
+            assertEquals(sample().failures(), restored.failures());
+            assertEquals(sample().indices(), restored.indices());
+            assertEquals(sample().admissionRejections(), restored.admissionRejections());
+            assertEquals("the counters fall back to zero", refusedWhileDisabled(0L), restored.admissionRefusedWhileDisabled());
+            assertEquals(-1, in.read());
+        }
+    }
+
     public void testWithheldIndexReaderStatsRejectsCounts() {
         // A withheld entry that carries what the wrapper hides is a
         // programming error, not something to zero out silently.
@@ -882,6 +939,11 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
             "every kind is reported, zero when it never refused",
             List.of("fts", "fts_flat", "scalar_index", "vector_index", "filter_scan", "aggregate_scan", "column_load", "fetch_take"),
             List.copyOf(stats.admissionRejections().keySet())
+        );
+        assertEquals(
+            "every kind is reported under refused_while_disabled too, zero when it never refused off",
+            refusedWhileDisabled(0L),
+            stats.admissionRefusedWhileDisabled()
         );
         assertEquals("none", stats.warmUpMode());
         assertTrue(stats.warmUps().isEmpty());
