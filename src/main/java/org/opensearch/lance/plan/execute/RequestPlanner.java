@@ -218,12 +218,7 @@ public final class RequestPlanner {
             );
         }
         if (query != null && QueryToRex.referencesAny(query, sqlExcludedColumns)) {
-            return luceneFallback(
-                shape,
-                model,
-                factory,
-                "query on a column without a Lance SQL form (ip, geo_point or a derived tokens column)"
-            );
+            return luceneFallback(shape, model, factory, "query on a column without a Lance SQL form (ip or geo_point)");
         }
         ExecutionTranslation translation;
         try {
