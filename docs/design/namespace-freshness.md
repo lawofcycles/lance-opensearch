@@ -17,9 +17,14 @@ the plugin keeps a mapping that reflects it.
 The request path does not depend on the mapping being fresh. The fragment coordinator opens the
 table's latest manifest per request, reads the schema and the version from it, and ships the
 version to every executor as `pinnedVersion`, so a `_search` sees a new row on its next call. The
-mapping lags the table by at most one freshness check, and that lag is visible only where the
-ecosystem reads the mapping: a new column is searchable before it is in `_field_caps`, and
-`GET /_doc/{id}` follows the shard's reader, which advances on refresh.
+shard's engine refreshes its reader before every read, so `GET /_doc/{id}`, `_stats` and a mixed
+target `_search` see the new row on their next call as well. The mapping follows the first request
+that observes a new version: the coordinator sends the version it read to the shard's node through
+the sync action, once per version, and the check runs at once unless the mapping was derived at
+that version already. The lag that is left is the duration of that one check, and it is visible
+only where the ecosystem reads the mapping: a filter on a new column answers from the Arrow schema
+the request read, while a sort or an aggregation on it, `_field_caps` and `GET /{index}/_mapping`
+see the column once the check has applied the mapping.
 
 ## What moved off the cluster manager, and why
 
@@ -83,13 +88,13 @@ opened it.
 
 ## Direction
 
-The next step follows from the mapping being a derived cache: the request path already has the
-Arrow schema of the version it reads, so the coordinator can compare that schema with the schema
-the mapping records (every derived field carries its Lance field id and Arrow type fingerprint in
-its `meta`) and submit the mapping update through the indexing style path when they differ. The
-freshness check then stops being a scheduled probe of the object store and becomes a side effect
-of a request that noticed the schema changed; the scheduled check remains for the reader advance
-of indexes nobody queries.
+The freshness check is already a side effect of a request that read a new version: the coordinator
+of every fan out hands the version it observed to the shard's node, and the scheduled check is
+left for the reader advance and the mapping of indexes nobody queries. The step that follows from
+the mapping being a derived cache is to compare the Arrow schema the request already has with the
+schema the mapping records (every derived field carries its Lance field id and Arrow type
+fingerprint in its `meta`) on the coordinator, and ask for the check only when they differ, so a
+version that changed no column costs the shard's node nothing.
 
 Catalog listing is the other background job left on the manager. It becomes on demand (the
 `_poll` trigger is the first form of that) or moves to a data node elected for it, so the manager
