@@ -14,13 +14,13 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
-import org.opensearch.index.IndexModule;
 import org.opensearch.lance.LanceMappingMeta;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceTableFactory;
@@ -28,7 +28,6 @@ import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.attach.LanceAttachAction;
 import org.opensearch.lance.attach.LanceAttachRequest;
 import org.opensearch.lance.attach.LanceAttachResponse;
-import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.namespace.LanceIndexSyncAction;
 import org.opensearch.lance.namespace.LanceIndexSyncRequest;
 import org.opensearch.plugins.Plugin;
@@ -37,12 +36,15 @@ import org.opensearch.test.OpenSearchSingleNodeTestCase;
 /**
  * {@code GET /_plugins/_lance/stats} must not report a figure a reader wrapper (the
  * security plugin's DLS / FLS wrapper) does not filter, nor name columns
- * it may hide. {@link WrapperOnPrefixPlugin} installs a wrapper on the
- * Lance-backed indexes whose name starts with {@code wrapped}, so one node
- * hosts a wrapped and a plain index side by side and the report of each
- * can be compared: the plain index lists its row counts, its Lance index
- * types and the rename its mapping records, the wrapped index lists none
- * of them.
+ * it may hide. The node runs with
+ * {@code plugins.lance.test.hiding_wrapper_index_prefix} set, so the
+ * plugin installs its {@code HidingReaderWrapper} on the Lance-backed
+ * indexes whose name starts with {@code wrapped}, and one node hosts a
+ * wrapped and a plain index side by side so the report of each can be
+ * compared: the plain index lists its row counts, its Lance index types
+ * and the rename its mapping records, the wrapped index lists none of
+ * them. What the wrapper hides plays no part; the stats action only asks
+ * whether one is installed.
  *
  * <p>Thread leak checks are off as in the other tests that load the Lance
  * native library.
@@ -55,7 +57,15 @@ public class TransportLanceStatsActionTests extends OpenSearchSingleNodeTestCase
 
     @Override
     protected Collection<Class<? extends Plugin>> getPlugins() {
-        return List.of(LancePlugin.class, WrapperOnPrefixPlugin.class);
+        return List.of(LancePlugin.class);
+    }
+
+    @Override
+    protected Settings nodeSettings() {
+        return Settings.builder()
+            .put(super.nodeSettings())
+            .put(LancePlugin.TEST_HIDING_WRAPPER_INDEX_PREFIX_SETTING.getKey(), "wrapped:body:id:4")
+            .build();
     }
 
     /**
@@ -148,22 +158,6 @@ public class TransportLanceStatsActionTests extends OpenSearchSingleNodeTestCase
             assertEquals(0, plainEntry.get("nested_docs"));
             assertTrue(plainEntry.toString(), plainEntry.containsKey("index_types"));
             assertTrue(plainEntry.toString(), plainEntry.containsKey("renamed_fields"));
-        }
-    }
-
-    /**
-     * Installs a reader wrapper on every Lance-backed index whose name
-     * starts with {@code wrapped}. The wrapper itself changes nothing;
-     * the stats action only asks whether one is installed.
-     */
-    public static class WrapperOnPrefixPlugin extends Plugin {
-
-        @Override
-        public void onIndexModule(IndexModule indexModule) {
-            if (indexModule.getSettings().get(LanceEngineFactory.TABLE_SETTING) != null
-                && indexModule.getIndex().getName().startsWith("wrapped")) {
-                indexModule.setReaderWrapper(indexService -> reader -> reader);
-            }
         }
     }
 }
