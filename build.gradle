@@ -386,6 +386,11 @@ testClusters.integTest {
     // slot (its merge), so nothing else is refused.
     setting 'thread_pool.lance_coordinator.size', '1'
     setting 'thread_pool.lance_coordinator.queue_size', '1'
+    // Every IT writes its tables under the shared tables directory, so the
+    // allowlist can name it and the attach IT can see the refusal of a
+    // path that climbs out of it. The s3 bucket is the one the
+    // InvalidAccessKeyId fixture answers for.
+    setting 'plugins.lance.allowed_table_roots', "${sharedTablesDir.absolutePath},s3://redaction-bucket"
     environment 'AWS_SHARED_CREDENTIALS_FILE', integTestAwsCredentialsFile.absolutePath
     environment 'AWS_CONFIG_FILE', integTestAwsConfigFile.absolutePath
     if (lanceLanguageModelHome != null) {
