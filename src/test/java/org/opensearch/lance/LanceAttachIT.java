@@ -38,6 +38,25 @@ public class LanceAttachIT extends LanceRestTestCase {
         assertEquals("expected 400 for missing table, saw: " + status, 400, status);
     }
 
+    public void testAttachRefusesADotDotPathThatLeavesTheAllowedRoot() throws IOException {
+        // The test cluster allows the shared tables directory only. A path
+        // that starts with it but climbs out through `..` is refused by the
+        // allowlist with 403 before Lance is asked to open anything, so the
+        // message names the setting rather than a failed open.
+        String table = sharedRoot().resolve("..")
+            .resolve("outside-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT) + ".lance")
+            .toString();
+        ResponseException failure = expectThrows(
+            ResponseException.class,
+            () -> postJson("/_plugins/_lance/attach", "{\"table\":\"" + table + "\"}")
+        );
+        int status = failure.getResponse().getStatusLine().getStatusCode();
+        String body = readAll(failure.getResponse());
+        assertEquals("expected 403 for a path outside the allowlist, saw " + status + ": " + body, 403, status);
+        assertTrue("expected the setting named, saw: " + body, body.contains("plugins.lance.allowed_table_roots"));
+        assertFalse("the allowlist must answer before Lance opens the table: " + body, body.contains("could not open"));
+    }
+
     public void testAttachRejectsMissingTableField() throws IOException {
         ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_plugins/_lance/attach", "{}"));
         int status = failure.getResponse().getStatusLine().getStatusCode();

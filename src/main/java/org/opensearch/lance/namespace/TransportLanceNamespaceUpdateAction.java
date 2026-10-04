@@ -140,8 +140,9 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
      *
      * <p>The allowlist runs before the duplicate lookup so a root that is
      * already registered but has since been removed from the allowlist is
-     * refused rather than acknowledged; it is a string comparison, so the
-     * ordering costs no I/O and reveals nothing about the path. The
+     * refused rather than acknowledged; it canonicalises the path (symlinks
+     * of the existing ancestors resolved) but answers the same 403 whether
+     * or not the path exists. The
      * existence check runs last so a repeated register of a known root
      * stays a no-op even if the directory has gone away.
      *
