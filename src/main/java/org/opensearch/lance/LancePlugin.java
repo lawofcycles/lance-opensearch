@@ -7,6 +7,7 @@ package org.opensearch.lance;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.Function;
@@ -20,6 +21,7 @@ import org.opensearch.cluster.ClusterStateListener;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.lifecycle.LifecycleComponent;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Setting;
@@ -1442,17 +1444,30 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      * Lance-backed indexes get the read-only engine over the node's
      * {@link LanceWarmCache}, so the shard's reader and the fragment path
      * share one snapshot per table version. Index services are created
-     * after {@link #createComponents} has run, so the cache is present;
-     * a {@code null} here (the factory asked for before the components
-     * exist, as a test harness may do) makes the engine open its own
-     * dataset per reader instead.
+     * after {@link #createComponents} has run and after Guice bound the
+     * node's {@code IndicesService} into {@link #indicesServiceHolder}, so
+     * both are present; a {@code null} cache here (the factory asked for
+     * before the components exist, as a test harness may do) makes the
+     * engine open its own dataset per reader instead, and a {@code null}
+     * indices service makes a GET outside the shard reader refuse.
      */
     @Override
     public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
         if (LanceEngineFactory.isLanceIndex(indexSettings.getSettings())) {
-            return Optional.of(new LanceEngineFactory(warmCache, () -> maxDocsPerReader, servedVersions));
+            return Optional.of(new LanceEngineFactory(warmCache, () -> maxDocsPerReader, servedVersions, indicesServiceHolder.get()));
         }
         return Optional.empty();
+    }
+
+    /**
+     * {@link IndicesServiceHolder.Binder}, which Guice constructs with the
+     * node's {@code IndicesService} and {@link #indicesServiceHolder}
+     * (returned from {@link #createComponents}, so bound), before the node
+     * starts.
+     */
+    @Override
+    public Collection<Class<? extends LifecycleComponent>> getGuiceServiceClasses() {
+        return List.of(IndicesServiceHolder.Binder.class);
     }
 
     /**
@@ -1479,6 +1494,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     private volatile LanceIndexFreshnessService freshnessService;
     /** Served manifest version of every open Lance engine on this node, published by the engines. */
     private final LanceServedVersions servedVersions = new LanceServedVersions();
+    /** The node's {@code IndicesService}, bound by Guice through {@link IndicesServiceHolder.Binder}; the engine factories read it. */
+    private final IndicesServiceHolder indicesServiceHolder = new IndicesServiceHolder();
     private org.opensearch.threadpool.ThreadPool threadPool;
     /** The node's cluster service, kept so {@link #close} can take the listeners registered in createComponents off it. */
     private volatile ClusterService clusterService;
@@ -1753,8 +1770,18 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             .addSettingsUpdateConsumer(NAMESPACE_RESURFACE_GRACE_SETTING, namespaceService::setResurfaceGrace);
         // The components are injected into the plugin's transport
         // actions (attach, namespace list / update / poll,
-        // index sync, fragment query).
-        return List.of(namespaceService, freshnessService, allowedTableRoots, warmCache, statsCollector, requestCache, fetchCache);
+        // index sync, fragment query); the indices service holder into
+        // its Guice binder (getGuiceServiceClasses).
+        return List.of(
+            namespaceService,
+            freshnessService,
+            allowedTableRoots,
+            warmCache,
+            statsCollector,
+            requestCache,
+            fetchCache,
+            indicesServiceHolder
+        );
     }
 
     /**

@@ -49,10 +49,12 @@ import org.opensearch.index.engine.ReadOnlyEngine;
 import org.opensearch.index.engine.Segment;
 import org.opensearch.index.engine.SegmentsStats;
 import org.opensearch.index.shard.DocsStats;
+import org.opensearch.indices.IndicesService;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LancePlugin;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.plan.explain.ReaderWrapperProbe;
 
 /**
  * Engine factory producing a read-only engine backed by a Lance table.
@@ -102,6 +104,8 @@ public final class LanceEngineFactory implements EngineFactory {
     private final LongSupplier maxDocsPerReader;
     /** Where the engines publish the version they serve, or {@code null} (tests). */
     private final LanceServedVersions servedVersions;
+    /** The node's index services, read for the reader wrapper probe of a GET outside the shard reader, or {@code null} (tests). */
+    private final IndicesService indicesService;
 
     /** Factory whose engines open their own dataset per reader. */
     public LanceEngineFactory() {
@@ -127,7 +131,7 @@ public final class LanceEngineFactory implements EngineFactory {
      *                         lowered it)
      */
     public LanceEngineFactory(LanceWarmCache warmCache, LongSupplier maxDocsPerReader) {
-        this(warmCache, maxDocsPerReader, null);
+        this(warmCache, maxDocsPerReader, null, null);
     }
 
     /**
@@ -135,11 +139,23 @@ public final class LanceEngineFactory implements EngineFactory {
      *                       served manifest version to while open, so the
      *                       freshness check reads it without acquiring a
      *                       searcher; {@code null} publishes nothing
+     * @param indicesService the node's index services, which a GET of a
+     *                       row outside the shard reader asks whether a
+     *                       reader wrapper is installed on the index
+     *                       ({@link ReaderWrapperProbe#installed});
+     *                       {@code null} makes such a GET refuse, as the
+     *                       question cannot be answered
      */
-    public LanceEngineFactory(LanceWarmCache warmCache, LongSupplier maxDocsPerReader, LanceServedVersions servedVersions) {
+    public LanceEngineFactory(
+        LanceWarmCache warmCache,
+        LongSupplier maxDocsPerReader,
+        LanceServedVersions servedVersions,
+        IndicesService indicesService
+    ) {
         this.warmCache = warmCache;
         this.maxDocsPerReader = maxDocsPerReader;
         this.servedVersions = servedVersions;
+        this.indicesService = indicesService;
     }
 
     /**
@@ -340,7 +356,8 @@ public final class LanceEngineFactory implements EngineFactory {
             warmCache,
             indexUuid,
             maxDocsPerReader,
-            servedVersions
+            servedVersions,
+            indicesService
         );
     }
 
@@ -385,22 +402,8 @@ public final class LanceEngineFactory implements EngineFactory {
         private final LanceServedVersions servedVersions;
         /** The entry published to {@link #servedVersions}, removed again in {@link #closeNoLock}. */
         private final LongSupplier servedVersionEntry;
-
-        LanceReadOnlyEngine(
-            EngineConfig config,
-            String table,
-            String field,
-            LancePrimaryKeyType pkType,
-            int shardId,
-            Optional<Long> pinnedVersion,
-            String tag,
-            StorageOptions storageOptions,
-            LanceWarmCache warmCache,
-            String indexUuid,
-            LongSupplier maxDocsPerReader
-        ) {
-            this(config, table, field, pkType, shardId, pinnedVersion, tag, storageOptions, warmCache, indexUuid, maxDocsPerReader, null);
-        }
+        /** The node's index services, asked for the reader wrapper by {@link #resolveOutsideReader}, or {@code null}. */
+        private final IndicesService indicesService;
 
         LanceReadOnlyEngine(
             EngineConfig config,
@@ -414,10 +417,12 @@ public final class LanceEngineFactory implements EngineFactory {
             LanceWarmCache warmCache,
             String indexUuid,
             LongSupplier maxDocsPerReader,
-            LanceServedVersions servedVersions
+            LanceServedVersions servedVersions,
+            IndicesService indicesService
         ) {
             super(config, null, null, true, Function.identity(), true);
             this.tablePath = table;
+            this.indicesService = indicesService;
             this.field = field;
             this.pkType = pkType;
             this.shardId = shardId;
@@ -963,11 +968,14 @@ public final class LanceEngineFactory implements EngineFactory {
          * searcher open until it is released, which keeps the snapshot
          * the extra reader reads from, and closes both together.
          *
-         * <p>The shard searcher's top reader is the engine's own
-         * {@link OpenSearchDirectoryReader} unless the index's reader
-         * wrapper (the security plugin's DLS / FLS) applied itself for the
-         * caller; that filter cannot be applied to a reader opened here,
-         * so the lookup refuses instead of answering outside the wrapper.
+         * <p>A reader opened here cannot carry the index's reader wrapper
+         * (the security plugin's DLS / FLS), so the lookup refuses when
+         * {@link ReaderWrapperProbe#installed} finds one on the index's
+         * service, whatever the wrapper made of the shard searcher's
+         * reader (a wrapper that returns the reader it is given leaves
+         * the engine's own reader on top). Without an
+         * {@link IndicesService} the question has no answer and the
+         * lookup refuses as well.
          */
         private GetResult resolveOutsideReader(
             Engine.Searcher searcher,
@@ -976,7 +984,7 @@ public final class LanceEngineFactory implements EngineFactory {
             int fragmentId,
             int offset
         ) throws IOException {
-            if (!(searcher.getDirectoryReader() instanceof OpenSearchDirectoryReader)) {
+            if (indicesService == null || ReaderWrapperProbe.installed(indicesService, config().getShardId().getIndex())) {
                 throw new IllegalStateException(
                     "GET of a row outside the shard reader of ["
                         + config().getShardId().getIndexName()
