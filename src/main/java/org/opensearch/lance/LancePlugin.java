@@ -58,6 +58,7 @@ import org.opensearch.lance.engine.LanceFetchCache;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.mapper.LanceTextFieldMapper;
 import org.opensearch.lance.mapper.LanceVectorFieldMapper;
+import org.opensearch.lance.namespace.AllowedCatalogEndpoints;
 import org.opensearch.lance.namespace.AllowedTableRoots;
 import org.opensearch.lance.namespace.LanceIndexFreshnessService;
 import org.opensearch.lance.namespace.LanceIndexSyncAction;
@@ -344,6 +345,18 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     public static final Setting<List<String>> ALLOWED_TABLE_ROOTS_SETTING = Setting.listSetting(
         "plugins.lance.allowed_table_roots",
         ALLOWED_TABLE_ROOTS_SETTING_DEPRECATED,
+        Function.identity(),
+        Setting.Property.NodeScope
+    );
+    /**
+     * URI prefixes the catalog endpoint of a {@code rest}, {@code glue},
+     * {@code iceberg}, {@code polaris} or {@code unity} namespace
+     * registration may fall under; see {@link AllowedCatalogEndpoints}
+     * for the match and for what an empty list refuses.
+     */
+    public static final Setting<List<String>> ALLOWED_CATALOG_ENDPOINTS_SETTING = Setting.listSetting(
+        AllowedCatalogEndpoints.SETTING_KEY,
+        List.of(),
         Function.identity(),
         Setting.Property.NodeScope
     );
@@ -1241,6 +1254,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             NAMESPACE_POLL_CADENCE_SETTING,
             NAMESPACE_RESURFACE_GRACE_SETTING,
             ALLOWED_TABLE_ROOTS_SETTING,
+            ALLOWED_CATALOG_ENDPOINTS_SETTING,
             STORAGE_OPTIONS_SETTING,
             NATIVE_MEMORY_LIMIT_SETTING,
             NATIVE_MEMORY_CB_ENABLED_SETTING,
@@ -1500,6 +1514,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     /** The node's cluster service, kept so {@link #close} can take the listeners registered in createComponents off it. */
     private volatile ClusterService clusterService;
     private AllowedTableRoots allowedTableRoots;
+    private AllowedCatalogEndpoints allowedCatalogEndpoints;
     private LanceDispatchActionFilter dispatchActionFilter;
     private LanceCreateIndexActionFilter createIndexActionFilter;
     private LanceClearCacheActionFilter clearCacheActionFilter;
@@ -1581,6 +1596,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         this.clusterService = clusterService;
         TimeValue cadence = NAMESPACE_POLL_CADENCE_SETTING.get(environment.settings());
         this.allowedTableRoots = new AllowedTableRoots(ALLOWED_TABLE_ROOTS_SETTING.get(environment.settings()));
+        this.allowedCatalogEndpoints = new AllowedCatalogEndpoints(ALLOWED_CATALOG_ENDPOINTS_SETTING.get(environment.settings()));
 
         // Install the node-scoped Lance Session before any Dataset is
         // opened. LanceEngineFactory and the REST attach / namespace
@@ -1762,7 +1778,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             cadence,
             NAMESPACE_RESURFACE_GRACE_SETTING.get(environment.settings()),
             warmCache,
-            allowedTableRoots
+            allowedTableRoots,
+            allowedCatalogEndpoints
         );
         // Register a reactive consumer so an operator can adjust the grace
         // period at runtime without a rolling restart.
@@ -1776,6 +1793,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             namespaceService,
             freshnessService,
             allowedTableRoots,
+            allowedCatalogEndpoints,
             warmCache,
             statsCollector,
             requestCache,

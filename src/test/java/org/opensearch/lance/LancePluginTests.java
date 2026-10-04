@@ -111,6 +111,7 @@ public class LancePluginTests extends OpenSearchTestCase {
         assertTrue(settingKeys.contains("index.plugins.lance.uncovered_fragment_policy"));
         assertTrue(settingKeys.contains(LanceEngineFactory.TAG_SETTING));
         assertTrue(settingKeys.contains("plugins.lance.namespace.poll_cadence"));
+        assertTrue(settingKeys.contains("plugins.lance.allowed_catalog_endpoints"));
     }
 
     public void testEverySettingHasACurrentAndADeprecatedKey() {
@@ -121,12 +122,15 @@ public class LancePluginTests extends OpenSearchTestCase {
         // same default, so a cluster configured with the old keys behaves
         // as before and reading an old key logs a deprecation. A setting
         // introduced after the rename has no old key and no twin.
-        Set<String> introducedAfterRename = Set.of(LancePlugin.FRAGMENT_PATH_DEFER_FETCH_SETTING.getKey());
+        Set<String> introducedAfterRename = Set.of(
+            LancePlugin.FRAGMENT_PATH_DEFER_FETCH_SETTING.getKey(),
+            LancePlugin.ALLOWED_CATALOG_ENDPOINTS_SETTING.getKey()
+        );
         List<Setting<?>> settings = plugin.getSettings();
         List<Setting<?>> current = settings.stream().filter(s -> s.isDeprecated() == false).collect(java.util.stream.Collectors.toList());
         List<Setting<?>> deprecated = settings.stream().filter(Setting::isDeprecated).collect(java.util.stream.Collectors.toList());
-        // 37 node settings and 9 index settings.
-        assertEquals(46, current.size());
+        // 38 node settings and 9 index settings.
+        assertEquals(47, current.size());
         assertEquals(current.size() - introducedAfterRename.size(), deprecated.size());
         java.util.Map<String, Setting<?>> deprecatedByKey = deprecated.stream()
             .collect(java.util.stream.Collectors.toMap(Setting::getKey, s -> s));

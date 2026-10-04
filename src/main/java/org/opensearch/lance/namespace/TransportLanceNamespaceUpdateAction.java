@@ -55,6 +55,7 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
     private static final Logger LOG = LogManager.getLogger(TransportLanceNamespaceUpdateAction.class);
 
     private final AllowedTableRoots allowedRoots;
+    private final AllowedCatalogEndpoints allowedEndpoints;
 
     @Inject
     public TransportLanceNamespaceUpdateAction(
@@ -63,7 +64,8 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
         ThreadPool threadPool,
         ActionFilters actionFilters,
         IndexNameExpressionResolver indexNameExpressionResolver,
-        AllowedTableRoots allowedRoots
+        AllowedTableRoots allowedRoots,
+        AllowedCatalogEndpoints allowedEndpoints
     ) {
         super(
             LanceNamespaceUpdateAction.NAME,
@@ -75,6 +77,7 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
             indexNameExpressionResolver
         );
         this.allowedRoots = allowedRoots;
+        this.allowedEndpoints = allowedEndpoints;
     }
 
     @Override
@@ -106,7 +109,12 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
         if (request.operation() == LanceNamespaceUpdateRequest.Operation.REGISTER) {
             RegisterDecision decision;
             try {
-                decision = decideRegister(allowedRoots, state.metadata().custom(LanceNamespaceMetadata.TYPE), request.toEntry());
+                decision = decideRegister(
+                    allowedRoots,
+                    allowedEndpoints,
+                    state.metadata().custom(LanceNamespaceMetadata.TYPE),
+                    request.toEntry()
+                );
             } catch (Exception e) {
                 listener.onFailure(e);
                 return;
@@ -132,26 +140,29 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
 
     /**
      * Decides what a register request should do, in this order: the
-     * allowlist, then the duplicate lookup, then the filesystem existence
+     * allowlists, then the duplicate lookup, then the filesystem existence
      * check. Throws {@link OpenSearchStatusException} (403) for a root
      * outside {@code plugins.lance.allowed_table_roots} and
-     * {@link IllegalArgumentException} (400) for a filesystem path that is
-     * not an existing directory.
+     * {@link IllegalArgumentException} (400) for a catalog endpoint
+     * {@code plugins.lance.allowed_catalog_endpoints} refuses and for a
+     * filesystem path that is not an existing directory.
      *
-     * <p>The allowlist runs before the duplicate lookup so a root that is
-     * already registered but has since been removed from the allowlist is
-     * refused rather than acknowledged; it canonicalises the path (symlinks
-     * of the existing ancestors resolved) but answers the same 403 whether
-     * or not the path exists. The
+     * <p>The allowlists run before the duplicate lookup so a root or an
+     * endpoint that is already registered but has since been removed from
+     * the allowlist is refused rather than acknowledged; the root check
+     * canonicalises the path (symlinks of the existing ancestors resolved)
+     * but answers the same 403 whether or not the path exists. The
      * existence check runs last so a repeated register of a known root
      * stays a no-op even if the directory has gone away.
      *
-     * <p>The allowlist and the existence check apply to directory
+     * <p>The root allowlist and the existence check apply to directory
      * registrations, whose root the request itself names. A rest or
      * glue registration has no root to check here — its tables come
      * from the catalog at poll time — so the poll validates every
      * table location the catalog returns against the same allowlist
-     * before surfacing it.
+     * before surfacing it. What such a registration does name is the
+     * catalog server, and that is checked here against the endpoint
+     * allowlist so a refused server is never contacted.
      *
      * <p>These checks live here rather than in the REST handler so they
      * sit behind the {@link ActionFilters} chain: a caller without the
@@ -163,6 +174,7 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
      */
     static RegisterDecision decideRegister(
         AllowedTableRoots allowedRoots,
+        AllowedCatalogEndpoints allowedEndpoints,
         LanceNamespaceMetadata current,
         LanceNamespaceMetadata.Entry entry
     ) {
@@ -172,6 +184,10 @@ public final class TransportLanceNamespaceUpdateAction extends TransportClusterM
                 "path [" + entry.rootUri() + "] is not under any of the configured plugins.lance.allowed_table_roots",
                 RestStatus.FORBIDDEN
             );
+        }
+        String endpointRefusal = allowedEndpoints.refusal(entry);
+        if (endpointRefusal != null) {
+            throw new IllegalArgumentException(endpointRefusal);
         }
         if (current != null && current.withRegistered(entry) == current) {
             return RegisterDecision.ALREADY_REGISTERED;

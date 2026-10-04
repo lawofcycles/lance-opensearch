@@ -494,6 +494,27 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         assertTrue(readAll(withPath.getResponse()).contains("[path]"));
     }
 
+    public void testRegisterRestNamespaceOnALinkLocalEndpointIsRefused() throws IOException {
+        // The test cluster's plugins.lance.allowed_catalog_endpoints names
+        // the loopback fixtures only, so the instance metadata address is
+        // outside it; with the setting unset the same request is refused
+        // as link local. Either way the registration is not created and
+        // no poll ever contacts the address.
+        ResponseException imds = expectThrows(
+            ResponseException.class,
+            () -> postJson(
+                "/_plugins/_lance/namespace",
+                "{\"type\":\"rest\",\"name\":\"imds\",\"config\":{\"uri\":\"http://169.254.169.254/\"}}"
+            )
+        );
+        assertEquals(400, imds.getResponse().getStatusLine().getStatusCode());
+        String body = readAll(imds.getResponse());
+        assertTrue(body, body.contains("catalog endpoint [http://169.254.169.254/] (config.uri)"));
+        assertTrue(body, body.contains("plugins.lance.allowed_catalog_endpoints"));
+        Response listing = client().performRequest(new Request("GET", "/_plugins/_lance/namespace"));
+        assertFalse("the refused registration must not be in cluster state", readAll(listing).contains("\"imds\""));
+    }
+
     static void updateClusterSetting(String key, String value) throws IOException {
         Request request = new Request("PUT", "/_cluster/settings");
         request.setJsonEntity("{\"transient\":{\"" + key + "\":\"" + value + "\"}}");
