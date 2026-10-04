@@ -38,8 +38,8 @@ public class RestLanceSyncAction extends BaseRestHandler {
     }
 
     @Override
-    public List<ReplacedRoute> replacedRoutes() {
-        return List.of(new ReplacedRoute(RestRequest.Method.POST, "/_plugins/_lance/sync/{index}", "/{index}/_lance/sync"));
+    public List<Route> routes() {
+        return List.of(new Route(RestRequest.Method.POST, "/_plugins/_lance/sync/{index}"));
     }
 
     @Override

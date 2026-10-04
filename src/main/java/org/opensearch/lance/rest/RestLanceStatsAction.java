@@ -22,10 +22,6 @@ import org.opensearch.transport.client.node.NodeClient;
  * native memory accounting and full-text probe limit. The handler only
  * builds a {@link LanceStatsRequest}; the numbers are read on each node by
  * the transport action, so nothing blocks on the REST thread.
- *
- * <p>The deprecated path template in {@link #replacedRoutes()} names its
- * parameter {@code node_id} as well, so {@code request.param("node_id")}
- * reads the node ids on both paths.
  */
 public class RestLanceStatsAction extends BaseRestHandler {
 
@@ -35,10 +31,10 @@ public class RestLanceStatsAction extends BaseRestHandler {
     }
 
     @Override
-    public List<ReplacedRoute> replacedRoutes() {
+    public List<Route> routes() {
         return List.of(
-            new ReplacedRoute(RestRequest.Method.GET, "/_plugins/_lance/stats", "/_lance/stats"),
-            new ReplacedRoute(RestRequest.Method.GET, "/_plugins/_lance/{node_id}/stats", "/_lance/stats/{node_id}")
+            new Route(RestRequest.Method.GET, "/_plugins/_lance/stats"),
+            new Route(RestRequest.Method.GET, "/_plugins/_lance/{node_id}/stats")
         );
     }
 

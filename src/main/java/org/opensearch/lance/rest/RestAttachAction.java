@@ -81,8 +81,8 @@ public class RestAttachAction extends BaseRestHandler {
     }
 
     @Override
-    public List<ReplacedRoute> replacedRoutes() {
-        return List.of(new ReplacedRoute(RestRequest.Method.POST, "/_plugins/_lance/attach", "/_lance/attach"));
+    public List<Route> routes() {
+        return List.of(new Route(RestRequest.Method.POST, "/_plugins/_lance/attach"));
     }
 
     @Override

@@ -87,13 +87,13 @@ public class RestNamespaceAction extends BaseRestHandler {
     }
 
     @Override
-    public List<ReplacedRoute> replacedRoutes() {
+    public List<Route> routes() {
         return List.of(
-            new ReplacedRoute(RestRequest.Method.POST, "/_plugins/_lance/namespace", "/_lance/namespace"),
-            new ReplacedRoute(RestRequest.Method.GET, "/_plugins/_lance/namespace", "/_lance/namespace"),
-            new ReplacedRoute(RestRequest.Method.DELETE, "/_plugins/_lance/namespace", "/_lance/namespace"),
-            new ReplacedRoute(RestRequest.Method.POST, "/_plugins/_lance/namespace/tables", "/_lance/namespace/tables"),
-            new ReplacedRoute(RestRequest.Method.POST, "/_plugins/_lance/namespace/_poll", "/_lance/namespace/_poll")
+            new Route(RestRequest.Method.POST, "/_plugins/_lance/namespace"),
+            new Route(RestRequest.Method.GET, "/_plugins/_lance/namespace"),
+            new Route(RestRequest.Method.DELETE, "/_plugins/_lance/namespace"),
+            new Route(RestRequest.Method.POST, "/_plugins/_lance/namespace/tables"),
+            new Route(RestRequest.Method.POST, "/_plugins/_lance/namespace/_poll")
         );
     }
 

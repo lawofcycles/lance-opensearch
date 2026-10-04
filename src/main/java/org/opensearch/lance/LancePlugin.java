@@ -105,7 +105,6 @@ import org.opensearch.lance.stats.LanceStatsCollector;
 import org.opensearch.lance.stats.TransportLanceStatsAction;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.plugins.ActionPlugin;
-import org.opensearch.plugins.ActionPlugin.ActionHandler;
 import org.opensearch.plugins.CircuitBreakerPlugin;
 import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.MapperPlugin;
@@ -157,7 +156,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         );
     }
 
-    /** The plugin's settings, current and deprecated keys alike: {@link LanceSettings#all()}. */
+    /** The plugin's settings: {@link LanceSettings#all()}. */
     @Override
     public List<Setting<?>> getSettings() {
         return LanceSettings.all();
@@ -165,7 +164,6 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
 
     /**
      * The credential entries of {@code index.plugins.lance.storage_options.*}
-     * (and of the deprecated {@code index.lance.storage_options.*})
      * are withheld from {@code GET /<index>/_settings} and the cluster
      * state API through OpenSearch's settings filter. The patterns come
      * from {@link StorageOptions#SENSITIVE_INDEX_SETTING_PATTERNS}, so
@@ -646,10 +644,6 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
      *   <li>{@code GET /_plugins/_lance/explain/{index}} ({@link RestLanceExplainAction})</li>
      *   <li>{@code POST /_plugins/_lance/sync/{index}} ({@link RestLanceSyncAction})</li>
      * </ul>
-     * Each handler also serves the path it had before the move through
-     * {@code replacedRoutes()}, so a request on an old path is answered
-     * with a deprecation {@code Warning} header. The old paths go away in
-     * the next minor release.
      */
     @Override
     public List<RestHandler> getRestHandlers(

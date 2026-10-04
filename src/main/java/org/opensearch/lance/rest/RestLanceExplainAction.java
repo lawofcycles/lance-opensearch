@@ -44,12 +44,12 @@ public class RestLanceExplainAction extends BaseRestHandler {
     }
 
     @Override
-    public List<ReplacedRoute> replacedRoutes() {
+    public List<Route> routes() {
         // GET with a body, the shape _search and _validate/query accept, and
         // POST for the clients that cannot send a body on a GET.
         return List.of(
-            new ReplacedRoute(RestRequest.Method.GET, "/_plugins/_lance/explain/{index}", "/{index}/_lance/explain"),
-            new ReplacedRoute(RestRequest.Method.POST, "/_plugins/_lance/explain/{index}", "/{index}/_lance/explain")
+            new Route(RestRequest.Method.GET, "/_plugins/_lance/explain/{index}"),
+            new Route(RestRequest.Method.POST, "/_plugins/_lance/explain/{index}")
         );
     }
 

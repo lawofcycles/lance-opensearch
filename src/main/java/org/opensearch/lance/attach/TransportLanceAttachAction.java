@@ -452,7 +452,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         // reads the response headers from the thread context when it
         // writes the response, so a response sent straight from the
         // callback would lose the headers on the caller's context, such
-        // as the Warning a request on a deprecated path carries. The
+        // as a deprecation Warning the request has collected. The
         // listener therefore restores the caller's context (with its
         // response headers) before it answers, the way cluster state
         // updates in core preserve the submitter's context.
