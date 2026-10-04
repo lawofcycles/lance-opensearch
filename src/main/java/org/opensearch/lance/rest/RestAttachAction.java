@@ -66,15 +66,7 @@ public class RestAttachAction extends BaseRestHandler {
      * The top level keys {@link #prepareRequest} reads, in the order it
      * reads them. Any other key is a 400 naming it and this list.
      */
-    static final List<String> ACCEPTED_KEYS = List.of(
-        "table",
-        "name",
-        "version",
-        "tag",
-        "storage_options",
-        "overrides",
-        "multi_fields"
-    );
+    static final List<String> ACCEPTED_KEYS = List.of("table", "name", "version", "tag", "storage_options", "overrides", "multi_fields");
 
     @Override
     public String getName() {
