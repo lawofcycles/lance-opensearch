@@ -34,12 +34,31 @@ public class AllowedCatalogEndpointsTests extends OpenSearchTestCase {
             "http://[fe80::1]/",
             "http://[fe80::1%25eth0]/",
             "http://[::ffff:127.0.0.1]/",
-            "http://0.0.0.0/"
+            "http://0.0.0.0/",
+            "http://[::]/"
         )) {
             String refusal = endpoints.refusal("uri", local);
             assertNotNull(local, refusal);
             assertTrue(refusal, refusal.contains("is a link local or loopback address"));
             assertTrue(refusal, refusal.contains("plugins.lance.allowed_catalog_endpoints"));
+        }
+    }
+
+    public void testEmptyListRefusesTheUnspecifiedAddressOfBothFamilies() {
+        // 0.0.0.0 and :: are the wildcard addresses; a client that
+        // connects to one reaches the local host, so the empty list
+        // treats them as loopback.
+        AllowedCatalogEndpoints endpoints = new AllowedCatalogEndpoints(List.of());
+        for (String wildcard : List.of(
+            "http://0.0.0.0/",
+            "http://0.0.0.0:8181/v1",
+            "http://[::]/",
+            "http://[::]:8181/v1",
+            "https://[::]/"
+        )) {
+            String refusal = endpoints.refusal("uri", wildcard);
+            assertNotNull(wildcard, refusal);
+            assertTrue(refusal, refusal.contains("is a link local or loopback address"));
         }
     }
 

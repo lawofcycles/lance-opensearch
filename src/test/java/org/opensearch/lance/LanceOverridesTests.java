@@ -125,6 +125,45 @@ public class LanceOverridesTests extends OpenSearchTestCase {
         assertTrue(empty.getMessage(), empty.getMessage().contains("must be non-empty strings"));
     }
 
+    public void testSubFieldNameWithEveryKindOfWhitespaceRejected() {
+        // Character.isWhitespace covers more than the space and the tab:
+        // a line feed, a carriage return and the Unicode space
+        // separators outside ASCII are refused with the same message, in
+        // both clauses.
+        for (String name : List.of("raw\n", "raw\rname", "raw\u3000name", "raw\u2028name", "\u2003raw")) {
+            IllegalArgumentException legacy = expectThrows(
+                IllegalArgumentException.class,
+                () -> LanceOverrides.parseAttachClauses(null, Map.of("body", Map.of(name, Map.of("type", "keyword"))))
+            );
+            assertTrue(legacy.getMessage(), legacy.getMessage().contains("[multi_fields.body] sub-field name [" + name + "]"));
+            assertTrue(legacy.getMessage(), legacy.getMessage().contains("must not contain whitespace or control characters"));
+
+            IllegalArgumentException fields = expectThrows(
+                IllegalArgumentException.class,
+                () -> LanceOverrides.parseAttachClauses(Map.of("body", Map.of("fields", Map.of(name, Map.of("type", "keyword")))), null)
+            );
+            assertTrue(fields.getMessage(), fields.getMessage().contains("[overrides.body.fields] sub-field name [" + name + "]"));
+            assertTrue(fields.getMessage(), fields.getMessage().contains("must not contain whitespace or control characters"));
+        }
+    }
+
+    public void testParseRejectsAStoredSubFieldNameWithWhitespace() {
+        // The canonical JSON of the overrides setting goes through the
+        // same name rule on every shard open, so an index attached
+        // before the rule existed with such a name fails to open with
+        // the message the attach path gives today.
+        String stored = "{\"body\":{\"fields\":{\"raw name\":{\"type\":\"keyword\"}}}}";
+        IllegalArgumentException parsed = expectThrows(IllegalArgumentException.class, () -> LanceOverrides.parse(stored));
+        assertEquals(
+            "[overrides.body.fields] sub-field name [raw name] must not contain whitespace or control characters",
+            parsed.getMessage()
+        );
+
+        Settings settings = Settings.builder().put(LanceEngineFactory.OVERRIDES_SETTING, stored).build();
+        IllegalArgumentException fromSettings = expectThrows(IllegalArgumentException.class, () -> LanceOverrides.of(settings));
+        assertEquals(parsed.getMessage(), fromSettings.getMessage());
+    }
+
     public void testSubFieldNameWithOrdinaryCharactersAccepted() {
         // Letters, digits, underscore and hyphen are what a mapping
         // field name ordinarily carries; both clauses accept them and

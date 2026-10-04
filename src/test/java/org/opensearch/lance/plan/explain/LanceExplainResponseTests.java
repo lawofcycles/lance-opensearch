@@ -418,6 +418,46 @@ public class LanceExplainResponseTests extends OpenSearchTestCase {
         }
     }
 
+    public void testMixedPluginVersionTodaysCoordinatorReadsAVersion3NodesAnswer() throws IOException {
+        // The stream a version 3 node writes: today's base fields and the
+        // cacheability block, no index word block. The cacheability is
+        // read, the index word falls back to absent, and the pair with
+        // the version 3 coordinator test above covers both directions of
+        // the version 3 to 4 bump.
+        LanceExplainResponse today = LanceExplainResponse.fragment(
+            "demo",
+            "logical",
+            "physical",
+            FragmentPlan.lucene(FragmentPlan.Kind.LUCENE_TOPK, "rating = 5"),
+            "collapse",
+            List.of(FragmentPlanRefiner.Reason.SORT_FIELD_TYPE),
+            NO_DEMAND,
+            LanceExplainResponse.Cacheability.no("size > 0"),
+            PushedFts.INDEX_INVERTED
+        );
+        try (BytesStreamOutput out = new BytesStreamOutput(); BytesStreamOutput written = new BytesStreamOutput()) {
+            today.writeTo(written);
+            int indexWordBlockBytes;
+            try (BytesStreamOutput block = new BytesStreamOutput()) {
+                WireVersion.writeBlock(block, false, o -> o.writeOptionalString(PushedFts.INDEX_INVERTED));
+                indexWordBlockBytes = block.bytes().length();
+            }
+            try (StreamInput in = written.bytes().streamInput()) {
+                assertEquals(LanceExplainResponse.WIRE_VERSION, in.readVInt());
+                byte[] rest = in.readAllBytes();
+                out.writeVInt(3);
+                out.writeBytes(rest, 0, rest.length - indexWordBlockBytes);
+            }
+            LanceExplainResponse asVersion3 = read(out);
+            assertEquals(LanceExplainResponse.Cacheability.no("size > 0"), asVersion3.cacheability());
+            assertNull("a version 3 node has no index word to send", asVersion3.ftsIndex());
+            assertEquals(today.fragmentPlan(), asVersion3.fragmentPlan());
+            assertEquals("collapse", asVersion3.unplanned());
+            assertEquals(List.of(FragmentPlanRefiner.Reason.SORT_FIELD_TYPE), asVersion3.refinementsPossible());
+            assertEquals(today.traits(), asVersion3.traits());
+        }
+    }
+
     public void testMixedPluginVersionAVersion2CoordinatorReadsTodaysAnswerWithoutTheCacheability() throws IOException {
         // Today's writer, read as a version 2 node does: the base fields
         // by hand in their version 2 layout, then the walk over the
