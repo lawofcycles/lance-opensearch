@@ -137,11 +137,19 @@ public final class AllowedTableRoots {
         if (path == null) {
             return null;
         }
-        String authority = uri.getAuthority();
+        // A table URI names a bucket or container, never a user or a
+        // port, so an authority with either is not a form this allowlist
+        // compares; refuse it rather than fold credentials into the key.
+        if (uri.getRawUserInfo() != null || uri.getPort() != -1) {
+            return null;
+        }
+        String host = uri.getHost();
         StringBuilder form = new StringBuilder();
         form.append(uri.getScheme().toLowerCase(Locale.ROOT)).append("://");
-        if (authority != null) {
-            form.append(authority.toLowerCase(Locale.ROOT));
+        if (host != null) {
+            form.append(host.toLowerCase(Locale.ROOT));
+        } else if (uri.getRawAuthority() != null) {
+            form.append(uri.getRawAuthority().toLowerCase(Locale.ROOT));
         }
         form.append(path);
         return form.toString();
@@ -152,7 +160,9 @@ public final class AllowedTableRoots {
      * path. Returns the path with a leading and a trailing {@code /}, or
      * null when a {@code ..} climbs above the first segment. Interior
      * empty segments are kept, because object stores treat {@code a//b}
-     * and {@code a/b} as different keys.
+     * and {@code a/b} as different keys; trailing empty segments are
+     * dropped, so a root written {@code a//} and one written {@code a/}
+     * are the same root.
      */
     private static String resolveSegments(String decodedPath) {
         String relative = decodedPath.startsWith("/") ? decodedPath.substring(1) : decodedPath;

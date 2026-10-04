@@ -188,6 +188,15 @@ public class AllowedTableRootsTests extends OpenSearchTestCase {
         assertFalse(roots.allows("s3://bucket/prefix/%zz"));
     }
 
+    public void testUriWithUserInfoOrPortIsRejected() {
+        // The bucket is the only authority a table URI names; a user or a
+        // port would be folded into the compared key by a plain lower case.
+        AllowedTableRoots roots = new AllowedTableRoots(List.of("s3://bucket/prefix/"));
+        assertFalse(roots.allows("s3://someone@bucket/prefix/table"));
+        assertFalse(roots.allows("s3://bucket:9000/prefix/table"));
+        assertTrue(roots.allows("s3://BUCKET/prefix/table"));
+    }
+
     public void testRootWithDotDotAboveTheBucketFailsConstruction() {
         IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
