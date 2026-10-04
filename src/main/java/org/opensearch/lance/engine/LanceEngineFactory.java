@@ -41,6 +41,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.breaker.NoopCircuitBreaker;
 import org.opensearch.core.indices.breaker.CircuitBreakerService;
+import org.opensearch.index.IndexService;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineException;
@@ -970,12 +971,13 @@ public final class LanceEngineFactory implements EngineFactory {
          *
          * <p>A reader opened here cannot carry the index's reader wrapper
          * (the security plugin's DLS / FLS), so the lookup refuses when
-         * {@link ReaderWrapperProbe#installed} finds one on the index's
-         * service, whatever the wrapper made of the shard searcher's
-         * reader (a wrapper that returns the reader it is given leaves
-         * the engine's own reader on top). Without an
-         * {@link IndicesService} the question has no answer and the
-         * lookup refuses as well.
+         * {@link ReaderWrapperProbe#installedOn} finds one on this
+         * index's own service, whatever the wrapper made of the shard
+         * searcher's reader (a wrapper that returns the reader it is
+         * given leaves the engine's own reader on top). Without an
+         * {@link IndicesService}, or when the node does not hold the
+         * index's service, the question has no answer and the lookup
+         * refuses as well.
          */
         private GetResult resolveOutsideReader(
             Engine.Searcher searcher,
@@ -984,7 +986,8 @@ public final class LanceEngineFactory implements EngineFactory {
             int fragmentId,
             int offset
         ) throws IOException {
-            if (indicesService == null || ReaderWrapperProbe.installed(indicesService, config().getShardId().getIndex())) {
+            IndexService ownService = indicesService == null ? null : indicesService.indexService(config().getShardId().getIndex());
+            if (ownService == null || ReaderWrapperProbe.installedOn(ownService)) {
                 throw new IllegalStateException(
                     "GET of a row outside the shard reader of ["
                         + config().getShardId().getIndexName()

@@ -932,7 +932,7 @@ Before each native scan or index load starts, the executor estimates what it wil
 Lance allocates native memory the plugin's breakers never see: an inverted index document set or the matching pages of a BTree that do not fit one index cache shard, the IVF partitions a nearest scan probes, the row addresses a filtered scan materialises, the read queue and decoded batches of every scan. On a table large enough for the node any of these ends the node with a kernel OOM kill. Three dynamic cluster settings control the gate:
 
 ```
-plugins.lance.admission.enabled: true              # default; false admits every shape
+plugins.lance.admission.enabled: true              # default; false admits every shape except a full text scan without an index, which is refused
 plugins.lance.admission.headroom: 8gb              # default; available memory kept out of reach of a scan
 plugins.lance.admission.bounded_shapes_gated: true # default; false admits bounded full text pages ungated and judges a bounded filter page on its limit
 ```
