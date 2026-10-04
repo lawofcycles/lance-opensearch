@@ -290,11 +290,16 @@ public final class ScanAdmission {
      * {@code lance-index/src/scalar/inverted/index/flat_search.rs}),
      * then scores the whole collection with {@code MemBM25Scorer} and
      * holds the scored batch next to it; nothing of this is cached
-     * between scans. The figure is pinned to the one measurement so
-     * far: a {@code match} over a 1B row Utf8 column without an index
-     * on one 128 GB node took 390 s and grew the resident set by about
-     * 100 GB, 100 bytes per row. The coefficient is fitted as further
-     * measurements come in.
+     * between scans. Measured on tables without an index with a 50 ms
+     * resident set sampler, the peak growth of the resident set per
+     * scanned row for a one token {@code match} is 34 bytes at 2M
+     * rows, 46 bytes at 20M rows and 46 bytes at 100M rows, and 30 to
+     * 32 bytes for a two token query. The 100 bytes are a 2.2 times
+     * margin over that peak. The margin is kept because a cancelled
+     * flat scan does not stop: Lance collects every row's tokens before
+     * it scores anything, so a timeout returns the partial answer and
+     * the scan runs to its end, and this gate is the only bound on
+     * what the scan allocates.
      */
     static final long FLAT_FTS_BYTES_PER_ROW = 100L;
 
