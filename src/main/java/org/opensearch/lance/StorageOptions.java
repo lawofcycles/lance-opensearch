@@ -154,6 +154,24 @@ public final class StorageOptions {
     private static final Pattern XML_ACCESS_KEY_ID = Pattern.compile("(<(?:AWS)?AccessKeyId>)[^<]*(</(?:AWS)?AccessKeyId>)");
 
     /**
+     * The {@code <StringToSign>}, {@code <SignatureProvided>} and
+     * {@code <CanonicalRequest>} elements of the S3
+     * {@code SignatureDoesNotMatch} error body, whatever their content.
+     * {@code SignatureProvided} is the HMAC the client derived from
+     * the secret access key, {@code StringToSign} and
+     * {@code CanonicalRequest} are the inputs it was computed over,
+     * which carry the signed headers, the session token and the key
+     * id's credential scope. {@code StringToSign} and
+     * {@code CanonicalRequest} are newline separated and span lines,
+     * so the match runs in DOTALL mode and stops at the element's own
+     * closing tag.
+     */
+    private static final Pattern XML_SIGNATURE_ELEMENTS = Pattern.compile(
+        "(<(StringToSign|SignatureProvided|CanonicalRequest)>).*?(</\\2>)",
+        Pattern.DOTALL
+    );
+
+    /**
      * A {@code Bearer} or {@code Basic} authorization value, the shapes
      * a catalog client puts in an {@code Authorization} header.
      */
@@ -178,7 +196,10 @@ public final class StorageOptions {
      * {@code key=value} / {@code key: value} / {@code "key": "value"}
      * pair whose key names a credential (see {@link #hasSensitiveSegment}),
      * an AWS access key id wherever it appears, the
-     * {@code <AWSAccessKeyId>} element of an S3 error body, a
+     * {@code <AWSAccessKeyId>} element of an S3 error body, the
+     * {@code <StringToSign>}, {@code <SignatureProvided>} and
+     * {@code <CanonicalRequest>} elements of an S3
+     * {@code SignatureDoesNotMatch} body, a
      * {@code Bearer} or {@code Basic} authorization value, and the
      * {@code sig} parameter of an Azure SAS URL. Region, endpoint,
      * bucket and table path are left as they are. Returns
@@ -198,6 +219,7 @@ public final class StorageOptions {
             return message;
         }
         String out = message;
+        out = XML_SIGNATURE_ELEMENTS.matcher(out).replaceAll("$1" + REDACTED + "$3");
         out = XML_ACCESS_KEY_ID.matcher(out).replaceAll("$1" + REDACTED + "$2");
         out = ACCESS_KEY_ID.matcher(out).replaceAll(REDACTED);
         out = AUTHORIZATION_VALUE.matcher(out).replaceAll("$1" + REDACTED);
