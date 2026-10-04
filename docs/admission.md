@@ -31,7 +31,7 @@ The two `plugins.lance.test.*` settings are described under [Tables above the Lu
 - A request that runs several gated paths (a filter under a knn, a filtered aggregate) is judged per path in order and counts once in flight.
 - A 429 on a table whose scan does not fit the node is the designed outcome. The coefficients are a model, fitted to measurements as they come in.
 
-What Lance allocates that the breakers do not see: an inverted index document set or the matching pages of a BTree that do not fit one index cache shard, the IVF partitions a nearest scan probes, the row addresses a filtered scan materialises, the read queue and decoded batches of every scan, and the batches of the take that reads a page's rows.
+What Lance allocates that the breakers do not see: an inverted index document set or the matching pages of a BTree that do not fit one index cache shard, the per row token counts of a full text scan over a column without an inverted index, the IVF partitions a nearest scan probes, the row addresses a filtered scan materialises, the read queue and decoded batches of every scan, and the batches of the take that reads a page's rows.
 
 ## Estimators
 
@@ -39,7 +39,7 @@ One estimator per kind, each a static method of `ScanAdmission` with its coeffic
 
 ### `fts`
 
-A full text scan. The estimate is the sum of four parts; the first three are zero when one document set fits the shard share, the fourth when it fits the shard share on its own.
+A full text scan. The estimate is the sum of five parts; the first three are zero when one document set fits the shard share, the fourth and the fifth when each fits the shard share on its own.
 
 - The document set rebuild, `rows × 52 bytes`, over whichever fragments the scan keeps, once per full text clause. Lance searches every `match`, `match_phrase` and `multi_match` column of a `lance_fts_bool`, a fused stock `bool` or a `lance_fts_boost` on its own and holds each result while it joins them, so `bool(must [match, match])` counts two document sets.
 - The positions of each `match_phrase` clause's tokens, `rows × 48 bytes` per phrase clause (`PHRASE_POSITION_BYTES_PER_ROW`).
@@ -48,6 +48,19 @@ A full text scan. The estimate is the sum of four parts; the first three are zer
 - The row addresses the scan's SQL prefilter materialises when a `bool` with scalar `filter` / `must_not` clauses was fused into one Lance scan: one row in five of the table (`FILTER_MATCH_RATIO_UNKNOWN`) at 256 bytes each (`FILTER_SCAN_BYTES_PER_MATCHING_ROW`), the same term `filter_scan` and `aggregate_scan` charge for Lance's `MaterializeIndexExec`. When several full text leaves each carry a prefilter (a `bool` the planner did not fuse), every distinct prefilter SQL is charged once. For `bool(must [match body w000100], filter [range price >= 100]) size 10` over 1B rows on a 128 GB node the 429 message reads
   `[lance_admission] fts estimate [96.1gb] exceeds available [81.9gb] minus headroom [8gb] plus [0b] retained by earlier admitted scans: bounded full text page over [perf1b]: inverted index document set of [48.4gb] plus the prefilter [price >= 100.0] materialising 200000000 row addresses over the whole table at [256b] each against an index cache shard of [8gb] plus the hits scan buffers. Drop the scalar filter, attach the table to a node with a larger index cache, or relax plugins.lance.admission.bounded_shapes_gated / plugins.lance.admission.headroom / plugins.lance.admission.enabled.`
   - Where the figure comes from: 1B rows at one in five is 200M row addresses, at 256 bytes 51.2 GB. With the 48.4 GB document set the shape reaches 96.1 GB, above the 88 GB a 128 GB node has after the 8 GB headroom, so it is refused there.
+- The rows the column's inverted index does not cover, when the table statistics report them (`num_unindexed_rows` of the index statistics): Lance reads them through the flat path of `fts_flat` below and unions the result with the index lookup, so they are charged at 100 bytes each (`FLAT_FTS_BYTES_PER_ROW`) on top of the document set, named in the message as `plus the flat BM25 scan of [N] rows the index does not cover at [100b] each`. The statistics collector reads the row figures of bitmap, BTree and vector indexes today and not of inverted indexes, so this term is zero until it does; a column whose index covers no fragment at all is still judged as `fts`, on its document set.
+
+### `fts_flat`
+
+A full text scan over a column that carries no inverted index: a `match`, `lance_match`, `match_phrase` or `lance_match_phrase` on a Utf8 column declared `lance_text` through the attach override ([mapping-overrides.md](mapping-overrides.md#type-lance_text)). The executor tells the two kinds apart by the snapshot's set of indexed columns; a `multi_match` that names an indexed and an unindexed column is judged as `fts` for the first and as `fts_flat` for the second, in that order, and counts once in flight.
+
+- The estimate is `rows × 100 bytes` per unindexed column the query names (`FLAT_FTS_BYTES_PER_ROW`), over the table's rows like the `fts` estimate. Zero when it fits the shard share.
+  - What Lance holds: its flat path (`plan_flat_match_query` in `lance/src/dataset/scanner.rs`, `FlatMatchQueryExec` in `lance/src/io/exec/fts.rs`) reads the column of every scanned fragment, tokenises each row and, before it scores anything, collects for every row the row address, the row's token total and the count of each query token in it (`tokenize_and_count` in `lance-index/src/scalar/inverted/index/flat_search.rs`), then scores the collection with `MemBM25Scorer` and holds the scored batch next to it. Nothing of this is cached between scans, so a repeat of the query allocates it again.
+  - Where the figure comes from: a `match` over a 1B row Utf8 column without an index on one 128 GB node took 390 s and grew the resident set by about 100 GB (QA round 19). The coefficient is pinned to that one measurement and is fitted as further measurements come in; a 1B row table on a 128 GB node reading 88 GB after the headroom is refused, a 20M row table (2 GB) is admitted.
+- The message names the kind, the rows and the column: `[lance_admission] fts_flat estimate [93.1gb] exceeds available [80gb] minus headroom [8gb] plus [0b] retained by earlier admitted scans: full text scan without an inverted index over [perf1b]: flat BM25 scan of [1000000000] rows on column [body] at [100b] each. Create an inverted index on column [body] with the table's writer (pylance create_scalar_index), attach the table to a node with more memory, or relax plugins.lance.admission.headroom / plugins.lance.admission.enabled.`
+- The remedy that makes the term disappear is the index: once the writer has created an inverted index on the column the same query is judged as `fts`.
+- Bounded pages are gated like the `fts` kind, and `plugins.lance.admission.bounded_shapes_gated: false` opts them out the same way: Lance tokenises every scanned row whatever the page size, as it rebuilds the whole document set whatever the page size.
+- The retained pool identity is `fts_flat:<index>:<columns>`, so a repeat of the same flat scan is credited what the first left behind and a scan of another kind over the same index is not.
 
 ### `scalar_index`
 

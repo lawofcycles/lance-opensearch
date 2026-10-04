@@ -89,7 +89,7 @@ Place the table under the directory you mounted in step 2. The rest of this walk
 - `embedding: fixed_size_list<float>[8]` — mapped as `lance_vector`; used by the `lance_knn` query
 - `rating: int32` — mapped as `integer`; used by the `bool.filter` and aggregation examples
 
-Once attached, `curl -s http://localhost:9200/demo/_mapping` shows exactly these types; the mapping is the contract the queries below rely on. Only a `lance_text` field sends `match` and its relatives to the Lance FTS index, so a string column that has no inverted index in the table (mapped as `keyword`) needs one built first (see "How the plugin thinks about indexes" in step 6).
+Once attached, `curl -s http://localhost:9200/demo/_mapping` shows exactly these types; the mapping is the contract the queries below rely on. Only a `lance_text` field sends `match` and its relatives to Lance. A string column that has no inverted index in the table is mapped as `keyword`, where `match` is an exact match of the whole string and can return 0 hits. To search such a column as full text, declare it `lance_text` on the attach body (`"overrides": {"body": {"type": "lance_text"}}`, see [mapping-overrides.md](mapping-overrides.md#type-lance_text); Lance then scans and scores the rows without an index) or have the table's writer create the inverted index (see "How the plugin thinks about indexes" in step 6).
 
 ### Option B: create a sample table with Python
 
@@ -647,7 +647,7 @@ plugins.lance.namespace.poll_cadence: 1s
 
 ### How the plugin thinks about indexes
 
-Indexes on the Lance table (FTS, scalar, vector) belong to the writer. Build them from the same writer that produced the table, using pylance, the Lance Java SDK, or a Ray / Spark job; the freshness check picks a new index up at its manifest commit, and the mapping follows (a Utf8 column becomes `lance_text` once it has an inverted index). The plugin never creates or optimises an index: it holds no write credentials for the table and never commits a version to it.
+Indexes on the Lance table (FTS, scalar, vector) belong to the writer. Build them from the same writer that produced the table, using pylance, the Lance Java SDK, or a Ray / Spark job; the freshness check picks a new index up at its manifest commit, and the mapping follows (a Utf8 column becomes `lance_text` once it has an inverted index, unless the attach body declared its type). The plugin never creates or optimises an index: it holds no write credentials for the table and never commits a version to it. A Utf8 column can be searched as full text before its index exists by declaring it `lance_text` on the attach body ([mapping-overrides.md](mapping-overrides.md#type-lance_text)); Lance then tokenises and scores the rows per request, under the admission gate.
 
 ```python
 import lance
@@ -937,7 +937,7 @@ plugins.lance.admission.headroom: 8gb              # default; available memory k
 plugins.lance.admission.bounded_shapes_gated: true # default; false admits bounded full text pages ungated and judges a bounded filter page on its limit
 ```
 
-The 429 message names the kind of scan (`fts`, `scalar_index`, `vector_index`, `filter_scan`, `aggregate_scan`, `column_load`, `fetch_take`), the estimate, the available memory, the headroom and what to relax. `GET /_plugins/_lance/stats` reports the decisions under `admission`, with one rejection counter per kind.
+The 429 message names the kind of scan (`fts`, `fts_flat`, `scalar_index`, `vector_index`, `filter_scan`, `aggregate_scan`, `column_load`, `fetch_take`), the estimate, the available memory, the headroom and what to relax. `GET /_plugins/_lance/stats` reports the decisions under `admission`, with one rejection counter per kind.
 
 The estimates are a model whose coefficients are pinned to the measurements the project has; a 429 on a table whose scan does not fit the node is the intended answer. `_count` without a filter never scans and is never gated; the take that reads the rows of a page (`GET /_doc`, a `match_all` page) is judged as `fetch_take`, at estimate zero for any page whose rows fit the index cache shard share.
 

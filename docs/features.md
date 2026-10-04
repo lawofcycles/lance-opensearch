@@ -206,10 +206,11 @@ Notes per row:
   - `regexp` becomes `regexp_like` over the pattern anchored as `^(?:...)$`, evaluated with Rust regex syntax: `.`, `*`, `+`, `?`, `{n,m}`, `[...]`, `(...)`, `|`, `\d` / `\w` / `\s` mean what they mean in Lucene, while Lucene's own operators are refused (see [limitations.md](limitations.md#regexp-on-lance_text)).
   - Without `sort`, aggregations or `post_filter` the scan stops at `from + size` rows; `hits.total` and `_count` come from a count only scan of the same predicate, so the cost is one pass over the column per executor and shrinks with the number of data nodes.
 - Every full text scan is judged by the admission gate before it starts ([admission.md](admission.md#fts)).
+- A Utf8 column without an inverted index can be declared `lance_text` on the attach body (`"overrides": {"body": {"type": "lance_text"}}`); Lance then answers `match` and its relatives from its flat BM25 scan of the column, judged by the gate as `fts_flat` ([mapping-overrides.md](mapping-overrides.md#type-lance_text)). Without the declaration such a column is `keyword`.
 
 #### The inverted index and its tokenizer
 
-- A Utf8 column is `lance_text` only when the Lance table carries an inverted index on it; otherwise it is `keyword`. The table's writer creates the index (pylance `ds.create_scalar_index("text", "INVERTED", base_tokenizer="lindera/ipadic", with_position=True)`, or lance-java `createIndex` with `ScalarIndexParams.create("inverted", ...)`); the next freshness check re-derives the mapping and rebuilds the OpenSearch index with the column as `lance_text`.
+- A Utf8 column is `lance_text` only when the Lance table carries an inverted index on it or the attach body declares it so; otherwise it is `keyword`. The table's writer creates the index (pylance `ds.create_scalar_index("text", "INVERTED", base_tokenizer="lindera/ipadic", with_position=True)`, or lance-java `createIndex` with `ScalarIndexParams.create("inverted", ...)`); the next freshness check re-derives the mapping and rebuilds the OpenSearch index with the column as `lance_text`, unless the column's type was declared, in which case the mapping stands and the index is not rebuilt.
 - The tokenizer is the writer's choice and is fixed when the index is created. Lance 12 accepts `simple` (its default), `whitespace`, `raw`, `ngram`, `icu`, `icu/split`, `lindera/<model>`, `jieba/<model>` as the inverted index `base_tokenizer`. To switch, drop or replace the index on the Lance side (`Dataset.drop_index` / `create_scalar_index(..., replace=True)`).
 - Whether positions are stored (off by default in Lance) is fixed when the index is created. `lance_match_phrase` needs them; `lance_match`, `lance_multi_match`, `lance_fts_bool` and `lance_fts_boost` do not, and an index with positions is larger. A column built without them has to be dropped on the Lance side and built again to gain phrase support.
   - A `lance_match_phrase` query on a column without positions answers 400 `illegal_argument_exception` with Lance's message (`position is not found but required for phrase queries ...`).
@@ -296,7 +297,7 @@ Notes per row:
 
 The attach body and the namespace register body accept an `overrides` clause with per-column mapping rules, persisted in the `index.plugins.lance.overrides` index setting and re-applied on every manifest version advance. [mapping-overrides.md](mapping-overrides.md#mapping-overrides) describes each kind, the validation table and the persistence rules.
 
-Six kinds are supported: `type: date` on an epoch millis integer column, `type: keyword` on a Utf8 column with an inverted index, `type: ip`, `type: wildcard`, `type: geo_point` on a two float struct or `FixedSizeList<Float64>[2]`, and keyword sub-fields (`fields`).
+Seven kinds are supported: `type: date` on an epoch millis integer column, `type: keyword` on a Utf8 column with an inverted index, `type: ip`, `type: wildcard`, `type: lance_text` on a Utf8 column without an inverted index, `type: geo_point` on a two float struct or `FixedSizeList<Float64>[2]`, and keyword sub-fields (`fields`).
 
 ### Index types the plugin reads
 
@@ -465,7 +466,7 @@ Test settings, all node scope and dynamic; do not change them on a real node:
   - `retained_bytes`: the memory earlier admitted scans left in the process that the next decision on a scan of the same identity adds to the available memory; zero while a gated request is in flight or a gated scan runs.
   - `retained_scope`: that identity as `kind:table:columns`, the only scans `retained_bytes` is credited to; `none` before the first admission, and from a node whose plugin version does not report it.
   - `last_estimate_bytes`, `last_kind` and `last_source`: the estimate, the kind and the source of the node's last admission decision, admitted or not. The source is `request` for a search request's gated path and `warm_up` for the metadata warm up's full text probe; `none` before the first, and for the source also from a node whose plugin version does not report it.
-  - `rejections`: an object with one counter per kind (`fts`, `scalar_index`, `vector_index`, `filter_scan`, `aggregate_scan`, `column_load`, `fetch_take`) of the scans the node's gate refused since it started, every counter present even at zero. A warm up probe the gate did not admit counts under `fts`.
+  - `rejections`: an object with one counter per kind (`fts`, `fts_flat`, `scalar_index`, `vector_index`, `filter_scan`, `aggregate_scan`, `column_load`, `fetch_take`) of the scans the node's gate refused since it started, every counter present even at zero. A warm up probe the gate did not admit counts under `fts`.
 - `warm_up`: `mode` (current `plugins.lance.attach.warm_indexes`) and `tables`, one entry per Lance-backed index the node has seen since it started: `index`, `table`, `version` (the manifest the warm-up read), `mode` (the one it ran under), `state` (`pending`, `running`, `done`, `failed`, `skipped`, `cancelled`), `started_at`, `seconds` and `indexes` (per Lance index: `name`, `type`, `column`, `state`, `seconds`, `detail`). See [Index warm-up](#index-warm-up).
 - `plan.statistics`: the planner's table statistics cache of the node, one entry per table version: `tables` (entries held), `collect_millis_total` (time spent collecting, summed over the collections), `pending` (collections started and not finished), `planned_without` (requests the node coordinated and planned without the statistics of their version) and `failures` (collections that threw).
   - `pending` at zero does not say the node holds the statistics of a table; a node that has started no collection reports zero too. `tables` says an entry is held, and a `planned_without` that stands still across a request says the request read one.
@@ -588,7 +589,7 @@ Types listed here map to real OpenSearch field types with doc values or FTS back
 | `boolean` | `boolean` |
 | `date` / `timestamp` (all units and TZs) | `date` |
 | `utf8` with a Lance FTS index | `lance_text` |
-| `utf8` without a Lance FTS index | `keyword` |
+| `utf8` without a Lance FTS index | `keyword` (`lance_text` when the attach body declares `type: lance_text`) |
 | `list<utf8>` | multi-valued `keyword` |
 | `struct` | `object` |
 | `list<struct>` | `nested` |

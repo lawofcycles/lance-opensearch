@@ -7,6 +7,7 @@ The attach body and the namespace register body take an optional `overrides` cla
   - [`type: keyword`](#type-keyword)
   - [`type: ip`](#type-ip)
   - [`type: wildcard`](#type-wildcard)
+  - [`type: lance_text`](#type-lance_text)
   - [`type: geo_point`](#type-geo_point)
   - [`fields`](#fields)
   - [Validation](#validation)
@@ -14,7 +15,7 @@ The attach body and the namespace register body take an optional `overrides` cla
 
 ## Mapping overrides
 
-The attach body accepts an `overrides` clause with per-column mapping rules. Six kinds are supported: a `date` type override, a `keyword` type override, an `ip` type override, a `wildcard` type override, a `geo_point` type override, and keyword sub-fields (`fields`). `type` and `fields` may appear together on one column:
+The attach body accepts an `overrides` clause with per-column mapping rules. Seven kinds are supported: a `date` type override, a `keyword` type override, an `ip` type override, a `wildcard` type override, a `lance_text` type override, a `geo_point` type override, and keyword sub-fields (`fields`). `type` and `fields` may appear together on one column:
 
 ```json
 POST /_plugins/_lance/attach
@@ -62,6 +63,17 @@ POST /_plugins/_lance/attach
 - The n-gram-accelerated `wildcard` field type of OpenSearch core is not used because the fragment reader has no postings: in the 3.7 tree, `WildcardFieldType.wildcardQuery` always builds its first phase from `matchAllTermsQuery` over the pattern's required trigram terms with `isSearchable` hardcoded, so without an inverted index every query on that field type would match nothing.
 - Like the `keyword` override, the column's inverted index, if any, is not used.
 
+### `type: lance_text`
+
+`type: lance_text` on a Utf8 column maps it to `lance_text` whether or not the table carries an inverted index on it. Without the override a Utf8 column is `lance_text` only when it has an inverted index, and `keyword` otherwise, where a stock `match` is an exact match of the whole string (often 0 hits) and `lance_match` answers 400. The override is the opt in for full text search on a column the writer has not indexed, or has indexed for some fragments only.
+
+- The emitted mapping is `lance_text` with `meta.lance_override_type: lance_text`, so `GET _mapping` shows the column is full text by declaration and not by index.
+- Lance decides the path per request from the table's indexes. With an inverted index that covers every fragment the query runs on the index. Without one Lance reads the column of every fragment the executor scans, tokenises each row with its plain `simple` tokenizer and scores the rows with BM25 (`plan_flat_match_query` in `rust/lance/src/dataset/scanner.rs`). With an index that covers some fragments Lance runs both and unions the results. `match`, `lance_match`, `match_phrase` and `lance_match_phrase` all take these paths; a phrase on an unindexed column needs no stored positions, because the flat path tokenises with positions itself.
+- The flat path over a column without any index applies no lower casing, stemming or stop word removal, where an index built with Lance's defaults applies all three (`lower_case`, `stem` and `remove_stop_words` of the inverted index parameters, English); when an index covers some fragments, the flat scan of the others borrows the index's analyzer. `match body: the` finds every row holding the lower case token `the` on the flat path and nothing once the writer's index drops the stop word; `dog` matches `dogs` through the stemmed index and not on the flat path. The hit set of the same query can therefore change when the writer adds the index, on stop words, inflected forms and letter case, and the scores change for every row (each path sees its own corpus statistics), so the order and the `_score` values differ as well.
+- A column so declared never flips between `keyword` and `lance_text` when the writer creates or drops the index: the freshness check derives the mapping from the declaration, so the OpenSearch index is not rebuilt. The same holds for `type: keyword`.
+- Exact match, sort and `terms` aggregations need doc values a `lance_text` column does not carry; declare a keyword sub-field for them (`"body": {"type": "lance_text", "fields": {"raw": {"type": "keyword"}}}`), the way OpenSearch's `text` type pairs with a `.keyword` sub-field.
+- The flat scan is judged by the admission gate as its own kind, `fts_flat`, at 100 bytes per table row per column ([admission.md](admission.md#fts_flat)). On a node whose available memory minus the headroom does not hold that the request answers 429 `[lance_admission] fts_flat estimate [...] ... full text scan without an inverted index over [index]: flat BM25 scan of [N] rows on column [body] at [100b] each`, and the remedy is to have the writer create the inverted index (pylance `ds.create_scalar_index("body", "INVERTED")`), to attach the table to a node with more memory, or to relax `plugins.lance.admission.headroom` / `plugins.lance.admission.enabled`. A flat scan reads and tokenises every row of the scanned fragments, so set `search.default_search_timeout` on the cluster or a `timeout` on the request to bound the time such a query may take ([limitations.md](limitations.md#shard-model-and-concurrency)).
+
 ### `type: geo_point`
 
 `type: geo_point` opts a column into OpenSearch's stock `geo_point` mapping. Two Lance shapes are accepted: a `Struct` with exactly two `Float64` children named as one of `(lat, lon)`, `(latitude, longitude)` or `(y, x)` in either order, where the child names fix the storage order and the operator declares no `order`; or a `FixedSizeList<Float64>[2]`, where `overrides.<col>.order` selects `lat_lon` (default) or `lon_lat`.
@@ -88,11 +100,12 @@ Validation answers 400 naming the column and the reason:
 
 | rule | accepted |
 |---|---|
-| `type` values | `date`, `keyword`, `ip`, `wildcard`, `geo_point` |
+| `type` values | `date`, `keyword`, `ip`, `wildcard`, `lance_text`, `geo_point` |
 | `type: date` column | signed Int32 / Int64, Date, Timestamp |
 | `type: keyword` column | Utf8 (with or without inverted index), List&lt;Utf8&gt; |
 | `type: ip` column | Utf8, List&lt;Utf8&gt; (holding IP address strings) |
 | `type: wildcard` column | Utf8 |
+| `type: lance_text` column | Utf8 (with or without inverted index); List&lt;Utf8&gt; is refused |
 | `type: geo_point` column | Struct&lt;Float64, Float64&gt; named (lat/lon), (latitude/longitude) or (y/x); or FixedSizeList&lt;Float64&gt;[2] |
 | `fields` column | Utf8 (resolves to `lance_text`, `keyword` or `ip`) |
 | `format` | only with `type: date`, validated as a date format pattern |
