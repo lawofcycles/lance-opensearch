@@ -244,9 +244,7 @@ curl -X POST http://localhost:9200/_plugins/_lance/attach \
 
 The call is idempotent; a second attach on the same table returns `already_attached: true`.
 
-Every endpoint of the plugin lives under `/_plugins/_lance/`, the node settings under `plugins.lance.*` and the index settings under `index.plugins.lance.*`. In 0.1.0 the previous paths (`/_lance/attach`, `/_lance/namespace`, `/_lance/refs/{index}`, `/_lance/stats`, `/_lance/stats/{node_id}`, `/{index}/_lance/explain`, `/{index}/_lance/sync`) still answer, with a deprecation `Warning` header on the response and a line in the node's deprecation log naming the new path.
-
-The previous setting names, `lance.*` and `index.lance.*`, are accepted the same way: a value under an old key is read when the new key is absent, and every read of an old key logs a deprecation warning (a `Warning` header on the request that read it). An index created under the old keys keeps opening; attach and the namespace poll write the new keys only. The old paths and the old setting names are removed in the next minor release.
+Every endpoint of the plugin lives under `/_plugins/_lance/`, the node settings under `plugins.lance.*` and the index settings under `index.plugins.lance.*`.
 
 ### Point at S3, GCS, or Azure with storage_options
 

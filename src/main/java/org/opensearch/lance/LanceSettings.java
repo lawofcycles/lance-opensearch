@@ -5,7 +5,6 @@
 
 package org.opensearch.lance;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Function;
 
@@ -26,54 +25,21 @@ import org.opensearch.lance.query.ScanAdmission;
  * The settings of the plugin. {@link LancePlugin#getSettings()} registers
  * {@link #all()}; the components read the constants declared here.
  *
- * <p>Every setting has two registered keys: the current one under
- * {@code plugins.lance} (node scope) or {@code index.plugins.lance} (index
- * scope), and the deprecated one under {@code lance} or {@code index.lance}
- * that the first preview releases used. The current setting names the
- * deprecated one as its fallback, which with OpenSearch's {@code Setting}
- * gives these three outcomes when a current setting is read.
- * <ul>
- * <li>Only the current key is present: its value is used and nothing is
- * logged.</li>
- * <li>Only the deprecated key is present: the current setting returns the
- * deprecated key's value, and a deprecation warning naming the deprecated
- * key is logged (the deprecation logger reports each key once per node).</li>
- * <li>Both keys are present: the current key's value is used and the
- * deprecated key's value is ignored, but the deprecation warning is still
- * logged, because {@code Setting} evaluates the fallback's raw value on
- * every read and the fallback finds its key in the settings.</li>
- * </ul>
- * The code reads only the current settings; attach and the namespace poll
- * write only the current keys. The deprecated settings are registered so an
- * {@code opensearch.yml} and an index whose cluster state carries the old
- * keys stay valid for one release.
+ * <p>The node settings live under {@code plugins.lance.*} and the index
+ * settings under {@code index.plugins.lance.*}.
  */
 public final class LanceSettings {
 
     private LanceSettings() {}
 
-    public static final Setting<String> TABLE_SETTING_DEPRECATED = Setting.simpleString(
-        "index.lance.table",
-        Setting.Property.IndexScope,
-        Setting.Property.Final,
-        Setting.Property.Deprecated
-    );
     public static final Setting<String> TABLE_SETTING = Setting.simpleString(
         LanceEngineFactory.TABLE_SETTING,
-        TABLE_SETTING_DEPRECATED,
         Setting.Property.IndexScope,
         Setting.Property.Final
     );
-    public static final Setting<String> PRIMARY_KEY_FIELD_SETTING_DEPRECATED = Setting.simpleString(
-        "index.lance.primary_key_field",
-        "",
-        Setting.Property.IndexScope,
-        Setting.Property.Final,
-        Setting.Property.Deprecated
-    );
     public static final Setting<String> PRIMARY_KEY_FIELD_SETTING = Setting.simpleString(
         LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING,
-        PRIMARY_KEY_FIELD_SETTING_DEPRECATED,
+        "",
         Setting.Property.IndexScope,
         Setting.Property.Final
     );
@@ -86,32 +52,16 @@ public final class LanceSettings {
      * setting has no meaning when
      * {@link #PRIMARY_KEY_FIELD_SETTING} is empty (the table has no PK).
      */
-    public static final Setting<String> PRIMARY_KEY_TYPE_SETTING_DEPRECATED = Setting.simpleString(
-        "index.lance.primary_key_type",
+    public static final Setting<String> PRIMARY_KEY_TYPE_SETTING = Setting.simpleString(
+        LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING,
         "long",
         LanceSettings::validatePrimaryKeyType,
         Setting.Property.IndexScope,
-        Setting.Property.Final,
-        Setting.Property.Deprecated
-    );
-    public static final Setting<String> PRIMARY_KEY_TYPE_SETTING = Setting.simpleString(
-        LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING,
-        LanceSettings::validatePrimaryKeyType,
-        PRIMARY_KEY_TYPE_SETTING_DEPRECATED,
-        Setting.Property.IndexScope,
         Setting.Property.Final
-    );
-    public static final Setting<Long> VERSION_SETTING_DEPRECATED = Setting.longSetting(
-        "index.lance.version",
-        -1L,
-        -1L,
-        Setting.Property.IndexScope,
-        Setting.Property.Final,
-        Setting.Property.Deprecated
     );
     public static final Setting<Long> VERSION_SETTING = Setting.longSetting(
         LanceEngineFactory.VERSION_SETTING,
-        VERSION_SETTING_DEPRECATED,
+        -1L,
         -1L,
         Setting.Property.IndexScope,
         Setting.Property.Final
@@ -126,16 +76,9 @@ public final class LanceSettings {
      * the next poll after the update refreshes the reader onto the
      * version the new tag points at.
      */
-    public static final Setting<String> TAG_SETTING_DEPRECATED = Setting.simpleString(
-        "index.lance.tag",
-        "",
-        Setting.Property.IndexScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<String> TAG_SETTING = Setting.simpleString(
         LanceEngineFactory.TAG_SETTING,
-        TAG_SETTING_DEPRECATED,
+        "",
         Setting.Property.IndexScope,
         Setting.Property.Dynamic
     );
@@ -144,16 +87,9 @@ public final class LanceSettings {
      * engine can rehydrate keyword sub-fields on shard open. Empty
      * means no sub-fields declared.
      */
-    public static final Setting<String> MULTI_FIELDS_SETTING_DEPRECATED = Setting.simpleString(
-        "index.lance.multi_fields",
-        "",
-        Setting.Property.IndexScope,
-        Setting.Property.Final,
-        Setting.Property.Deprecated
-    );
     public static final Setting<String> MULTI_FIELDS_SETTING = Setting.simpleString(
         LanceEngineFactory.MULTI_FIELDS_SETTING,
-        MULTI_FIELDS_SETTING_DEPRECATED,
+        "",
         Setting.Property.IndexScope,
         Setting.Property.Final
     );
@@ -168,44 +104,22 @@ public final class LanceSettings {
      * overridden column (the override follows the column to its new
      * name) or resets one to a type the override no longer fits.
      */
-    public static final Setting<String> OVERRIDES_SETTING_DEPRECATED = Setting.simpleString(
-        "index.lance.overrides",
-        "",
-        Setting.Property.IndexScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<String> OVERRIDES_SETTING = Setting.simpleString(
         LanceEngineFactory.OVERRIDES_SETTING,
-        OVERRIDES_SETTING_DEPRECATED,
+        "",
         Setting.Property.IndexScope,
         Setting.Property.Dynamic
-    );
-    public static final Setting<String> UNCOVERED_FRAGMENT_POLICY_SETTING_DEPRECATED = Setting.simpleString(
-        "index.lance.uncovered_fragment_policy",
-        "immediate",
-        LanceSettings::validateUncoveredFragmentPolicy,
-        Setting.Property.IndexScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
     );
     public static final Setting<String> UNCOVERED_FRAGMENT_POLICY_SETTING = Setting.simpleString(
         LanceEngineFactory.UNCOVERED_FRAGMENT_POLICY_SETTING,
+        "immediate",
         LanceSettings::validateUncoveredFragmentPolicy,
-        UNCOVERED_FRAGMENT_POLICY_SETTING_DEPRECATED,
         Setting.Property.IndexScope,
         Setting.Property.Dynamic
     );
-    public static final Setting<TimeValue> NAMESPACE_POLL_CADENCE_SETTING_DEPRECATED = Setting.timeSetting(
-        "lance.namespace.poll_cadence",
-        TimeValue.timeValueSeconds(10),
-        TimeValue.timeValueSeconds(1),
-        Setting.Property.NodeScope,
-        Setting.Property.Deprecated
-    );
     public static final Setting<TimeValue> NAMESPACE_POLL_CADENCE_SETTING = Setting.timeSetting(
         "plugins.lance.namespace.poll_cadence",
-        NAMESPACE_POLL_CADENCE_SETTING_DEPRECATED,
+        TimeValue.timeValueSeconds(10),
         TimeValue.timeValueSeconds(1),
         Setting.Property.NodeScope
     );
@@ -218,31 +132,16 @@ public final class LanceSettings {
      * indexes that were surfaced or attached by this plugin; ordinary
      * OpenSearch indexes are never in the tombstone list.
      */
-    public static final Setting<TimeValue> NAMESPACE_RESURFACE_GRACE_SETTING_DEPRECATED = Setting.timeSetting(
-        "lance.namespace.resurface_guard_grace",
-        TimeValue.timeValueHours(1),
-        TimeValue.timeValueMillis(0),
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<TimeValue> NAMESPACE_RESURFACE_GRACE_SETTING = Setting.timeSetting(
         "plugins.lance.namespace.resurface_guard_grace",
-        NAMESPACE_RESURFACE_GRACE_SETTING_DEPRECATED,
+        TimeValue.timeValueHours(1),
         TimeValue.timeValueMillis(0),
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
-    public static final Setting<List<String>> ALLOWED_TABLE_ROOTS_SETTING_DEPRECATED = Setting.listSetting(
-        "lance.allowed_table_roots",
-        List.of(),
-        Function.identity(),
-        Setting.Property.NodeScope,
-        Setting.Property.Deprecated
-    );
     public static final Setting<List<String>> ALLOWED_TABLE_ROOTS_SETTING = Setting.listSetting(
         "plugins.lance.allowed_table_roots",
-        ALLOWED_TABLE_ROOTS_SETTING_DEPRECATED,
+        List.of(),
         Function.identity(),
         Setting.Property.NodeScope
     );
@@ -258,15 +157,8 @@ public final class LanceSettings {
         Function.identity(),
         Setting.Property.NodeScope
     );
-    public static final Setting<Settings> STORAGE_OPTIONS_SETTING_DEPRECATED = Setting.groupSetting(
-        StorageOptions.DEPRECATED_INDEX_SETTING_PREFIX,
-        Setting.Property.IndexScope,
-        Setting.Property.Final,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Settings> STORAGE_OPTIONS_SETTING = Setting.groupSetting(
         StorageOptions.INDEX_SETTING_PREFIX,
-        STORAGE_OPTIONS_SETTING_DEPRECATED,
         Setting.Property.IndexScope,
         Setting.Property.Final
     );
@@ -286,17 +178,10 @@ public final class LanceSettings {
      * setting is node-scoped only, so a change requires a rolling
      * restart to take effect.
      */
-    public static final Setting<String> NATIVE_MEMORY_LIMIT_SETTING_DEPRECATED = Setting.simpleString(
-        "lance.native_memory.limit",
-        "40%",
-        LanceSettings::validateNativeMemoryLimit,
-        Setting.Property.NodeScope,
-        Setting.Property.Deprecated
-    );
     public static final Setting<String> NATIVE_MEMORY_LIMIT_SETTING = Setting.simpleString(
         "plugins.lance.native_memory.limit",
+        "40%",
         LanceSettings::validateNativeMemoryLimit,
-        NATIVE_MEMORY_LIMIT_SETTING_DEPRECATED,
         Setting.Property.NodeScope
     );
 
@@ -310,16 +195,9 @@ public final class LanceSettings {
      * the Session cache limit so operators have one number to reason
      * about.
      */
-    public static final Setting<Boolean> NATIVE_MEMORY_CB_ENABLED_SETTING_DEPRECATED = Setting.boolSetting(
-        "lance.native_memory.circuit_breaker.enabled",
-        true,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Boolean> NATIVE_MEMORY_CB_ENABLED_SETTING = Setting.boolSetting(
         "plugins.lance.native_memory.circuit_breaker.enabled",
-        NATIVE_MEMORY_CB_ENABLED_SETTING_DEPRECATED,
+        true,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -333,17 +211,9 @@ public final class LanceSettings {
      * far behind the real footprint. Node scoped and dynamic so
      * operators can tune it without a restart.
      */
-    public static final Setting<TimeValue> NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING_DEPRECATED = Setting.timeSetting(
-        "lance.native_memory.circuit_breaker.poll_interval",
-        TimeValue.timeValueSeconds(5),
-        TimeValue.timeValueSeconds(1),
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<TimeValue> NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING = Setting.timeSetting(
         "plugins.lance.native_memory.circuit_breaker.poll_interval",
-        NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING_DEPRECATED,
+        TimeValue.timeValueSeconds(5),
         TimeValue.timeValueSeconds(1),
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
@@ -371,17 +241,9 @@ public final class LanceSettings {
      * because the underlying semaphore's permit count is fixed at
      * plugin init.
      */
-    public static final Setting<Integer> FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING_DEPRECATED = Setting.intSetting(
-        "lance.fragment_dispatch.max_concurrent",
-        4,
-        1,
-        128,
-        Setting.Property.NodeScope,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Integer> FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING = Setting.intSetting(
         "plugins.lance.fragment_dispatch.max_concurrent",
-        FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING_DEPRECATED,
+        4,
         1,
         128,
         Setting.Property.NodeScope
@@ -396,16 +258,9 @@ public final class LanceSettings {
      * off retires every snapshot at once and later requests open the
      * table per request as before.
      */
-    public static final Setting<Boolean> CACHE_ENABLED_SETTING_DEPRECATED = Setting.boolSetting(
-        "lance.cache.enabled",
-        true,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Boolean> CACHE_ENABLED_SETTING = Setting.boolSetting(
         "plugins.lance.cache.enabled",
-        CACHE_ENABLED_SETTING_DEPRECATED,
+        true,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -416,16 +271,9 @@ public final class LanceSettings {
      * holds. Each snapshot is one open Lance dataset plus a few kilobytes
      * of metadata per fragment. Static, node scope.
      */
-    public static final Setting<Integer> CACHE_MAX_SNAPSHOTS_SETTING_DEPRECATED = Setting.intSetting(
-        "lance.cache.max_snapshots",
-        64,
-        1,
-        Setting.Property.NodeScope,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Integer> CACHE_MAX_SNAPSHOTS_SETTING = Setting.intSetting(
         "plugins.lance.cache.max_snapshots",
-        CACHE_MAX_SNAPSHOTS_SETTING_DEPRECATED,
+        64,
         1,
         Setting.Property.NodeScope
     );
@@ -435,17 +283,9 @@ public final class LanceSettings {
      * off-heap column cache. The remainder goes to the Lance Session's
      * index and metadata caches in their 6:1 ratio. Static, node scope.
      */
-    public static final Setting<Double> CACHE_COLUMN_SHARE_SETTING_DEPRECATED = Setting.doubleSetting(
-        "lance.cache.column_share",
-        0.4,
-        0.0,
-        0.95,
-        Setting.Property.NodeScope,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Double> CACHE_COLUMN_SHARE_SETTING = Setting.doubleSetting(
         "plugins.lance.cache.column_share",
-        CACHE_COLUMN_SHARE_SETTING_DEPRECATED,
+        0.4,
         0.0,
         0.95,
         Setting.Property.NodeScope
@@ -459,16 +299,9 @@ public final class LanceSettings {
      * version ({@link org.opensearch.lance.dispatch.LanceRequestCache}). Dynamic: turning it off drops
      * every entry.
      */
-    public static final Setting<Boolean> REQUEST_CACHE_ENABLED_SETTING_DEPRECATED = Setting.boolSetting(
-        "lance.request_cache.enabled",
-        true,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Boolean> REQUEST_CACHE_ENABLED_SETTING = Setting.boolSetting(
         "plugins.lance.request_cache.enabled",
-        REQUEST_CACHE_ENABLED_SETTING_DEPRECATED,
+        true,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -478,15 +311,9 @@ public final class LanceSettings {
      * or a percentage of the heap; the same default as
      * {@code indices.requests.cache.size}. Static, node scope.
      */
-    public static final Setting<ByteSizeValue> REQUEST_CACHE_SIZE_SETTING_DEPRECATED = Setting.memorySizeSetting(
-        "lance.request_cache.size",
-        "1%",
-        Setting.Property.NodeScope,
-        Setting.Property.Deprecated
-    );
     public static final Setting<ByteSizeValue> REQUEST_CACHE_SIZE_SETTING = Setting.memorySizeSetting(
         "plugins.lance.request_cache.size",
-        REQUEST_CACHE_SIZE_SETTING_DEPRECATED,
+        "1%",
         Setting.Property.NodeScope
     );
 
@@ -494,15 +321,9 @@ public final class LanceSettings {
      * The largest answer the coordinator result cache stores, measured as
      * the serialised size of the reduced aggregations. Static, node scope.
      */
-    public static final Setting<ByteSizeValue> REQUEST_CACHE_MAX_ENTRY_SIZE_SETTING_DEPRECATED = Setting.byteSizeSetting(
-        "lance.request_cache.max_entry_size",
-        new ByteSizeValue(1, ByteSizeUnit.MB),
-        Setting.Property.NodeScope,
-        Setting.Property.Deprecated
-    );
     public static final Setting<ByteSizeValue> REQUEST_CACHE_MAX_ENTRY_SIZE_SETTING = Setting.byteSizeSetting(
         "plugins.lance.request_cache.max_entry_size",
-        REQUEST_CACHE_MAX_ENTRY_SIZE_SETTING_DEPRECATED,
+        new ByteSizeValue(1, ByteSizeUnit.MB),
         Setting.Property.NodeScope
     );
 
@@ -511,16 +332,9 @@ public final class LanceSettings {
      * it was stored; zero (the default) keeps it until the table moves to
      * another version or the cache evicts it. Dynamic.
      */
-    public static final Setting<TimeValue> REQUEST_CACHE_EXPIRE_SETTING_DEPRECATED = Setting.positiveTimeSetting(
-        "lance.request_cache.expire",
-        TimeValue.ZERO,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<TimeValue> REQUEST_CACHE_EXPIRE_SETTING = Setting.positiveTimeSetting(
         "plugins.lance.request_cache.expire",
-        REQUEST_CACHE_EXPIRE_SETTING_DEPRECATED,
+        TimeValue.ZERO,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -532,16 +346,9 @@ public final class LanceSettings {
      * ({@link org.opensearch.lance.engine.LanceFetchCache}). Dynamic: turning it off drops every
      * entry.
      */
-    public static final Setting<Boolean> FETCH_CACHE_ENABLED_SETTING_DEPRECATED = Setting.boolSetting(
-        "lance.fetch_cache.enabled",
-        true,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Boolean> FETCH_CACHE_ENABLED_SETTING = Setting.boolSetting(
         "plugins.lance.fetch_cache.enabled",
-        FETCH_CACHE_ENABLED_SETTING_DEPRECATED,
+        true,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -551,15 +358,9 @@ public final class LanceSettings {
      * percentage of the heap; the same default as
      * {@code indices.requests.cache.size}. Static, node scope.
      */
-    public static final Setting<ByteSizeValue> FETCH_CACHE_SIZE_SETTING_DEPRECATED = Setting.memorySizeSetting(
-        "lance.fetch_cache.size",
-        "1%",
-        Setting.Property.NodeScope,
-        Setting.Property.Deprecated
-    );
     public static final Setting<ByteSizeValue> FETCH_CACHE_SIZE_SETTING = Setting.memorySizeSetting(
         "plugins.lance.fetch_cache.size",
-        FETCH_CACHE_SIZE_SETTING_DEPRECATED,
+        "1%",
         Setting.Property.NodeScope
     );
 
@@ -568,15 +369,9 @@ public final class LanceSettings {
      * decoded value's heap; a larger cell (a long text, a wide struct)
      * is taken on every request. Static, node scope.
      */
-    public static final Setting<ByteSizeValue> FETCH_CACHE_MAX_ENTRY_SIZE_SETTING_DEPRECATED = Setting.byteSizeSetting(
-        "lance.fetch_cache.max_entry_size",
-        new ByteSizeValue(256, ByteSizeUnit.KB),
-        Setting.Property.NodeScope,
-        Setting.Property.Deprecated
-    );
     public static final Setting<ByteSizeValue> FETCH_CACHE_MAX_ENTRY_SIZE_SETTING = Setting.byteSizeSetting(
         "plugins.lance.fetch_cache.max_entry_size",
-        FETCH_CACHE_MAX_ENTRY_SIZE_SETTING_DEPRECATED,
+        new ByteSizeValue(256, ByteSizeUnit.KB),
         Setting.Property.NodeScope
     );
 
@@ -585,16 +380,9 @@ public final class LanceSettings {
      * zero (the default) keeps it until its table version's snapshot
      * closes, its index is deleted or the cache evicts it. Dynamic.
      */
-    public static final Setting<TimeValue> FETCH_CACHE_EXPIRE_SETTING_DEPRECATED = Setting.positiveTimeSetting(
-        "lance.fetch_cache.expire",
-        TimeValue.ZERO,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<TimeValue> FETCH_CACHE_EXPIRE_SETTING = Setting.positiveTimeSetting(
         "plugins.lance.fetch_cache.expire",
-        FETCH_CACHE_EXPIRE_SETTING_DEPRECATED,
+        TimeValue.ZERO,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -611,17 +399,9 @@ public final class LanceSettings {
      * {@code _rowid} prefilter read. Dynamic: the next scan picks up
      * a new value. See {@link LanceFtsQuery}.
      */
-    public static final Setting<Integer> FTS_SUBSET_PROBE_LIMIT_SETTING_DEPRECATED = Setting.intSetting(
-        "lance.fts.subset_probe_limit",
-        LanceFtsQuery.DEFAULT_SUBSET_PROBE_LIMIT,
-        1,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Integer> FTS_SUBSET_PROBE_LIMIT_SETTING = Setting.intSetting(
         "plugins.lance.fts.subset_probe_limit",
-        FTS_SUBSET_PROBE_LIMIT_SETTING_DEPRECATED,
+        LanceFtsQuery.DEFAULT_SUBSET_PROBE_LIMIT,
         1,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
@@ -636,18 +416,9 @@ public final class LanceSettings {
      * the default is in {@link LanceFtsQuery#effectiveSubsetProbeLimit}.
      * Dynamic.
      */
-    public static final Setting<Double> FTS_SUBSET_PROBE_RATIO_SETTING_DEPRECATED = Setting.doubleSetting(
-        "lance.fts.subset_probe_ratio",
-        LanceFtsQuery.DEFAULT_SUBSET_PROBE_RATIO,
-        0d,
-        1d,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Double> FTS_SUBSET_PROBE_RATIO_SETTING = Setting.doubleSetting(
         "plugins.lance.fts.subset_probe_ratio",
-        FTS_SUBSET_PROBE_RATIO_SETTING_DEPRECATED,
+        LanceFtsQuery.DEFAULT_SUBSET_PROBE_RATIO,
         0d,
         1d,
         Setting.Property.NodeScope,
@@ -659,17 +430,9 @@ public final class LanceSettings {
      * hit queries stay on the whole table lookup whatever the ratio
      * gives. Dynamic.
      */
-    public static final Setting<Integer> FTS_SUBSET_PROBE_MIN_ROWS_SETTING_DEPRECATED = Setting.intSetting(
-        "lance.fts.subset_probe_min_rows",
-        LanceFtsQuery.DEFAULT_SUBSET_PROBE_MIN_ROWS,
-        1,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Integer> FTS_SUBSET_PROBE_MIN_ROWS_SETTING = Setting.intSetting(
         "plugins.lance.fts.subset_probe_min_rows",
-        FTS_SUBSET_PROBE_MIN_ROWS_SETTING_DEPRECATED,
+        LanceFtsQuery.DEFAULT_SUBSET_PROBE_MIN_ROWS,
         1,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
@@ -685,16 +448,9 @@ public final class LanceSettings {
      * the behaviour that let a large enough table end the node with a
      * kernel OOM kill. Dynamic. See {@link ScanAdmission}.
      */
-    public static final Setting<Boolean> ADMISSION_ENABLED_SETTING_DEPRECATED = Setting.boolSetting(
-        "lance.admission.enabled",
-        true,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Boolean> ADMISSION_ENABLED_SETTING = Setting.boolSetting(
         "plugins.lance.admission.enabled",
-        ADMISSION_ENABLED_SETTING_DEPRECATED,
+        true,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -705,19 +461,11 @@ public final class LanceSettings {
      * {@code MemAvailable - headroom} plus the memory earlier admitted
      * scans retained. Dynamic.
      */
-    public static final Setting<ByteSizeValue> ADMISSION_HEADROOM_SETTING_DEPRECATED = Setting.byteSizeSetting(
-        "lance.admission.headroom",
+    public static final Setting<ByteSizeValue> ADMISSION_HEADROOM_SETTING = Setting.byteSizeSetting(
+        "plugins.lance.admission.headroom",
         ScanAdmission.DEFAULT_HEADROOM,
         ByteSizeValue.ZERO,
         new ByteSizeValue(Long.MAX_VALUE),
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
-    public static final Setting<ByteSizeValue> ADMISSION_HEADROOM_SETTING = new Setting<>(
-        "plugins.lance.admission.headroom",
-        ADMISSION_HEADROOM_SETTING_DEPRECATED,
-        new Setting.ByteSizeValueParser(ByteSizeValue.ZERO, new ByteSizeValue(Long.MAX_VALUE), "plugins.lance.admission.headroom"),
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -733,16 +481,9 @@ public final class LanceSettings {
      * filter page is then judged on its limit). Dynamic. See
      * {@link ScanAdmission}.
      */
-    public static final Setting<Boolean> ADMISSION_BOUNDED_SHAPES_GATED_SETTING_DEPRECATED = Setting.boolSetting(
-        "lance.admission.bounded_shapes_gated",
-        true,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Boolean> ADMISSION_BOUNDED_SHAPES_GATED_SETTING = Setting.boolSetting(
         "plugins.lance.admission.bounded_shapes_gated",
-        ADMISSION_BOUNDED_SHAPES_GATED_SETTING_DEPRECATED,
+        true,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -755,23 +496,11 @@ public final class LanceSettings {
      * table's indexes and scans as not fitting the cache; do not change
      * it on a real node. Dynamic.
      */
-    public static final Setting<ByteSizeValue> TEST_INDEX_CACHE_SHARD_SHARE_SETTING_DEPRECATED = Setting.byteSizeSetting(
-        "lance.test.index_cache_shard_share",
+    public static final Setting<ByteSizeValue> TEST_INDEX_CACHE_SHARD_SHARE_SETTING = Setting.byteSizeSetting(
+        "plugins.lance.test.index_cache_shard_share",
         ByteSizeValue.ZERO,
         ByteSizeValue.ZERO,
         new ByteSizeValue(Long.MAX_VALUE),
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
-    public static final Setting<ByteSizeValue> TEST_INDEX_CACHE_SHARD_SHARE_SETTING = new Setting<>(
-        "plugins.lance.test.index_cache_shard_share",
-        TEST_INDEX_CACHE_SHARD_SHARE_SETTING_DEPRECATED,
-        new Setting.ByteSizeValueParser(
-            ByteSizeValue.ZERO,
-            new ByteSizeValue(Long.MAX_VALUE),
-            "plugins.lance.test.index_cache_shard_share"
-        ),
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -785,17 +514,9 @@ public final class LanceSettings {
      * admission and the reading at the scan's completion) and prove the
      * retained credit; do not set it on a real node. Dynamic.
      */
-    public static final Setting<List<String>> TEST_ADMISSION_AVAILABLE_MEMORY_SETTING_DEPRECATED = Setting.listSetting(
-        "lance.test.admission_available_memory",
-        List.of(),
-        raw -> ByteSizeValue.parseBytesSizeValue(raw, "lance.test.admission_available_memory").getStringRep(),
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<List<String>> TEST_ADMISSION_AVAILABLE_MEMORY_SETTING = Setting.listSetting(
         "plugins.lance.test.admission_available_memory",
-        TEST_ADMISSION_AVAILABLE_MEMORY_SETTING_DEPRECATED,
+        List.of(),
         raw -> ByteSizeValue.parseBytesSizeValue(raw, "plugins.lance.test.admission_available_memory").getStringRep(),
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
@@ -810,17 +531,9 @@ public final class LanceSettings {
      * plans without them and the {@code GET /_plugins/_lance/stats} counters that
      * record it; do not set it on a real node. Dynamic.
      */
-    public static final Setting<TimeValue> TEST_STATISTICS_COLLECT_DELAY_SETTING_DEPRECATED = Setting.timeSetting(
-        "lance.test.statistics_collect_delay",
-        TimeValue.ZERO,
-        TimeValue.ZERO,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<TimeValue> TEST_STATISTICS_COLLECT_DELAY_SETTING = Setting.timeSetting(
         "plugins.lance.test.statistics_collect_delay",
-        TEST_STATISTICS_COLLECT_DELAY_SETTING_DEPRECATED,
+        TimeValue.ZERO,
         TimeValue.ZERO,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
@@ -863,16 +576,9 @@ public final class LanceSettings {
      * leaf readers. Dynamic so the two paths can be compared without a
      * restart.
      */
-    public static final Setting<Boolean> AGGREGATION_PUSHDOWN_SETTING_DEPRECATED = Setting.boolSetting(
-        "lance.aggregation.pushdown",
-        true,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Boolean> AGGREGATION_PUSHDOWN_SETTING = Setting.boolSetting(
         "plugins.lance.aggregation.pushdown",
-        AGGREGATION_PUSHDOWN_SETTING_DEPRECATED,
+        true,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -893,18 +599,9 @@ public final class LanceSettings {
      * the concurrent hash tables bounded on large hosts. 1 restores the
      * single scan.
      */
-    public static final Setting<Integer> AGGREGATION_PUSHDOWN_PARALLELISM_SETTING_DEPRECATED = Setting.intSetting(
-        "lance.aggregation.pushdown_parallelism",
-        Math.max(1, Math.min(32, NativeMemoryLimit.availableCpus() / 2)),
-        1,
-        32,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Integer> AGGREGATION_PUSHDOWN_PARALLELISM_SETTING = Setting.intSetting(
         "plugins.lance.aggregation.pushdown_parallelism",
-        AGGREGATION_PUSHDOWN_PARALLELISM_SETTING_DEPRECATED,
+        Math.max(1, Math.min(32, NativeMemoryLimit.availableCpus() / 2)),
         1,
         32,
         Setting.Property.NodeScope,
@@ -921,16 +618,9 @@ public final class LanceSettings {
      * would hold them all. Static: the executor reads it from the node
      * settings when it plans a request.
      */
-    public static final Setting<Integer> AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING_DEPRECATED = Setting.intSetting(
-        "lance.aggregation.pushdown_max_groups",
-        1_000_000,
-        1,
-        Setting.Property.NodeScope,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Integer> AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING = Setting.intSetting(
         "plugins.lance.aggregation.pushdown_max_groups",
-        AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING_DEPRECATED,
+        1_000_000,
         1,
         Setting.Property.NodeScope
     );
@@ -954,18 +644,9 @@ public final class LanceSettings {
      * trade-off can be tuned without a restart; the executor reads it
      * when it plans a request.
      */
-    public static final Setting<Integer> AGGREGATION_PERCENTILES_BINS_SETTING_DEPRECATED = Setting.intSetting(
-        "lance.aggregation.percentiles_bins",
-        4096,
-        16,
-        1_000_000,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Integer> AGGREGATION_PERCENTILES_BINS_SETTING = Setting.intSetting(
         "plugins.lance.aggregation.percentiles_bins",
-        AGGREGATION_PERCENTILES_BINS_SETTING_DEPRECATED,
+        4096,
         16,
         1_000_000,
         Setting.Property.NodeScope,
@@ -988,18 +669,9 @@ public final class LanceSettings {
      * proportionally more retained groups per scan. Dynamic; the
      * executor reads it when it plans a request.
      */
-    public static final Setting<Integer> AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING_DEPRECATED = Setting.intSetting(
-        "lance.aggregation.pushdown_topk_slack",
-        4,
-        1,
-        64,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Integer> AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING = Setting.intSetting(
         "plugins.lance.aggregation.pushdown_topk_slack",
-        AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING_DEPRECATED,
+        4,
         1,
         64,
         Setting.Property.NodeScope,
@@ -1020,18 +692,9 @@ public final class LanceSettings {
      * the same reason: each scan already keeps Lance's decode threads
      * busy next to the consuming thread. 1 restores the single scan.
      */
-    public static final Setting<Integer> FRAGMENT_PATH_PARALLELISM_SETTING_DEPRECATED = Setting.intSetting(
-        "lance.fragment_path.parallelism",
-        Math.max(1, Math.min(32, NativeMemoryLimit.availableCpus() / 2)),
-        1,
-        32,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Integer> FRAGMENT_PATH_PARALLELISM_SETTING = Setting.intSetting(
         "plugins.lance.fragment_path.parallelism",
-        FRAGMENT_PATH_PARALLELISM_SETTING_DEPRECATED,
+        Math.max(1, Math.min(32, NativeMemoryLimit.availableCpus() / 2)),
         1,
         32,
         Setting.Property.NodeScope,
@@ -1054,18 +717,9 @@ public final class LanceSettings {
      * collects on the request's thread alone, in fragment order, and
      * reduces nothing, which is the behaviour before slicing existed.
      */
-    public static final Setting<Integer> FRAGMENT_PATH_SLICES_SETTING_DEPRECATED = Setting.intSetting(
-        "lance.fragment_path.slices",
-        Math.max(1, Math.min(32, NativeMemoryLimit.availableCpus() / 2)),
-        1,
-        32,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Integer> FRAGMENT_PATH_SLICES_SETTING = Setting.intSetting(
         "plugins.lance.fragment_path.slices",
-        FRAGMENT_PATH_SLICES_SETTING_DEPRECATED,
+        Math.max(1, Math.min(32, NativeMemoryLimit.availableCpus() / 2)),
         1,
         32,
         Setting.Property.NodeScope,
@@ -1104,17 +758,9 @@ public final class LanceSettings {
      * every bitmap and every IVF partition. Dynamic: warm-ups started
      * after the change use the new value.
      */
-    public static final Setting<LanceIndexWarmer.Mode> ATTACH_WARM_INDEXES_SETTING_DEPRECATED = new Setting<>(
-        "lance.attach.warm_indexes",
-        LanceIndexWarmer.Mode.METADATA.settingValue(),
-        LanceIndexWarmer.Mode::parse,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<LanceIndexWarmer.Mode> ATTACH_WARM_INDEXES_SETTING = new Setting<>(
         "plugins.lance.attach.warm_indexes",
-        ATTACH_WARM_INDEXES_SETTING_DEPRECATED,
+        LanceIndexWarmer.Mode.METADATA.settingValue(),
         LanceIndexWarmer.Mode::parse,
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
@@ -1135,18 +781,9 @@ public final class LanceSettings {
      * and the dispatch filter read it per request, the engine at every
      * reader open.
      */
-    public static final Setting<Long> MAX_DOCS_PER_READER_SETTING_DEPRECATED = Setting.longSetting(
-        "lance.test.max_docs_per_reader",
-        IndexWriter.MAX_DOCS,
-        1L,
-        IndexWriter.MAX_DOCS,
-        Setting.Property.NodeScope,
-        Setting.Property.Dynamic,
-        Setting.Property.Deprecated
-    );
     public static final Setting<Long> MAX_DOCS_PER_READER_SETTING = Setting.longSetting(
         "plugins.lance.test.max_docs_per_reader",
-        MAX_DOCS_PER_READER_SETTING_DEPRECATED,
+        IndexWriter.MAX_DOCS,
         1L,
         IndexWriter.MAX_DOCS,
         Setting.Property.NodeScope,
@@ -1187,9 +824,9 @@ public final class LanceSettings {
         NativeMemoryLimit.parse(value, "plugins.lance.native_memory.limit");
     }
 
-    /** Every setting of the plugin, the current keys first and then the deprecated ones. */
+    /** Every setting of the plugin. */
     public static List<Setting<?>> all() {
-        List<Setting<?>> current = List.of(
+        return List.of(
             TABLE_SETTING,
             PRIMARY_KEY_FIELD_SETTING,
             PRIMARY_KEY_TYPE_SETTING,
@@ -1239,56 +876,5 @@ public final class LanceSettings {
             ATTACH_WARM_INDEXES_SETTING,
             MAX_DOCS_PER_READER_SETTING
         );
-        List<Setting<?>> deprecated = List.of(
-            TABLE_SETTING_DEPRECATED,
-            PRIMARY_KEY_FIELD_SETTING_DEPRECATED,
-            PRIMARY_KEY_TYPE_SETTING_DEPRECATED,
-            VERSION_SETTING_DEPRECATED,
-            TAG_SETTING_DEPRECATED,
-            MULTI_FIELDS_SETTING_DEPRECATED,
-            OVERRIDES_SETTING_DEPRECATED,
-            UNCOVERED_FRAGMENT_POLICY_SETTING_DEPRECATED,
-            NAMESPACE_POLL_CADENCE_SETTING_DEPRECATED,
-            NAMESPACE_RESURFACE_GRACE_SETTING_DEPRECATED,
-            ALLOWED_TABLE_ROOTS_SETTING_DEPRECATED,
-            STORAGE_OPTIONS_SETTING_DEPRECATED,
-            NATIVE_MEMORY_LIMIT_SETTING_DEPRECATED,
-            NATIVE_MEMORY_CB_ENABLED_SETTING_DEPRECATED,
-            NATIVE_MEMORY_CB_POLL_INTERVAL_SETTING_DEPRECATED,
-            FRAGMENT_DISPATCH_MAX_CONCURRENT_SETTING_DEPRECATED,
-            CACHE_ENABLED_SETTING_DEPRECATED,
-            CACHE_MAX_SNAPSHOTS_SETTING_DEPRECATED,
-            CACHE_COLUMN_SHARE_SETTING_DEPRECATED,
-            REQUEST_CACHE_ENABLED_SETTING_DEPRECATED,
-            REQUEST_CACHE_SIZE_SETTING_DEPRECATED,
-            REQUEST_CACHE_MAX_ENTRY_SIZE_SETTING_DEPRECATED,
-            REQUEST_CACHE_EXPIRE_SETTING_DEPRECATED,
-            FETCH_CACHE_ENABLED_SETTING_DEPRECATED,
-            FETCH_CACHE_SIZE_SETTING_DEPRECATED,
-            FETCH_CACHE_MAX_ENTRY_SIZE_SETTING_DEPRECATED,
-            FETCH_CACHE_EXPIRE_SETTING_DEPRECATED,
-            FTS_SUBSET_PROBE_LIMIT_SETTING_DEPRECATED,
-            FTS_SUBSET_PROBE_RATIO_SETTING_DEPRECATED,
-            FTS_SUBSET_PROBE_MIN_ROWS_SETTING_DEPRECATED,
-            ADMISSION_ENABLED_SETTING_DEPRECATED,
-            ADMISSION_HEADROOM_SETTING_DEPRECATED,
-            ADMISSION_BOUNDED_SHAPES_GATED_SETTING_DEPRECATED,
-            TEST_INDEX_CACHE_SHARD_SHARE_SETTING_DEPRECATED,
-            TEST_ADMISSION_AVAILABLE_MEMORY_SETTING_DEPRECATED,
-            TEST_STATISTICS_COLLECT_DELAY_SETTING_DEPRECATED,
-            AGGREGATION_PUSHDOWN_SETTING_DEPRECATED,
-            AGGREGATION_PUSHDOWN_PARALLELISM_SETTING_DEPRECATED,
-            AGGREGATION_PUSHDOWN_MAX_GROUPS_SETTING_DEPRECATED,
-            AGGREGATION_PERCENTILES_BINS_SETTING_DEPRECATED,
-            AGGREGATION_PUSHDOWN_TOPK_SLACK_SETTING_DEPRECATED,
-            FRAGMENT_PATH_PARALLELISM_SETTING_DEPRECATED,
-            FRAGMENT_PATH_SLICES_SETTING_DEPRECATED,
-            ATTACH_WARM_INDEXES_SETTING_DEPRECATED,
-            MAX_DOCS_PER_READER_SETTING_DEPRECATED
-        );
-        List<Setting<?>> all = new ArrayList<>(current.size() + deprecated.size());
-        all.addAll(current);
-        all.addAll(deprecated);
-        return all;
     }
 }

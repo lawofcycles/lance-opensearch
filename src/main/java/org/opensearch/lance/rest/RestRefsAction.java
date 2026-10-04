@@ -31,8 +31,8 @@ public class RestRefsAction extends BaseRestHandler {
     }
 
     @Override
-    public List<ReplacedRoute> replacedRoutes() {
-        return List.of(new ReplacedRoute(RestRequest.Method.GET, "/_plugins/_lance/refs/{index}", "/_lance/refs/{index}"));
+    public List<Route> routes() {
+        return List.of(new Route(RestRequest.Method.GET, "/_plugins/_lance/refs/{index}"));
     }
 
     @Override

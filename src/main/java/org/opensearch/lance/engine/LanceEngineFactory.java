@@ -162,11 +162,9 @@ public final class LanceEngineFactory implements EngineFactory {
     /**
      * Keys of the index settings of a Lance backed index. Attach and the
      * namespace poll write these keys; the plugin registers them as
-     * {@code Setting} objects in {@code LancePlugin} with the deprecated
-     * {@code index.lance.*} keys of the first preview releases as their
-     * fallbacks, so the code reads the settings through those objects
+     * {@code Setting} objects in {@code LanceSettings}
      * ({@link org.opensearch.lance.LanceSettings#TABLE_SETTING} and its
-     * siblings) and an index created under the old keys keeps opening.
+     * siblings), and the code reads the settings through those objects.
      */
     public static final String TABLE_SETTING = "index.plugins.lance.table";
     public static final String PRIMARY_KEY_FIELD_SETTING = "index.plugins.lance.primary_key_field";
@@ -234,36 +232,25 @@ public final class LanceEngineFactory implements EngineFactory {
      */
     public static final String UNCOVERED_FRAGMENT_POLICY_SETTING = "index.plugins.lance.uncovered_fragment_policy";
 
-    /**
-     * Whether the settings describe a Lance backed index: a table is set
-     * under the current key or under the deprecated one.
-     */
+    /** Whether the settings describe a Lance backed index: a table is set. */
     public static boolean isLanceIndex(Settings settings) {
-        return LanceSettings.TABLE_SETTING.existsOrFallbackExists(settings);
+        return LanceSettings.TABLE_SETTING.exists(settings);
     }
 
     /**
      * The table of a Lance backed index, or {@code null} when the settings
-     * set no table under the current key or the deprecated one.
+     * set no table.
      */
     public static String tableOf(Settings settings) {
         return isLanceIndex(settings) ? LanceSettings.TABLE_SETTING.get(settings) : null;
     }
 
     /**
-     * Copy the plugin's index settings of {@code from} into {@code to}
-     * under the current keys. An index created under the deprecated
-     * {@code index.lance.*} keys is rewritten to the current keys; a
-     * current key wins over the deprecated one when both are present.
+     * Copy the plugin's index settings of {@code from} into {@code to}.
      * Used where the plugin recreates an index from the settings of an
-     * existing one, so the recreated index carries the current keys only.
+     * existing one, so only the plugin's own keys travel.
      */
     public static void copyLanceIndexSettings(Settings from, Settings.Builder to) {
-        for (String key : from.keySet()) {
-            if (key.startsWith(DEPRECATED_INDEX_SETTING_PREFIX)) {
-                to.put(INDEX_SETTING_PREFIX + key.substring(DEPRECATED_INDEX_SETTING_PREFIX.length()), from.get(key));
-            }
-        }
         for (String key : from.keySet()) {
             if (key.startsWith(INDEX_SETTING_PREFIX)) {
                 to.put(key, from.get(key));
@@ -271,10 +258,8 @@ public final class LanceEngineFactory implements EngineFactory {
         }
     }
 
-    /** Prefix of every current index setting of the plugin. */
+    /** Prefix of every index setting of the plugin. */
     public static final String INDEX_SETTING_PREFIX = "index.plugins.lance.";
-    /** Prefix of every deprecated index setting of the plugin. */
-    private static final String DEPRECATED_INDEX_SETTING_PREFIX = "index.lance.";
 
     /**
      * Arrow type kinds a Lance primary key column can take. Kept small on

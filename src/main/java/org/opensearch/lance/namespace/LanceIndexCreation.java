@@ -47,8 +47,7 @@ final class LanceIndexCreation {
         Settings.Builder settings = Settings.builder();
         // Copied key by key: the previous settings may be the shard's
         // merged node and index settings, and the node's secure settings
-        // must not travel into a CreateIndex request. An index created
-        // under the deprecated keys comes back under the current ones.
+        // must not travel into a CreateIndex request.
         LanceEngineFactory.copyLanceIndexSettings(carried, settings);
         settings.put("index.number_of_shards", 1)
             .put("index.number_of_replicas", 0)
