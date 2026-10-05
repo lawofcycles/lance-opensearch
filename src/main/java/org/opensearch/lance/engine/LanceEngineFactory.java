@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
@@ -32,6 +33,7 @@ import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.Bits;
 import org.lance.Dataset;
+import org.lance.Fragment;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.opensearch.common.SuppressForbidden;
@@ -73,16 +75,17 @@ import org.opensearch.lance.plan.explain.ReaderWrapperProbe;
  *       resolves the primary key through a Lance scalar-index-backed
  *       point lookup.</li>
  *   <li>Shard-level stats: {@link Engine#docStats()} reports the Lance row
- *       count, deletion count, and manifest-recorded data file total;
- *       {@link Engine#segmentsStats(boolean, boolean)} stays empty because
- *       there are no Lucene segments to describe.</li>
+ *       count, deletion count, and data file total of the manifest of
+ *       the version the index follows, read per call without the
+ *       reader; {@link Engine#segmentsStats(boolean, boolean)} stays
+ *       empty because there are no Lucene segments to describe.</li>
  *   <li>Refresh lifecycle: every searcher acquisition and
  *       {@link Engine#refresh(String)} advance the shared reader when
- *       the Lance manifest version advances, so {@code GET /_doc/{id}},
- *       {@code _stats}, and a {@code _search} whose target mixes a
- *       Lance backed index with an ordinary one (which the dispatch
- *       filter leaves to the stock search action) read the table's
- *       current version, as the fragment path does per request.</li>
+ *       the Lance manifest version advances, so {@code GET /_doc/{id}}
+ *       and a {@code _search} whose target mixes a Lance backed index
+ *       with an ordinary one (which the dispatch filter leaves to the
+ *       stock search action) read the table's current version, as the
+ *       fragment path does per request.</li>
  * </ul>
  *
  * <p>Under the hood, the empty Lucene commit created at shard bootstrap
@@ -391,6 +394,11 @@ public final class LanceEngineFactory implements EngineFactory {
         private final LongSupplier servedVersionEntry;
         /** The node's index services, asked for the reader wrapper by {@link #resolveOutsideReader}, or {@code null}. */
         private final IndicesService indicesService;
+        /** Doc stats of the last manifest {@link #docStats()} read, answered when the manifest cannot be read right now. */
+        private volatile DocsStats lastDocStats;
+        /** Held by the one caller of a pinned engine that reads the manifest; the rest wait for its publish. */
+        private final Object docStatsLock = new Object();
+        private final LongAdder docStatsManifestReads = new LongAdder();
 
         LanceReadOnlyEngine(
             EngineConfig config,
@@ -698,17 +706,17 @@ public final class LanceEngineFactory implements EngineFactory {
          * version. This is the one method every acquisition funnels
          * through ({@code Engine.acquireSearcher} and
          * {@code IndexShard.acquireSearcherSupplier} both call it), so
-         * {@code GET /_doc/{id}}, {@code _mget}, {@code _stats} and a
-         * {@code _search} over a target that mixes this index with one
-         * that is not Lance backed all see the version the fragment path
-         * reads for its own request. {@code refreshToCurrentVersion()}
+         * {@code GET /_doc/{id}}, {@code _mget} and a {@code _search}
+         * over a target that mixes this index with one that is not Lance
+         * backed all see the version the fragment path reads for its own
+         * request ({@link #docStats()} reads the manifest directly and
+         * acquires no searcher). {@code refreshToCurrentVersion()}
          * calls {@code maybeRefreshBlocking()} on the reader manager,
          * which costs one manifest read, the same the fragment path pays
          * per request; when the version did not move, the
          * {@link LanceReaderManager#refreshIfNeeded} it runs returns null
          * and the reader stays. Both scopes refresh because the engine
-         * has one reader manager and the only internal scope caller is
-         * {@link #docStats()}.
+         * has one reader manager.
          */
         @Override
         public SearcherSupplier acquireSearcherSupplier(Function<Searcher, Searcher> wrapper, SearcherScope scope) throws EngineException {
@@ -765,30 +773,97 @@ public final class LanceEngineFactory implements EngineFactory {
         // leave the ones tied to Lucene segment files empty, and never
         // delegate to Lucene.segmentReader.
         //
-        // count / deleted come from the leaves: each LanceFragmentLeafReader
-        // reports maxDoc = physical rows and numDocs = rows outside the
-        // fragment's deletion file, so the sums equal Dataset.countRows()
-        // and the manifest's deletion total for the served version.
-        // totalSizeInBytes is the manifest-recorded data file total the
-        // reader captured at open (LanceDirectoryReader.dataFileSizesOf).
-        // It is not what _cat/indices shows as store.size: that column is
-        // IndexShard.storeStats() -> Store.stats(), which sums the files in
-        // the shard's Lucene Directory (only the bootstrap commit here) and
-        // has no engine-level override in OpenSearch 3.8.
+        // count / deleted / totalSizeInBytes are read from the manifest of
+        // the version the index follows (pinned, tag, or latest, resolved
+        // as the coordinator does for a search), not from the shard reader:
+        // the reader holds at most the Lucene document bound of rows and
+        // counts nested children as docs, the manifest counts the table.
+        // One manifest open per call (once per engine when the version is
+        // pinned), the same cost the fragment path pays per request. The
+        // reader is neither acquired nor refreshed here.
+        //
+        // totalSizeInBytes is the manifest data file total. It is not
+        // what IndexShard.storeStats() reports as store.size: that is
+        // Store.stats(), the files in the shard's Lucene Directory (only
+        // the bootstrap commit here), and OpenSearch 3.8 has no
+        // engine-level override. LanceIndicesStatsActionFilter copies
+        // this total into the store group of the indices stats response
+        // on the coordinating node, so _stats and _cat show the table.
         @Override
         public DocsStats docStats() {
-            try (Searcher searcher = acquireSearcher("docStats", SearcherScope.INTERNAL)) {
-                long numDocs = 0;
-                long numDeletedDocs = 0;
-                for (LeafReaderContext ctx : searcher.getIndexReader().leaves()) {
-                    numDocs += ctx.reader().numDocs();
-                    numDeletedDocs += ctx.reader().numDeletedDocs();
-                }
-                return new DocsStats.Builder().count(numDocs)
-                    .deleted(numDeletedDocs)
-                    .totalSizeInBytes(LanceDirectoryReader.dataFileSizesOf(searcher.getIndexReader()).knownBytes())
-                    .build();
+            ensureOpen();
+            if (pinnedVersion.isEmpty()) {
+                return readDocStats();
             }
+            // A pinned version never changes, so the manifest read once
+            // answers every later call. Callers that arrive while the first
+            // read is in flight wait for it instead of opening the manifest
+            // themselves; after it is published nobody takes the lock.
+            DocsStats last = lastDocStats;
+            if (last != null) {
+                return last;
+            }
+            synchronized (docStatsLock) {
+                last = lastDocStats;
+                return last != null ? last : readDocStats();
+            }
+        }
+
+        /**
+         * Open the manifest of the version the index follows, build its
+         * doc stats and publish them as {@link #lastDocStats}. When the
+         * manifest cannot be read and a previous read exists, answer that.
+         */
+        private DocsStats readDocStats() {
+            docStatsManifestReads.increment();
+            try {
+                Optional<Long> target = pinnedVersion;
+                String currentTag = currentTag();
+                if (target.isEmpty() && currentTag != null) {
+                    target = Optional.of(LanceRegistry.resolveTagVersion(tablePath, storageOptions, currentTag));
+                }
+                try (
+                    Dataset dataset = target.isPresent()
+                        ? LanceRegistry.openDatasetAt(tablePath, storageOptions, target.get())
+                        : LanceRegistry.openDataset(tablePath, storageOptions)
+                ) {
+                    long deleted = 0L;
+                    for (Fragment fragment : dataset.getFragments()) {
+                        deleted += fragment.metadata().getNumDeletions();
+                    }
+                    DocsStats stats = new DocsStats.Builder().count(dataset.countRows())
+                        .deleted(deleted)
+                        .totalSizeInBytes(LanceTableSizes.dataFileBytes(dataset).knownBytes())
+                        .build();
+                    lastDocStats = stats;
+                    return stats;
+                }
+            } catch (RuntimeException e) {
+                // A manifest that cannot be read right now (object store
+                // error) answers with the last values this engine read, as
+                // refreshToCurrentVersion() keeps the reader it has, so one
+                // table's storage does not fail _nodes/stats for the node.
+                // The first call has nothing to fall back to and fails.
+                DocsStats fallback = lastDocStats;
+                if (fallback == null) {
+                    throw StorageOptions.redactCredentials(e);
+                }
+                LOG.warn(
+                    "Lance manifest read for doc stats failed for shard {}, reporting the last read values",
+                    config().getShardId(),
+                    StorageOptions.redactCredentials(e)
+                );
+                return fallback;
+            }
+        }
+
+        /**
+         * Times {@link #docStats()} went to the table for its values rather
+         * than answering from the values it had read; one per call unless the
+         * version is pinned, in which case one for the engine.
+         */
+        long docStatsManifestReads() {
+            return docStatsManifestReads.sum();
         }
 
         @Override

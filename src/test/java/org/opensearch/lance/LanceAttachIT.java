@@ -593,9 +593,9 @@ public class LanceAttachIT extends LanceRestTestCase {
         String tagIndex = tableName + "-tag";
         String pinnedIndex = tableName + "-pinned";
         // _search goes through the fragment path, where the coordinator
-        // resolves the tag itself; _stats docs.count reads the shard
-        // engine's reader, which follows the tag through the namespace
-        // poll. Both must agree.
+        // resolves the tag itself; _stats docs.count reads the manifest of
+        // the version the shard engine resolves the tag to. Both must
+        // agree.
         String fragmentBody = "{\"query\":{\"match_all\":{}},\"size\":0}";
         try {
             Response attachTag = postJson(

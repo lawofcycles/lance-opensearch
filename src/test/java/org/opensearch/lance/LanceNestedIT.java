@@ -220,13 +220,15 @@ public class LanceNestedIT extends LanceRestTestCase {
             String innerHitsBody = readAll(innerHits.getResponse());
             assertTrue("inner_hits refusal must name the feature: " + innerHitsBody, innerHitsBody.contains("inner_hits"));
 
-            // Stats: shard_reader_rows counts visible parents (5 live
-            // rows), nested_docs the hidden child docs (7 elements of
-            // the live rows), and the two sum to the reader's numDocs,
-            // which is what {index}/_stats reports as docs.count.
+            // Stats: {index}/_stats docs.count is the table's live row
+            // count from the manifest (5 parents), so it does not count
+            // the hidden child docs. GET /_plugins/_lance/stats reports
+            // shard_reader_rows (visible parents the reader holds) and
+            // nested_docs (hidden child docs, 7 elements of the live rows)
+            // separately.
             String docStats = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_stats/docs")));
             int numDocs = extractIntPath(docStats, "indices", indexName, "primaries", "docs", "count");
-            assertEquals("docs.count counts parents plus child docs: " + docStats, 12, numDocs);
+            assertEquals("docs.count counts the table's live rows: " + docStats, 5, numDocs);
             String lanceStats = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
             Map<String, Object> nodes = castMap(parseJson(lanceStats).get("nodes"));
             Map<String, Object> indices = castMap(castMap(nodes.values().iterator().next()).get("indices"));
@@ -235,11 +237,7 @@ public class LanceNestedIT extends LanceRestTestCase {
             int nestedDocs = ((Number) indexStats.get("nested_docs")).intValue();
             assertEquals("shard_reader_rows counts live parents: " + lanceStats, 5, shardReaderRows);
             assertEquals("nested_docs counts live child docs: " + lanceStats, 7, nestedDocs);
-            assertEquals(
-                "nested_docs plus shard_reader_rows is the reader's numDocs: " + lanceStats,
-                numDocs,
-                shardReaderRows + nestedDocs
-            );
+            assertEquals("shard_reader_rows agrees with docs.count: " + lanceStats, numDocs, shardReaderRows);
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));

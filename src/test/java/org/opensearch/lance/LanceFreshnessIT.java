@@ -219,7 +219,7 @@ public class LanceFreshnessIT extends LanceRestTestCase {
         return (Map<String, Object>) node.get("freshness");
     }
 
-    /** {@code docs.count} of the shard: the engine reader's view, which only the freshness check advances. */
+    /** {@code docs.count} of the shard: the live row count of the manifest of the version the index follows. */
     private static int engineDocCount(String indexName) throws IOException {
         String stats = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_stats/docs")));
         return extractIntPath(stats, "indices", indexName, "primaries", "docs", "count");

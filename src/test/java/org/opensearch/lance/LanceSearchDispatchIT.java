@@ -1775,9 +1775,10 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             ensureGreen(pkTable);
 
             // The shard reader holds the first fragment only; _stats
-            // counts it, _plugins/_lance/stats reports both figures.
+            // counts the table from the manifest regardless,
+            // _plugins/_lance/stats reports both figures.
             String docStats = readAll(client().performRequest(new Request("GET", "/" + tableName + "/_stats/docs")));
-            assertEquals(20, extractIntPath(docStats, "indices", tableName, "primaries", "docs", "count"));
+            assertEquals(120, extractIntPath(docStats, "indices", tableName, "primaries", "docs", "count"));
             String lanceStats = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
             Map<String, Object> nodes = castMap(parseJson(lanceStats).get("nodes"));
             Map<String, Object> indices = castMap(castMap(nodes.values().iterator().next()).get("indices"));
@@ -1821,7 +1822,16 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             client().performRequest(new Request("POST", "/" + pkTable + "/_open"));
             ensureGreen(pkTable);
             String pkDocStats = readAll(client().performRequest(new Request("GET", "/" + pkTable + "/_stats/docs")));
-            assertEquals(4, extractIntPath(pkDocStats, "indices", pkTable, "primaries", "docs", "count"));
+            assertEquals(12, extractIntPath(pkDocStats, "indices", pkTable, "primaries", "docs", "count"));
+            String pkLanceStats = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
+            Map<String, Object> pkNodes = castMap(parseJson(pkLanceStats).get("nodes"));
+            Map<String, Object> pkIndices = castMap(castMap(pkNodes.values().iterator().next()).get("indices"));
+            Map<String, Object> pkIndexStats = castMap(pkIndices.get(pkTable));
+            assertEquals(
+                "the reopened shard holds one fragment: " + pkLanceStats,
+                4,
+                ((Number) pkIndexStats.get("shard_reader_rows")).intValue()
+            );
             for (String key : List.of("alpha-0", "alpha-5", "alpha-11")) {
                 Response hit = client().performRequest(new Request("GET", "/" + pkTable + "/_doc/" + key));
                 assertEquals(200, hit.getStatusLine().getStatusCode());

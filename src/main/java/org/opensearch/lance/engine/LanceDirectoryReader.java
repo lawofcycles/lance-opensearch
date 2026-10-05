@@ -27,7 +27,6 @@ import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.lance.Dataset;
 import org.lance.Fragment;
-import org.lance.fragment.DataFile;
 import org.lance.index.IndexDescription;
 import org.lance.schema.LanceField;
 import org.opensearch.core.common.breaker.CircuitBreaker;
@@ -38,49 +37,6 @@ import org.opensearch.lance.query.LanceHitsAccounting;
 
 /** DirectoryReader whose leaves are Lance fragments. */
 public final class LanceDirectoryReader extends DirectoryReader {
-
-    /**
-     * Byte total the Lance manifest records for the data files behind a
-     * set of fragments.
-     *
-     * @param knownBytes       sum of {@code DataFile.getFileSizeBytes()} over
-     *                         every data file whose size the manifest
-     *                         records
-     * @param filesWithoutSize number of data files the manifest lists
-     *                         without a size (older writers did not record
-     *                         one); those files contribute nothing to
-     *                         {@code knownBytes}, so the total is a lower
-     *                         bound whenever this is non-zero
-     */
-    public record DataFileSizes(long knownBytes, int filesWithoutSize) {
-        public static final DataFileSizes NONE = new DataFileSizes(0L, 0);
-    }
-
-    /**
-     * Sum the manifest-recorded sizes of every data file the given fragments
-     * reference. Reads only the in-memory manifest ({@code Fragment.metadata()}
-     * is a field access on an already materialised {@code FragmentMetadata});
-     * no object-store request is made, which is why this runs on every
-     * reader open rather than {@code Dataset.calculateDataSize()}, which
-     * fetches each data file's footer. Data overlay files are included
-     * through {@code getReferencedLanceFiles()}; deletion files and index
-     * files are not data files and are left out.
-     */
-    public static DataFileSizes sumDataFileSizes(List<Fragment> fragments) {
-        long knownBytes = 0L;
-        int filesWithoutSize = 0;
-        for (Fragment fragment : fragments) {
-            for (DataFile dataFile : fragment.metadata().getReferencedLanceFiles()) {
-                Long size = dataFile.getFileSizeBytes();
-                if (size == null) {
-                    filesWithoutSize++;
-                } else {
-                    knownBytes += size;
-                }
-            }
-        }
-        return new DataFileSizes(knownBytes, filesWithoutSize);
-    }
 
     /**
      * Cut a sequence of fragments, given as their physical row counts in
@@ -133,10 +89,10 @@ public final class LanceDirectoryReader extends DirectoryReader {
     // reader holds every fragment and numDocs() is that count already.
     private final long liveRows;
     // Data file byte total of the fragments this reader exposes, computed
-    // once at open from the manifest the reader was built from. The engine
-    // reports it through DocsStats.totalSizeInBytes; a refresh that swaps
-    // in a new reader recomputes it for the new manifest version.
-    private final DataFileSizes dataFileSizes;
+    // once at open from the manifest the reader was built from
+    // (LanceTableSizes.dataFileBytes); a refresh that swaps in a new
+    // reader recomputes it for the new manifest version.
+    private final LanceTableSizes.DataFileSizes dataFileSizes;
     // The engine hands us a freshly opened Dataset when it builds a new reader,
     // so this reader takes ownership of it and closes it when the reader is
     // closed. Lucene's ReferenceManager releases the previous reader once the
@@ -279,7 +235,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
             null,
             cache,
             leaves,
-            sumDataFileSizes(fragments),
+            LanceTableSizes.dataFileBytes(fragments),
             tableRows(dataset, physicalRows, held)
         );
     }
@@ -408,7 +364,17 @@ public final class LanceDirectoryReader extends DirectoryReader {
         }
         // Per-request fragment readers do not report shard stats, so skip
         // the manifest walk here.
-        return openWithLeaves(directory, commit, dataset, true, null, cache, leaves, DataFileSizes.NONE, TableRows.FROM_LEAVES);
+        return openWithLeaves(
+            directory,
+            commit,
+            dataset,
+            true,
+            null,
+            cache,
+            leaves,
+            LanceTableSizes.DataFileSizes.NONE,
+            TableRows.FROM_LEAVES
+        );
     }
 
     /**
@@ -504,7 +470,17 @@ public final class LanceDirectoryReader extends DirectoryReader {
         for (LanceFragmentLeafReader raw : rawLeaves) {
             raw.setShardColumnCache(cache);
         }
-        return openWithLeaves(directory, null, dataset, false, null, cache, leaves, DataFileSizes.NONE, TableRows.FROM_LEAVES);
+        return openWithLeaves(
+            directory,
+            null,
+            dataset,
+            false,
+            null,
+            cache,
+            leaves,
+            LanceTableSizes.DataFileSizes.NONE,
+            TableRows.FROM_LEAVES
+        );
     }
 
     /**
@@ -621,7 +597,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
         LanceWarmCache.Lease lease,
         LanceShardColumnCache columnCache,
         List<LeafReader> leaves,
-        DataFileSizes dataFileSizes,
+        LanceTableSizes.DataFileSizes dataFileSizes,
         TableRows tableRows
     ) throws IOException {
         ByteBuffersDirectory bridgeDir = new ByteBuffersDirectory();
@@ -653,7 +629,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
         LanceWarmCache.Lease lease,
         LanceShardColumnCache columnCache,
         DirectoryReader cacheLifetimeBridge,
-        DataFileSizes dataFileSizes,
+        LanceTableSizes.DataFileSizes dataFileSizes,
         TableRows tableRows
     ) throws IOException {
         super(directory, leaves, null);
@@ -733,9 +709,11 @@ public final class LanceDirectoryReader extends DirectoryReader {
 
     /**
      * The {@link LanceDirectoryReader} behind an arbitrary reader handed
-     * out by the engine (unwrapping the {@link FilterDirectoryReader}
-     * chain as {@link #dataFileSizesOf} does), or {@code null} when the
-     * innermost reader is not one.
+     * out by the engine, or {@code null} when the innermost reader is not
+     * one. The shard searcher's reader is an
+     * {@code OpenSearchDirectoryReader} (and, with the security plugin, a
+     * further DLS / FLS wrapper) around the {@link LanceDirectoryReader},
+     * so the {@link FilterDirectoryReader} chain is unwrapped first.
      */
     public static LanceDirectoryReader unwrap(IndexReader reader) {
         if (reader instanceof DirectoryReader directoryReader
@@ -770,28 +748,12 @@ public final class LanceDirectoryReader extends DirectoryReader {
 
     /**
      * Manifest-recorded data file byte total of the fragments this reader
-     * exposes. {@link DataFileSizes#NONE} for readers opened through
-     * {@link #openForFragments}.
+     * exposes ({@link LanceTableSizes#dataFileBytes(List)} over them at
+     * open). {@link LanceTableSizes.DataFileSizes#NONE} for readers
+     * opened through {@link #openForFragments}.
      */
-    public DataFileSizes dataFileSizes() {
+    public LanceTableSizes.DataFileSizes dataFileSizes() {
         return dataFileSizes;
-    }
-
-    /**
-     * Resolve the {@link DataFileSizes} behind an arbitrary reader handed
-     * out by the engine. The shard searcher's reader is an
-     * {@code OpenSearchDirectoryReader} (and, with the security plugin, a
-     * further DLS / FLS wrapper) around the {@link LanceDirectoryReader}, so
-     * unwrap the {@link FilterDirectoryReader} chain first. Returns
-     * {@link DataFileSizes#NONE} when the innermost reader is not a
-     * {@link LanceDirectoryReader}.
-     */
-    public static DataFileSizes dataFileSizesOf(IndexReader reader) {
-        if (reader instanceof DirectoryReader directoryReader
-            && FilterDirectoryReader.unwrap(directoryReader) instanceof LanceDirectoryReader lanceReader) {
-            return lanceReader.dataFileSizes();
-        }
-        return DataFileSizes.NONE;
     }
 
     /**
@@ -807,7 +769,7 @@ public final class LanceDirectoryReader extends DirectoryReader {
     /**
      * Lance version of the snapshot behind an arbitrary reader handed out
      * by the engine (unwrapping the {@link FilterDirectoryReader} chain as
-     * {@link #dataFileSizesOf} does), or {@code -1} when the innermost
+     * {@link #unwrap} does), or {@code -1} when the innermost
      * reader holds no snapshot lease.
      */
     public static long snapshotVersionOf(IndexReader reader) {

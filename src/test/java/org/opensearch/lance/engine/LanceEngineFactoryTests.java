@@ -6,8 +6,11 @@
 package org.opensearch.lance.engine;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.lucene.index.IndexWriter;
@@ -226,7 +229,8 @@ public class LanceEngineFactoryTests extends EngineTestCase {
                 }
                 assertEquals(1, initial.refCount());
 
-                // The shard engine reads through the snapshot: _stats and GET.
+                // GET reads through the snapshot; docStats reads the same
+                // version's manifest and agrees with the snapshot's total.
                 DocsStats docStats = engine.docStats();
                 assertEquals(200, docStats.getCount());
                 assertEquals(0, docStats.getDeleted());
@@ -303,11 +307,12 @@ public class LanceEngineFactoryTests extends EngineTestCase {
     }
 
     public void testEveryReadSeesTheTableVersionAndKeepsTheReaderWhenItDidNotMove() throws Exception {
-        // GET and docStats refresh the reader before they read: a row
-        // committed to the table is answered by the next GET with no
-        // refresh call, and a read at an unchanged version opens nothing
-        // (the snapshot build count and the dataset open count of the
-        // cache stand still). A pinned engine never refreshes.
+        // GET refreshes the reader before it reads: a row committed to
+        // the table is answered by the next GET with no refresh call, and
+        // a read at an unchanged version opens nothing (the snapshot build
+        // count and the dataset open count of the cache stand still).
+        // docStats reads the manifest of the followed version and touches
+        // the reader not at all. A pinned engine never refreshes.
         Path scratchDir = createTempDir();
         String uri = LanceTableFactory.writeStringPkTable(scratchDir, "engine-fresh-" + getTestName(), 4, 2);
         long attached;
@@ -355,9 +360,14 @@ public class LanceEngineFactoryTests extends EngineTestCase {
                     assertEquals("reads at an unchanged version build no snapshot", opensAfterOpen, cache.datasetOpenCount());
                     assertEquals(attached, ((LanceEngineFactory.LanceReadOnlyEngine) engine).servedVersion());
 
-                    // alpha-4 and alpha-5 are committed: the next GET answers
-                    // alpha-5 and the next docStats counts six, no refresh call.
+                    // alpha-4 and alpha-5 are committed: docStats counts six
+                    // from the manifest while the reader still serves the
+                    // attached version, then the next GET answers alpha-5
+                    // and swaps the reader, no refresh call.
                     LanceTableFactory.appendStringPkRows(uri, 4, 2);
+                    assertEquals(6, engine.docStats().getCount());
+                    assertEquals("docStats acquires no searcher and swaps no reader", 1L, cache.snapshotBuildCount());
+                    assertEquals(attached, ((LanceEngineFactory.LanceReadOnlyEngine) engine).servedVersion());
                     try (
                         Engine.GetResult hit = engine.get(
                             new Engine.Get(true, true, "alpha-5", new Term("_id", "alpha-5")),
@@ -370,6 +380,11 @@ public class LanceEngineFactoryTests extends EngineTestCase {
                     assertEquals(attached + 1, ((LanceEngineFactory.LanceReadOnlyEngine) engine).servedVersion());
                     assertEquals(6, engine.docStats().getCount());
                     assertEquals(2L, cache.snapshotBuildCount());
+                    assertEquals(
+                        "a following engine reads the manifest on every call",
+                        3L,
+                        ((LanceEngineFactory.LanceReadOnlyEngine) engine).docStatsManifestReads()
+                    );
                 }
             }
 
@@ -389,9 +404,44 @@ public class LanceEngineFactoryTests extends EngineTestCase {
                 lanceStore.associateIndexWithNewTranslog(translogUuid);
                 EngineConfig config = config(pinnedSettings, lanceStore, pinnedTranslog, newMergePolicy(), null);
                 try (Engine engine = new LanceEngineFactory(cache).newReadWriteEngine(config)) {
+                    LanceEngineFactory.LanceReadOnlyEngine lanceEngine = (LanceEngineFactory.LanceReadOnlyEngine) engine;
                     long builds = cache.snapshotBuildCount();
                     long opens = cache.datasetOpenCount();
+                    assertEquals(0L, lanceEngine.docStatsManifestReads());
+
+                    // Concurrent first callers: one reads the manifest, the
+                    // others wait for its values.
+                    int callers = 4;
+                    CountDownLatch start = new CountDownLatch(1);
+                    List<Thread> threads = new ArrayList<>(callers);
+                    List<Exception> failures = new CopyOnWriteArrayList<>();
+                    List<DocsStats> answers = new CopyOnWriteArrayList<>();
+                    for (int i = 0; i < callers; i++) {
+                        Thread thread = new Thread(() -> {
+                            try {
+                                start.await();
+                                answers.add(engine.docStats());
+                            } catch (Exception e) {
+                                failures.add(e);
+                            }
+                        }, getTestName() + "-docStats-" + i);
+                        thread.start();
+                        threads.add(thread);
+                    }
+                    start.countDown();
+                    for (Thread thread : threads) {
+                        thread.join(30_000L);
+                    }
+                    assertTrue(failures.toString(), failures.isEmpty());
+                    assertEquals(callers, answers.size());
+                    for (DocsStats answer : answers) {
+                        assertEquals(4, answer.getCount());
+                    }
+                    assertEquals("one caller read the manifest, the rest waited for it", 1L, lanceEngine.docStatsManifestReads());
+
                     assertEquals(4, engine.docStats().getCount());
+                    assertEquals(4, engine.docStats().getCount());
+                    assertEquals("a pinned engine reads the manifest once", 1L, lanceEngine.docStatsManifestReads());
                     try (
                         Engine.GetResult miss = engine.get(
                             new Engine.Get(true, true, "alpha-5", new Term("_id", "alpha-5")),
@@ -402,7 +452,7 @@ public class LanceEngineFactoryTests extends EngineTestCase {
                     }
                     assertEquals(builds, cache.snapshotBuildCount());
                     assertEquals(opens, cache.datasetOpenCount());
-                    assertEquals(attached, ((LanceEngineFactory.LanceReadOnlyEngine) engine).servedVersion());
+                    assertEquals(attached, lanceEngine.servedVersion());
                 }
             }
         }

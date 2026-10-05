@@ -312,8 +312,8 @@ identical either way; only where the grouping happened differs.
 There is no third route. Until every request shape ran on the fragment executors, a body they
 did not serve proceeded onto stock OpenSearch, one node reading the whole table through the Lance
 backed directory reader; that fallback is gone, and the executor decides at plan time whether a
-body has an answer. The directory reader itself stays for `GET /_doc/{id}`, `_stats` and a
-`_search` over a target that mixes a Lance backed index with an ordinary one.
+body has an answer. The directory reader itself stays for `GET /_doc/{id}` and a `_search` over a
+target that mixes a Lance backed index with an ordinary one; `_stats` reads the manifest.
 
 ### Search: hits
 
