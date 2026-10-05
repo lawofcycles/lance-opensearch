@@ -100,7 +100,7 @@ public class LancePluginTests extends OpenSearchTestCase {
 
     public void testExposesExpectedSettings() {
         Set<String> settingKeys = plugin.getSettings().stream().map(Setting::getKey).collect(Collectors.toSet());
-        // The exact settings the RFC and the README expect users to see.
+        // The settings the documentation names.
         assertTrue(settingKeys.contains(LanceEngineFactory.TABLE_SETTING));
         assertTrue(settingKeys.contains(LanceEngineFactory.PRIMARY_KEY_FIELD_SETTING));
         assertTrue(settingKeys.contains(LanceEngineFactory.PRIMARY_KEY_TYPE_SETTING));

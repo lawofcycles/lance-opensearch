@@ -42,8 +42,8 @@ import org.opensearch.transport.client.node.NodeClient;
 /**
  * POST /_plugins/_lance/attach {"table": "/path/to/table.lance"}
  *
- * The RFC's attach operation. Derives everything from the table and creates
- * a real engine backed index. The mapping follows the derivation defaults
+ * Attaches a Lance table as a read only index: derives everything from the
+ * table and creates a real engine backed index. The mapping follows the derivation defaults
  * (a string column carrying an FTS index maps to text, integers map to
  * numeric doc values fields), the shard count is always one, and the
  * primary key is detected from Lance field metadata. Optional overrides:

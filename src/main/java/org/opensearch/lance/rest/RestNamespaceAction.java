@@ -155,8 +155,8 @@ public class RestNamespaceAction extends BaseRestHandler {
             // DELETE only stops the polling of that registration.
             // Already-surfaced indexes stay; the operator can delete them
             // via DELETE /{index} if they want the tables to disappear.
-            // This matches the "the namespace registration is separate
-            // from the OpenSearch index lifecycle" contract in the RFC.
+            // The namespace registration and the lifecycle of the
+            // OpenSearch indexes it surfaced are separate.
             String identifier;
             try {
                 identifier = requireIdentifier(body, path);

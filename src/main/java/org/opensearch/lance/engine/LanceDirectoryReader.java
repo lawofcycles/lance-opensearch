@@ -170,11 +170,10 @@ public final class LanceDirectoryReader extends DirectoryReader {
      * ({@link LanceEngineFactory.LanceReadOnlyEngine}) uses this only when
      * it has no {@link LanceWarmCache} to take a snapshot from; with one it
      * goes through {@link #openForSnapshot(Directory, IndexCommit,
-     * LanceWarmCache.Lease, ColumnStore, CircuitBreaker)} instead. The RFC's
-     * shard-partitioning scheme (fragment id modulo shard count) was
-     * retired when {@code number_of_shards} was dropped from attach;
-     * {@link #openForFragments} is the fan-out variant used by the fragment
-     * path.
+     * LanceWarmCache.Lease, ColumnStore, CircuitBreaker)} instead. The index
+     * has a single shard, so no fragment is partitioned away from this
+     * reader; {@link #openForFragments} is the fan-out variant used by the
+     * fragment path.
      *
      * <p>Every fragment in the dataset is surfaced as a leaf.
      *
