@@ -75,10 +75,11 @@ public class LanceStatsIT extends LanceRestTestCase {
             assertTrue("index cache shards must be at least 1, saw " + indexCacheShards, indexCacheShards >= 1);
             assertEquals(indexCacheCapacity / indexCacheShards, indexCacheShardShare);
 
-            // Shard path: _stats docs.count reads the engine's reader over
-            // the snapshot (GET on this fixture is answered 404 before the
-            // reader is touched, because the table declares no primary
-            // key; testGetSharesTheSnapshot covers GET).
+            // Shard path: _stats docs.count reads the manifest of the
+            // version the engine's snapshot was built for and agrees with
+            // it (GET on this fixture is answered 404 before the reader is
+            // touched, because the table declares no primary key;
+            // testGetSharesTheSnapshot covers GET).
             String stats = readAll(client().performRequest(new Request("GET", "/" + index + "/_stats/docs")));
             assertEquals(200, extractIntPath(stats, "indices", index, "primaries", "docs", "count"));
 
