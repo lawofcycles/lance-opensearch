@@ -260,7 +260,7 @@ public final class LanceWarmCache implements Closeable {
         private final Map<Integer, FragmentMeta> fragmentsById;
         private final Set<String> ftsColumns;
         private final LanceFragmentSchema schema;
-        private final LanceDirectoryReader.DataFileSizes dataFileSizes;
+        private final LanceTableSizes.DataFileSizes dataFileSizes;
         private final boolean cached;
         /** The fetch cache seen from this version, or null when the node has no fetch cache. */
         private final LanceFetchCache.Table fetchTable;
@@ -275,7 +275,7 @@ public final class LanceWarmCache implements Closeable {
             List<FragmentMeta> fragments,
             Set<String> ftsColumns,
             LanceFragmentSchema schema,
-            LanceDirectoryReader.DataFileSizes dataFileSizes,
+            LanceTableSizes.DataFileSizes dataFileSizes,
             boolean cached,
             LanceFetchCache.Table fetchTable
         ) {
@@ -341,10 +341,9 @@ public final class LanceWarmCache implements Closeable {
         /**
          * Manifest-recorded byte total of the data files behind
          * {@link #fragments()}, read from the manifest when the snapshot
-         * was built. The shard engine reports it as
-         * {@code _stats} {@code docs.total_size_in_bytes}.
+         * was built ({@link LanceTableSizes#dataFileBytes(List)}).
          */
-        public LanceDirectoryReader.DataFileSizes dataFileSizes() {
+        public LanceTableSizes.DataFileSizes dataFileSizes() {
             return dataFileSizes;
         }
 
@@ -759,7 +758,7 @@ public final class LanceWarmCache implements Closeable {
             fragments,
             ftsColumns,
             schema,
-            LanceDirectoryReader.sumDataFileSizes(lanceFragments),
+            LanceTableSizes.dataFileBytes(lanceFragments),
             cached,
             fetchCache == null ? null : fetchCache.table(key)
         );
