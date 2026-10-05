@@ -56,6 +56,7 @@ import org.opensearch.lance.dispatch.LanceGetActionFilter;
 import org.opensearch.lance.dispatch.LanceGetIndexActionFilter;
 import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
 import org.opensearch.lance.dispatch.LancePointLookup;
+import org.opensearch.lance.dispatch.LanceUnsupportedReadActionFilter;
 import org.opensearch.lance.dispatch.LanceRequestCache;
 import org.opensearch.lance.dispatch.LanceRequestCacheClearAction;
 import org.opensearch.lance.dispatch.LanceFragmentFetchAction;
@@ -166,6 +167,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     private volatile ClusterService clusterService;
     private LanceDispatchActionFilter dispatchActionFilter;
     private LanceGetActionFilter getActionFilter;
+    private LanceUnsupportedReadActionFilter unsupportedReadActionFilter;
     private LanceCreateIndexActionFilter createIndexActionFilter;
     private LanceClearCacheActionFilter clearCacheActionFilter;
     private volatile LanceRequestCache requestCache;
@@ -458,7 +460,9 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // one that is not proceeds to the stock shard fan out. The get
         // filter answers GET /_doc/{id} and the _mget items of a Lance
         // backed index from the table, at the version the index follows,
-        // before the stock actions reach a shard. The clear cache filter drops the entries of a
+        // before the stock actions reach a shard; the unsupported read
+        // filter refuses _termvectors, _mtermvectors and _explain/{id} on
+        // one with 400. The clear cache filter drops the entries of a
         // Lance backed index from every node's result cache before
         // OpenSearch's own action clears the shard caches.
         this.dispatchActionFilter = new LanceDispatchActionFilter(clusterService, indexNameExpressionResolver, client, threadPool);
@@ -469,6 +473,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             threadPool,
             new LancePointLookup(indicesServiceHolder::get, warmCache)
         );
+        this.unsupportedReadActionFilter = new LanceUnsupportedReadActionFilter(clusterService, indexNameExpressionResolver);
         this.createIndexActionFilter = new LanceCreateIndexActionFilter(threadPool);
         this.clearCacheActionFilter = new LanceClearCacheActionFilter(clusterService, indexNameExpressionResolver, client);
         this.namespaceService = LanceNamespaceService.fromSettings(
@@ -591,6 +596,10 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         LanceGetActionFilter get = getActionFilter;
         if (get != null) {
             filters.add(get);
+        }
+        LanceUnsupportedReadActionFilter unsupportedRead = unsupportedReadActionFilter;
+        if (unsupportedRead != null) {
+            filters.add(unsupportedRead);
         }
         LanceCreateIndexActionFilter guard = createIndexActionFilter;
         if (guard != null) {

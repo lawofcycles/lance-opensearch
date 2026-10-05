@@ -23,6 +23,8 @@ import org.opensearch.core.rest.RestStatus;
  * the index follows (latest, pinned or tag), with the request's
  * {@code _source} filter honoured, with a row the reader wrapper hides
  * answered as absent, and without the shard's get service being entered.
+ * {@code _termvectors}, {@code _mtermvectors} and {@code _explain/{id}}
+ * on such an index are refused with 400.
  */
 public class LanceGetFilterIT extends LanceRestTestCase {
 
@@ -250,6 +252,39 @@ public class LanceGetFilterIT extends LanceRestTestCase {
                     client().performRequest(new Request("DELETE", "/" + index));
                 } catch (Exception ignored) {}
             }
+        }
+    }
+
+    public void testTermVectorsAndExplainAreRefusedWith400() throws Exception {
+        String suffix = "refuse-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
+        Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
+        String tableName = "demo-" + suffix;
+        String tableUri = LanceTableFactory.writeStringPkTable(scratchDir, tableName, 4);
+        String indexName = tableName;
+        try {
+            attach("{\"table\":\"" + tableUri + "\"}");
+            ensureGreen(indexName);
+
+            String termVectors = refused(new Request("GET", "/" + indexName + "/_termvectors/alpha-1"));
+            assertTrue(termVectors, termVectors.contains("[_termvectors] is not served by a Lance backed index [" + indexName + "]"));
+
+            Request multi = new Request("POST", "/_mtermvectors");
+            multi.setJsonEntity("{\"docs\":[{\"_index\":\"" + indexName + "\",\"_id\":\"alpha-1\"}]}");
+            String multiTermVectors = refused(multi);
+            assertTrue(
+                multiTermVectors,
+                multiTermVectors.contains("[_mtermvectors] is not served by a Lance backed index [" + indexName + "]")
+            );
+
+            Request explain = new Request("GET", "/" + indexName + "/_explain/alpha-1");
+            explain.setJsonEntity("{\"query\":{\"match_all\":{}}}");
+            String explained = refused(explain);
+            assertTrue(explained, explained.contains("[_explain] is not served by a Lance backed index [" + indexName + "]"));
+            assertTrue("the plugin's explain is named: " + explained, explained.contains("/_plugins/_lance/explain/" + indexName));
+        } finally {
+            try {
+                client().performRequest(new Request("DELETE", "/" + indexName));
+            } catch (Exception ignored) {}
         }
     }
 
