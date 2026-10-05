@@ -50,8 +50,8 @@ import org.opensearch.lance.engine.LanceFragmentLeafReader;
 /**
  * Lucene query that executes a Lance {@link FullTextQuery} tree per leaf
  * (fragment) and streams back matching docids with Lance BM25 scores.
- * This is the RFC's shard-level rewrite of text queries to native Lance
- * queries, surfaced through the real search phase.
+ * Text queries are rewritten at the shard level into native Lance full
+ * text queries and surfaced through the real search phase.
  *
  * <p>The query carries the {@link FullTextQuery} tree Lance should
  * evaluate together with the set of columns it references. The column

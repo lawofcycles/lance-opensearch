@@ -81,7 +81,7 @@ public class NativeMemoryLimitTests extends OpenSearchTestCase {
 
     private static final long GIB = 1L << 30;
 
-    /** 16 vCPUs, the r7gd.4xlarge the measurements were taken on. */
+    /** 16 vCPUs, the host size the measurements were taken on. */
     private static final int CPUS_16 = 16;
 
     /**
@@ -152,7 +152,7 @@ public class NativeMemoryLimitTests extends OpenSearchTestCase {
     }
 
     public void testSizeIndexCachePicksTheLargestShareWithinTheBudget() {
-        // r7gd.4xlarge defaults: limit 37 GiB, column_share 0.4 leaves a
+        // Defaults on a 16 vCPU host with 128 GiB: limit 37 GiB, column_share 0.4 leaves a
         // 22.2 GiB session, 1/7 of it (3.17 GiB) is metadata, the index
         // budget is 19.03 GiB. The budget itself would be 4 shards of
         // 4.76 GiB and drop the 4.82 GiB entry; 16 GiB - 1 is 2 shards of
@@ -209,7 +209,7 @@ public class NativeMemoryLimitTests extends OpenSearchTestCase {
     }
 
     public void testSizeIndexCacheOnSixtyFourCpus() {
-        // r7gd.16xlarge with a 148 GiB limit: session 88.8 GiB, metadata
+        // A 64 vCPU host with 512 GiB and a 148 GiB limit: session 88.8 GiB, metadata
         // 12.69 GiB, index budget 76.11 GiB. On 64 vCPUs the CPU term is
         // 32, so the budget as is would be 16 shards of 4.76 GiB. Every
         // k * 4 GiB - 1 candidate has a share of 8 GiB - 1 (the integer

@@ -689,7 +689,7 @@ Every byte a request needs that is not already in memory is read from the store 
 
 Measured on the project's 1B row benchmark table:
 
-- `filter rating=5 + terms(category)`, read from S3 by four r7gd.4xlarge data nodes, took 164 s the first time (the rating BTree was being read from S3) and 4.3 s once its pages were in the Lance Session cache. The same table and plugin build on one r7gd.16xlarge with the table on the instance's NVMe took 14 s cold and 4.8 s warm.
+- `filter rating=5 + terms(category)`, read from S3 by four 16 vCPU data nodes with 128 GiB each, took 164 s the first time (the rating BTree was being read from S3) and 4.3 s once its pages were in the Lance Session cache. The same table and plugin build on one 64 vCPU node with 512 GiB and the table on local NVMe took 14 s cold and 4.8 s warm.
 - A `lance_knn` (k=10, nprobes=200) went from 17.9 s cold to 0.3 s warm when read from S3 by three such nodes, and from 1.0 s to 0.2 s on the NVMe node.
 - Local disk does not shorten a shape that is bound by Lance's CPU work rather than by reads: a one hit `lance_match` took 30 s on S3 and on NVMe alike.
 
@@ -705,7 +705,7 @@ curl -X POST http://localhost:9200/_plugins/_lance/attach \
   -d '{"table":"/nvme/tables/t.lance"}'
 ```
 
-Every data node needs the whole table, not only the fragments it happens to execute: the fragment share of a node changes with cluster membership, and index files are read on every node. `POST /_plugins/_lance/attach` opens the table on the elected cluster manager to derive the mapping, so a table attached by local path has to be at the same path on the manager as well, which matters when the manager is a dedicated node that holds no data. The project's 1B row table (750 GB) syncs to one r7gd.16xlarge in about 24 minutes (1,413 s and 1,434 s in two runs).
+Every data node needs the whole table, not only the fragments it happens to execute: the fragment share of a node changes with cluster membership, and index files are read on every node. `POST /_plugins/_lance/attach` opens the table on the elected cluster manager to derive the mapping, so a table attached by local path has to be at the same path on the manager as well, which matters when the manager is a dedicated node that holds no data. The project's 1B row table (750 GB) syncs from S3 to the local NVMe of one 64 vCPU node in about 24 minutes (1,413 s and 1,434 s in two runs).
 
 Rerun `aws s3 sync` after the writer commits; it fetches only the files the new version added, because Lance never rewrites a data file, an index file, a deletion file or a manifest under `_versions/`. The freshness check picks the new version up on its next cadence from the local path exactly as it would from S3; files a Lance cleanup removed from the bucket stay on disk unless the sync runs with `--delete`.
 

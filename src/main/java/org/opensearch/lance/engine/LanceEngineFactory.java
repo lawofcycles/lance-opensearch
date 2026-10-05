@@ -838,7 +838,7 @@ public final class LanceEngineFactory implements EngineFactory {
         }
 
         /**
-         * RFC contract: {@code _id} get maps to a primary key point lookup.
+         * A GET by {@code _id} is a point lookup on the table's primary key.
          * Pushes the equality predicate to the Lance scalar index by scanning
          * the shard's own fragment ids with {@code <field> = <key>} as the
          * filter. A row address batch returned by Lance identifies both the

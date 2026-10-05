@@ -49,7 +49,8 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 
 /**
- * The RFC's namespace registration.
+ * Registers a Lance namespace (a catalog of tables) and surfaces its tables
+ * as read only indexes.
  *
  * <p>A registered catalog is polled at a configurable cadence via the Lance
  * Namespace API, on the elected cluster manager only. Tables in the

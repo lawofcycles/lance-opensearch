@@ -346,11 +346,10 @@ public final class ScanAdmission {
      * derived floor is 16 bytes per matching row plus the per page
      * result sets held before their union. The measured resident set of
      * the shape that motivates this gate, {@code term rating=5 size 0}
-     * over 10B rows with about 2B matching (QA round 16, r7gd.16xlarge),
-     * exceeded 500 GB, which is 250 bytes per matching row: the
-     * constant is pinned to that measurement so the gate refuses the
-     * shape it exists for, and the gap between the floor and the
-     * measurement is the first thing QA round 18 attributes.
+     * over 10B rows with about 2B matching, measured on a 64 vCPU host
+     * with 512 GiB, exceeded 500 GB, which is 250 bytes per matching
+     * row: the constant is pinned to that measurement so the gate refuses
+     * the shape it exists for.
      */
     static final long FILTER_SCAN_BYTES_PER_MATCHING_ROW = 256L;
 

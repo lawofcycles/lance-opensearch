@@ -50,8 +50,8 @@ import org.opensearch.lance.engine.LanceFragmentSchema.ColumnKind;
  * Docids are physical row offsets within the fragment, liveDocs reflects the
  * fragment's deletion file (built from a {@code _rowaddr}-only scan, and only
  * when the fragment metadata says a deletion file exists), and the numeric
- * field is served as DocValues from the Lance column. This is the RFC's
- * "leaf corresponds to a fragment group" contract in its minimal form.
+ * field is served as DocValues from the Lance column. One Lucene leaf
+ * corresponds to one Lance fragment.
  *
  * <p>Construction reads no data pages unless a deletion file is present.
  * {@code _id} and {@code _source} are fetched per hit through
