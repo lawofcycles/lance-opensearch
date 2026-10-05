@@ -22,9 +22,9 @@ import org.opensearch.monitor.os.OsProbe;
  *
  * <p>Formally, for a percentage {@code p} the resolved byte count is
  * {@code p / 100 * (physicalMemory - jvmHeapMax)}. The subtraction is
- * what makes the default useful across heterogeneous instance sizes:
- * on r7g.4xlarge (128 GiB physical / 31 GiB heap) 40% resolves to
- * roughly 38.8 GiB, while on t3.medium (4 GiB / 2 GiB heap) the same
+ * what makes the default useful across heterogeneous host sizes:
+ * on a 16 vCPU host with 128 GiB of memory and a 31 GiB heap 40% resolves to
+ * roughly 38.8 GiB, while on a host with 4 GiB and a 2 GiB heap the same
  * 40% resolves to roughly 800 MiB.
  *
  * <p>The parsed value is split in two: a {@code plugins.lance.cache.column_share}

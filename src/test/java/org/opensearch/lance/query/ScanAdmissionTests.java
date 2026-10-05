@@ -1378,7 +1378,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
     }
 
     public void testFilterScanOverThreeBillionRowsRefusesA128GbNode() {
-        // 3 x r7gd.4xlarge: 3.3B rows per node, 128 GB physical.
+        // Three 16 vCPU nodes with 128 GB each: 3.3B rows per node.
         long nodeRows = 3_300_000_000L;
         long matching = ScanAdmission.filterScanMatchingRows(nodeRows, 0.2, 0L, false);
         long estimate = ScanAdmission.filterScanEstimateBytes(nodeRows, matching, ScanAdmission.ROW_ADDRESS_BYTES, 16, 8 * GB);
@@ -1613,7 +1613,7 @@ public class ScanAdmissionTests extends OpenSearchTestCase {
 
     // ---- the shapes that killed the 4 node perf1b cluster, judged with its figures ----
 
-    /** perf1b: 1B rows over 4 r7gd.4xlarge nodes (16 vCPU, 128 GB), 250M rows per node, 8 parallel aggregate scans. */
+    /** perf1b: 1B rows over four 16 vCPU nodes with 128 GB each, 250M rows per node, 8 parallel aggregate scans. */
     private static final long PERF1B_ROWS = 1_000_000_000L;
     private static final long PERF1B_NODE_ROWS = 250_000_000L;
     private static final int PERF1B_SCANS = 8;
