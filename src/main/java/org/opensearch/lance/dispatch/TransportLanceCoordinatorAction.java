@@ -1263,9 +1263,12 @@ public final class TransportLanceCoordinatorAction extends HandledTransportActio
      * whatever version the tag points at right now; resolving it costs
      * one extra Dataset.open of the latest manifest (the tag lives in
      * the table's refs, not in any manifest), which the shared Lance
-     * Session keeps cheap.
+     * Session keeps cheap. The point lookup behind {@code GET /_doc/{id}}
+     * ({@link LancePointLookup}) picks its version through this method
+     * too, so a GET and a {@code _search} on the same index read the same
+     * manifest.
      */
-    private static long resolvePinnedVersion(IndexMetadata indexMetadata, String tableUri, StorageOptions storageOptions) {
+    static long resolvePinnedVersion(IndexMetadata indexMetadata, String tableUri, StorageOptions storageOptions) {
         long pinnedVersion = LanceSettings.VERSION_SETTING.get(indexMetadata.getSettings());
         String tag = LanceSettings.TAG_SETTING.get(indexMetadata.getSettings());
         if (pinnedVersion < 0 && !tag.isEmpty()) {

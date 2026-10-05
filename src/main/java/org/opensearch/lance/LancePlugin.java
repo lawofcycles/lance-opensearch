@@ -52,8 +52,11 @@ import org.opensearch.lance.dispatch.LanceFragmentQueryAction;
 import org.opensearch.lance.dispatch.TransportLanceCoordinatorAction;
 import org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction;
 import org.opensearch.lance.dispatch.LanceDispatchActionFilter;
+import org.opensearch.lance.dispatch.LanceGetActionFilter;
 import org.opensearch.lance.dispatch.LanceGetIndexActionFilter;
 import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
+import org.opensearch.lance.dispatch.LancePointLookup;
+import org.opensearch.lance.dispatch.LanceUnsupportedReadActionFilter;
 import org.opensearch.lance.dispatch.LanceRequestCache;
 import org.opensearch.lance.dispatch.LanceRequestCacheClearAction;
 import org.opensearch.lance.dispatch.LanceFragmentFetchAction;
@@ -163,6 +166,8 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     /** The node's cluster service, kept so {@link #close} can take the listeners registered in createComponents off it. */
     private volatile ClusterService clusterService;
     private LanceDispatchActionFilter dispatchActionFilter;
+    private LanceGetActionFilter getActionFilter;
+    private LanceUnsupportedReadActionFilter unsupportedReadActionFilter;
     private LanceCreateIndexActionFilter createIndexActionFilter;
     private LanceClearCacheActionFilter clearCacheActionFilter;
     private volatile LanceRequestCache requestCache;
@@ -452,11 +457,23 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // filter intercepts every _search whose targets are all Lance
         // backed and hands it to the plugin's coordinator, whatever the
         // body; only a request that names a Lance backed index next to
-        // one that is not proceeds to the stock shard fan out. The clear
-        // cache filter drops the entries of a Lance backed index from
-        // every node's result cache before OpenSearch's own action clears
-        // the shard caches.
+        // one that is not proceeds to the stock shard fan out. The get
+        // filter answers GET /_doc/{id} and the _mget items of a Lance
+        // backed index from the table, at the version the index follows,
+        // before the stock actions reach a shard; the unsupported read
+        // filter refuses _termvectors, _mtermvectors and _explain/{id} on
+        // one with 400. The clear cache filter drops the entries of a
+        // Lance backed index from every node's result cache before
+        // OpenSearch's own action clears the shard caches.
         this.dispatchActionFilter = new LanceDispatchActionFilter(clusterService, indexNameExpressionResolver, client, threadPool);
+        this.getActionFilter = new LanceGetActionFilter(
+            clusterService,
+            indexNameExpressionResolver,
+            client,
+            threadPool,
+            new LancePointLookup(indicesServiceHolder::get, warmCache)
+        );
+        this.unsupportedReadActionFilter = new LanceUnsupportedReadActionFilter(clusterService, indexNameExpressionResolver);
         this.createIndexActionFilter = new LanceCreateIndexActionFilter(threadPool);
         this.clearCacheActionFilter = new LanceClearCacheActionFilter(clusterService, indexNameExpressionResolver, client);
         this.namespaceService = LanceNamespaceService.fromSettings(
@@ -571,10 +588,18 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // filter is always present when the search machinery starts
         // routing through it; the null guard exists purely for the
         // test framework's out-of-order invocations.
-        List<ActionFilter> filters = new ArrayList<>(4);
+        List<ActionFilter> filters = new ArrayList<>(6);
         LanceDispatchActionFilter dispatch = dispatchActionFilter;
         if (dispatch != null) {
             filters.add(dispatch);
+        }
+        LanceGetActionFilter get = getActionFilter;
+        if (get != null) {
+            filters.add(get);
+        }
+        LanceUnsupportedReadActionFilter unsupportedRead = unsupportedReadActionFilter;
+        if (unsupportedRead != null) {
+            filters.add(unsupportedRead);
         }
         LanceCreateIndexActionFilter guard = createIndexActionFilter;
         if (guard != null) {

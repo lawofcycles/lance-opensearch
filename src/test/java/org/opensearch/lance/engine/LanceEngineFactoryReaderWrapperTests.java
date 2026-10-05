@@ -25,13 +25,13 @@ import org.opensearch.test.OpenSearchSingleNodeTestCase;
 
 /**
  * A GET of a row outside the shard reader (the table is above the Lucene
- * document bound) opens a reader the index's reader wrapper never sees,
- * so the engine refuses it whenever a wrapper is installed on the index,
- * asked of the node's {@code IndexService} through
- * {@code ReaderWrapperProbe}. The wrapper installed here hands back the
- * reader it is given, which leaves the engine's own reader on top of the
- * searcher: a check on the type of that reader would let the GET through,
- * the probe does not. The plain index next to it answers the same GET.
+ * document bound) is answered under an installed reader wrapper: the GET
+ * filter reads the row through a reader over its fragment that the
+ * index's wrapper is applied to, so the shard reader and its bound do
+ * not enter the lookup. The wrapper installed here hands back the reader
+ * it is given, the way a security plugin whose rules admit every row
+ * might, and the wrapped index answers every row the plain index next
+ * to it answers.
  *
  * <p>Thread leak checks are off as in the other tests that load the Lance
  * native library.
@@ -59,7 +59,7 @@ public class LanceEngineFactoryReaderWrapperTests extends OpenSearchSingleNodeTe
         ensureGreen(indexName);
     }
 
-    public void testGetOutsideTheShardReaderRefusesUnderAnInstalledWrapperWhateverTheWrapperReturns() throws Exception {
+    public void testGetOutsideTheShardReaderAnswersUnderAnInstalledWrapper() throws Exception {
         String plain = "plain-outside";
         String wrapped = "wrapped-outside";
         // One fragment per shard reader: rows 0 to 3 are inside it, the
@@ -69,36 +69,23 @@ public class LanceEngineFactoryReaderWrapperTests extends OpenSearchSingleNodeTe
             attach(plain);
             attach(wrapped);
 
-            // Inside the shard reader both indexes answer: the wrapper
-            // (which changes nothing) is applied to the shard searcher.
             assertTrue(client().prepareGet(plain, "alpha-1").get().isExists());
             assertTrue(client().prepareGet(wrapped, "alpha-1").get().isExists());
 
-            // Outside it the plain index resolves the row through a
-            // reader over its fragment.
+            // Outside the shard reader both indexes resolve the row through
+            // a reader over its fragment, the wrapped one with the wrapper
+            // applied to that reader.
             GetResponse outside = client().prepareGet(plain, "alpha-5").get();
             assertTrue(outside.isExists());
             assertEquals("alpha-5", outside.getId());
+            GetResponse wrappedOutside = client().prepareGet(wrapped, "alpha-9").get();
+            assertTrue(wrappedOutside.isExists());
+            assertEquals("alpha-9", wrappedOutside.getId());
+            assertEquals("col-9", wrappedOutside.getSourceAsMap().get("label"));
 
-            // The wrapped index refuses, although the wrapper left the
-            // engine's own reader on top of the searcher.
-            Exception refused = expectThrows(Exception.class, () -> client().prepareGet(wrapped, "alpha-9").get());
-            Throwable cause = refused;
-            boolean found = false;
-            for (int depth = 0; cause != null && depth < 10 && !found; depth++, cause = cause.getCause()) {
-                String message = cause.getMessage();
-                found = message != null
-                    && message.contains(
-                        "GET of a row outside the shard reader of ["
-                            + wrapped
-                            + "] (table above the Lucene document bound) cannot apply the index's reader wrapper (DLS / FLS)"
-                    );
-            }
-            assertTrue("the refusal names the wrapper: " + refused, found);
-
-            // A row that does not exist is not resolved outside either,
-            // and is no error on the plain index.
+            // A row that does not exist is no error on either index.
             assertFalse(client().prepareGet(plain, "alpha-99").get().isExists());
+            assertFalse(client().prepareGet(wrapped, "alpha-99").get().isExists());
         } finally {
             updateMaxDocsPerReader(null);
         }
