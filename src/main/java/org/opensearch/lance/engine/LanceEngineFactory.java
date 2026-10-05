@@ -777,11 +777,13 @@ public final class LanceEngineFactory implements EngineFactory {
         // One manifest open per call, the same cost the fragment path pays
         // per request. The reader is neither acquired nor refreshed here.
         //
-        // totalSizeInBytes is not what _cat/indices shows as store.size:
-        // that column is IndexShard.storeStats() -> Store.stats(), which
-        // sums the files in the shard's Lucene Directory (only the
-        // bootstrap commit here) and has no engine-level override in
-        // OpenSearch 3.8.
+        // totalSizeInBytes is the manifest data file total. It is not
+        // what IndexShard.storeStats() reports as store.size: that is
+        // Store.stats(), the files in the shard's Lucene Directory (only
+        // the bootstrap commit here), and OpenSearch 3.8 has no
+        // engine-level override. LanceIndicesStatsActionFilter copies
+        // this total into the store group of the indices stats response
+        // on the coordinating node, so _stats and _cat show the table.
         @Override
         public DocsStats docStats() {
             ensureOpen();

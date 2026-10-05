@@ -6,8 +6,11 @@
 package org.opensearch.lance;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import org.opensearch.client.Request;
 import org.opensearch.client.Response;
@@ -107,7 +110,8 @@ public class LancePluginIT extends LanceRestTestCase {
         // docs.count / docs.deleted must follow the Lance manifest: after
         // two rows are deleted and the shard refreshes onto the new
         // version, every stats surface reports 14 live rows and 2
-        // deletions, and _cat/shards agrees with _cat/indices.
+        // deletions, store.size is the table's data file total, and
+        // _cat/shards agrees with _cat/indices.
         try (LanceTestCluster fixture = LanceTestCluster.setUp(16, "catdocs")) {
             String indexName = fixture.indexName();
             // _cluster/stats aggregates every index on the shared cluster, so
@@ -122,6 +126,11 @@ public class LancePluginIT extends LanceRestTestCase {
             LanceTableFactory.deleteRows(fixture.tableUri(), "id IN (1, 4)");
             Response refresh = client().performRequest(new Request("POST", "/" + indexName + "/_refresh"));
             assertEquals(RestStatus.OK.getStatus(), refresh.getStatusLine().getStatusCode());
+            // store.size is the table's data file total (the sum of the
+            // .lance files under data/, unchanged by the delete, which
+            // adds a deletion file), not the shard directory's size.
+            long tableBytes = bytesUnderDataDir(Path.of(fixture.tableUri()));
+            assertTrue("fixture wrote no data files under " + fixture.tableUri(), tableBytes > 0L);
 
             Map<String, Object> indexRow = singleCatRow("/_cat/indices/" + indexName + "?format=json&bytes=b");
             assertEquals("docs.count in " + indexRow, "14", indexRow.get("docs.count"));
@@ -129,6 +138,7 @@ public class LancePluginIT extends LanceRestTestCase {
             assertEquals("health in " + indexRow, "green", indexRow.get("health"));
             assertEquals("pri in " + indexRow, "1", indexRow.get("pri"));
             assertEquals("rep in " + indexRow, "0", indexRow.get("rep"));
+            assertEquals("store.size in " + indexRow, Long.toString(tableBytes), indexRow.get("store.size"));
             assertEquals("pri.store.size in " + indexRow, indexRow.get("store.size"), indexRow.get("pri.store.size"));
 
             Map<String, Object> shardRow = singleCatRow("/_cat/shards/" + indexName + "?format=json&bytes=b");
@@ -141,10 +151,26 @@ public class LancePluginIT extends LanceRestTestCase {
             assertEquals("docs.count in " + stats, 14, extractIntPath(stats, "_all", "primaries", "docs", "count"));
             assertEquals("docs.deleted in " + stats, 2, extractIntPath(stats, "_all", "primaries", "docs", "deleted"));
             assertEquals(
-                "store.size_in_bytes in " + stats + " vs " + indexRow,
-                Integer.parseInt((String) indexRow.get("store.size")),
+                "store.size_in_bytes in " + stats,
+                tableBytes,
                 extractIntPath(stats, "_all", "primaries", "store", "size_in_bytes")
             );
+            assertEquals("store.size_in_bytes in " + stats, tableBytes, extractIntPath(stats, "_all", "total", "store", "size_in_bytes"));
+
+            // The store group alone answers the same number, and the docs
+            // group the plugin asked the shards for on its behalf is not
+            // in the answer.
+            String storeOnly = readAll(client().performRequest(new Request("GET", "/" + indexName + "/_stats/store")));
+            assertEquals(
+                "store.size_in_bytes in " + storeOnly,
+                tableBytes,
+                extractIntPath(storeOnly, "_all", "primaries", "store", "size_in_bytes")
+            );
+            @SuppressWarnings("unchecked")
+            Map<String, Object> storeOnlyPrimaries = (Map<String, Object>) ((Map<String, Object>) parseJson(storeOnly).get("_all")).get(
+                "primaries"
+            );
+            assertNull("docs in " + storeOnly, storeOnlyPrimaries.get("docs"));
 
             String health = readAll(client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?level=indices")));
             assertEquals("cluster status in " + health, "green", extractStringPath(health, "indices", indexName, "status"));
@@ -160,6 +186,19 @@ public class LancePluginIT extends LanceRestTestCase {
                 clusterDocsBefore - 2,
                 extractIntPath(clusterStats, "indices", "docs", "count")
             );
+        }
+    }
+
+    /** Bytes of the {@code .lance} data files under the table's {@code data/} directory, what the manifest records as the table's size. */
+    private static long bytesUnderDataDir(Path tablePath) throws IOException {
+        try (Stream<Path> files = Files.list(tablePath.resolve("data"))) {
+            long total = 0L;
+            for (Path file : (Iterable<Path>) files::iterator) {
+                if (file.getFileName().toString().endsWith(".lance")) {
+                    total += Files.size(file);
+                }
+            }
+            return total;
         }
     }
 

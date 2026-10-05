@@ -54,6 +54,7 @@ import org.opensearch.lance.dispatch.TransportLanceFragmentQueryAction;
 import org.opensearch.lance.dispatch.LanceDispatchActionFilter;
 import org.opensearch.lance.dispatch.LanceGetActionFilter;
 import org.opensearch.lance.dispatch.LanceGetIndexActionFilter;
+import org.opensearch.lance.dispatch.LanceIndicesStatsActionFilter;
 import org.opensearch.lance.dispatch.LanceCreateIndexActionFilter;
 import org.opensearch.lance.dispatch.LancePointLookup;
 import org.opensearch.lance.dispatch.LanceUnsupportedReadActionFilter;
@@ -170,6 +171,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     private LanceUnsupportedReadActionFilter unsupportedReadActionFilter;
     private LanceCreateIndexActionFilter createIndexActionFilter;
     private LanceClearCacheActionFilter clearCacheActionFilter;
+    private LanceIndicesStatsActionFilter indicesStatsActionFilter;
     private volatile LanceRequestCache requestCache;
     private volatile LanceFetchCache fetchCache;
     private volatile LanceWarmCache warmCache;
@@ -464,7 +466,10 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // filter refuses _termvectors, _mtermvectors and _explain/{id} on
         // one with 400. The clear cache filter drops the entries of a
         // Lance backed index from every node's result cache before
-        // OpenSearch's own action clears the shard caches.
+        // OpenSearch's own action clears the shard caches. The stats
+        // filter makes the store group of _stats, _cat/indices and
+        // _cat/shards report the table's data file total for a Lance
+        // backed index.
         this.dispatchActionFilter = new LanceDispatchActionFilter(clusterService, indexNameExpressionResolver, client, threadPool);
         this.getActionFilter = new LanceGetActionFilter(
             clusterService,
@@ -476,6 +481,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         this.unsupportedReadActionFilter = new LanceUnsupportedReadActionFilter(clusterService, indexNameExpressionResolver);
         this.createIndexActionFilter = new LanceCreateIndexActionFilter(threadPool);
         this.clearCacheActionFilter = new LanceClearCacheActionFilter(clusterService, indexNameExpressionResolver, client);
+        this.indicesStatsActionFilter = new LanceIndicesStatsActionFilter(clusterService);
         this.namespaceService = LanceNamespaceService.fromSettings(
             client,
             clusterService,
@@ -588,7 +594,7 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         // filter is always present when the search machinery starts
         // routing through it; the null guard exists purely for the
         // test framework's out-of-order invocations.
-        List<ActionFilter> filters = new ArrayList<>(6);
+        List<ActionFilter> filters = new ArrayList<>(7);
         LanceDispatchActionFilter dispatch = dispatchActionFilter;
         if (dispatch != null) {
             filters.add(dispatch);
@@ -608,6 +614,10 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         LanceClearCacheActionFilter clear = clearCacheActionFilter;
         if (clear != null) {
             filters.add(clear);
+        }
+        LanceIndicesStatsActionFilter stats = indicesStatsActionFilter;
+        if (stats != null) {
+            filters.add(stats);
         }
         // GET /<index> writes each index's settings as they are in the
         // cluster state; the settings filter registered through
