@@ -68,6 +68,7 @@ public final class LanceIndicesStatsActionFilter implements ActionFilter {
     }
 
     @Override
+    @SuppressWarnings("unchecked")
     public <Request extends ActionRequest, Response extends ActionResponse> void apply(
         Task task,
         String action,
@@ -81,15 +82,35 @@ public final class LanceIndicesStatsActionFilter implements ActionFilter {
             return;
         }
         boolean stripDocs = !statsRequest.docs();
-        if (stripDocs) {
-            statsRequest.docs(true);
-        }
-        chain.proceed(task, action, request, ActionListener.map(listener, response -> {
+        // The caller keeps its request as it sent it; the chain gets a copy
+        // with docs asked for, so a caller that reads the flags after the
+        // call does not see the group this filter added for itself.
+        Request widened = stripDocs ? (Request) withDocs(statsRequest) : request;
+        chain.proceed(task, action, widened, ActionListener.map(listener, response -> {
             if (response instanceof IndicesStatsResponse stats) {
                 withTableStoreSizes(stats, clusterService.state().metadata(), stripDocs);
             }
             return response;
         }));
+    }
+
+    /**
+     * A copy of {@code request} that asks for the {@code docs} group next to
+     * the groups {@code request} asks for. Everything the stats action reads
+     * off the request is carried over: the indices and their options, the
+     * timeout and its cancel flag, the parent task, and the flags with their
+     * search groups and field lists.
+     */
+    static IndicesStatsRequest withDocs(IndicesStatsRequest request) {
+        IndicesStatsRequest copy = new IndicesStatsRequest();
+        copy.indices(request.indices());
+        copy.indicesOptions(request.indicesOptions());
+        copy.timeout(request.timeout());
+        copy.setShouldCancelOnTimeout(request.getShouldCancelOnTimeout());
+        copy.setParentTask(request.getParentTask());
+        copy.flags(request.flags().clone());
+        copy.docs(true);
+        return copy;
     }
 
     /**

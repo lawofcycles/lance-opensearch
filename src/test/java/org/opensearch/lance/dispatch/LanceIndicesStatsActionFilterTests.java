@@ -7,25 +7,42 @@ package org.opensearch.lance.dispatch;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.opensearch.Version;
+import org.opensearch.action.ActionRequest;
 import org.opensearch.action.admin.indices.stats.CommonStats;
 import org.opensearch.action.admin.indices.stats.CommonStatsFlags;
+import org.opensearch.action.admin.indices.stats.IndicesStatsAction;
+import org.opensearch.action.admin.indices.stats.IndicesStatsRequest;
 import org.opensearch.action.admin.indices.stats.IndicesStatsResponse;
 import org.opensearch.action.admin.indices.stats.ShardStats;
+import org.opensearch.action.support.ActionFilterChain;
+import org.opensearch.action.support.PlainActionFuture;
+import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardRoutingState;
 import org.opensearch.cluster.routing.TestShardRouting;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.core.tasks.TaskId;
 import org.opensearch.index.shard.DocsStats;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.index.store.StoreStats;
 import org.opensearch.lance.engine.LanceEngineFactory;
+import org.opensearch.tasks.Task;
+import org.opensearch.test.ClusterServiceUtils;
 import org.opensearch.test.OpenSearchTestCase;
+import org.opensearch.threadpool.TestThreadPool;
+import org.opensearch.threadpool.ThreadPool;
 
 /**
  * {@link LanceIndicesStatsActionFilter} replaces the store size of every
@@ -151,5 +168,89 @@ public class LanceIndicesStatsActionFilterTests extends OpenSearchTestCase {
         LanceIndicesStatsActionFilter.withTableStoreSizes(response, metadata(), false);
 
         assertEquals(DIRECTORY_BYTES, response.getAt(0).getStats().store.getSizeInBytes());
+    }
+
+    public void testStoreWithoutDocsProceedsWithACopyAndLeavesTheCallersRequestAlone() throws Exception {
+        IndicesStatsRequest original = new IndicesStatsRequest().indices("lance", "plain").clear().store(true);
+        original.timeout(TimeValue.timeValueSeconds(5));
+        original.setShouldCancelOnTimeout(true);
+        original.setParentTask(new TaskId("node-1", 7L));
+        original.groups("g1", "g2");
+
+        Applied applied = apply(original);
+
+        IndicesStatsRequest seen = applied.seen;
+        assertNotSame("the chain gets a copy", original, seen);
+        assertTrue(seen.docs());
+        assertTrue(seen.store());
+        assertFalse(seen.search());
+        assertArrayEquals(new String[] { "lance", "plain" }, seen.indices());
+        assertSame(original.indicesOptions(), seen.indicesOptions());
+        assertEquals(TimeValue.timeValueSeconds(5), seen.timeout());
+        assertTrue(seen.getShouldCancelOnTimeout());
+        assertEquals(new TaskId("node-1", 7L), seen.getParentTask());
+        assertArrayEquals(new String[] { "g1", "g2" }, seen.groups());
+
+        assertFalse("the caller's request still asks for store only", original.docs());
+        assertTrue(original.store());
+
+        assertEquals(TABLE_BYTES, applied.response.getAt(0).getStats().store.getSizeInBytes());
+        assertNull("the docs group the copy asked for is not in the answer", applied.response.getAt(0).getStats().docs);
+        assertEquals(DIRECTORY_BYTES, applied.response.getAt(1).getStats().store.getSizeInBytes());
+    }
+
+    public void testStoreWithDocsProceedsWithTheCallersRequest() throws Exception {
+        IndicesStatsRequest original = new IndicesStatsRequest().indices("lance").clear().store(true).docs(true);
+
+        Applied applied = apply(original);
+
+        assertSame(original, applied.seen);
+        assertEquals(TABLE_BYTES, applied.response.getAt(0).getStats().store.getSizeInBytes());
+        assertEquals(14L, applied.response.getAt(0).getStats().docs.getCount());
+    }
+
+    private record Applied(IndicesStatsRequest seen, IndicesStatsResponse response) {
+    }
+
+    /**
+     * Run {@code request} through the filter in front of a chain that
+     * records the request it receives and answers with one Lance shard and
+     * one plain shard, as a data node would report them.
+     */
+    private Applied apply(IndicesStatsRequest request) throws Exception {
+        TestThreadPool threadPool = new TestThreadPool(getTestName());
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(threadPool);
+        try {
+            ClusterState state = ClusterState.builder(clusterService.state())
+                .metadata(
+                    Metadata.builder(clusterService.state().metadata())
+                        .put(
+                            indexMetadata(lance, Settings.builder().put(LanceEngineFactory.TABLE_SETTING, "/tables/demo.lance").build()),
+                            false
+                        )
+                        .put(indexMetadata(plain, Settings.EMPTY), false)
+                )
+                .build();
+            ClusterServiceUtils.setState(clusterService, state);
+
+            AtomicReference<IndicesStatsRequest> seen = new AtomicReference<>();
+            ActionFilterChain<ActionRequest, ActionResponse> chain = (t, name, r, listener) -> {
+                seen.set((IndicesStatsRequest) r);
+                listener.onResponse(
+                    response(
+                        shardStats(lance, docs(14L, 2L, TABLE_BYTES), directoryStore()),
+                        shardStats(plain, docs(3L, 0L, 900L), directoryStore())
+                    )
+                );
+            };
+            PlainActionFuture<ActionResponse> future = PlainActionFuture.newFuture();
+            Task task = new Task(1L, "transport", IndicesStatsAction.NAME, "", TaskId.EMPTY_TASK_ID, Map.of());
+            new LanceIndicesStatsActionFilter(clusterService).apply(task, IndicesStatsAction.NAME, request, null, future, chain);
+            IndicesStatsResponse response = (IndicesStatsResponse) future.actionGet(10, TimeUnit.SECONDS);
+            return new Applied(seen.get(), response);
+        } finally {
+            clusterService.close();
+            ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+        }
     }
 }
