@@ -1775,9 +1775,10 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             ensureGreen(pkTable);
 
             // The shard reader holds the first fragment only; _stats
-            // counts it, _plugins/_lance/stats reports both figures.
+            // counts the table from the manifest regardless,
+            // _plugins/_lance/stats reports both figures.
             String docStats = readAll(client().performRequest(new Request("GET", "/" + tableName + "/_stats/docs")));
-            assertEquals(20, extractIntPath(docStats, "indices", tableName, "primaries", "docs", "count"));
+            assertEquals(120, extractIntPath(docStats, "indices", tableName, "primaries", "docs", "count"));
             String lanceStats = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
             Map<String, Object> nodes = castMap(parseJson(lanceStats).get("nodes"));
             Map<String, Object> indices = castMap(castMap(nodes.values().iterator().next()).get("indices"));

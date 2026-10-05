@@ -3875,8 +3875,10 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             assertEquals(attach, 6, extractIntPath(attach, "fragments"));
             assertTrue(attach, attach.contains("\"lucene_bound_exceeded\":true"));
             client().performRequest(new Request("GET", "/_cluster/health/" + tableName + "?wait_for_status=green&timeout=60s"));
+            // _stats counts the table from the manifest, not the 20 rows
+            // the shard reader holds under the bound.
             String docStats = readAll(client().performRequest(new Request("GET", "/" + tableName + "/_stats/docs")));
-            assertEquals(20, extractIntPath(docStats, "indices", tableName, "primaries", "docs", "count"));
+            assertEquals(120, extractIntPath(docStats, "indices", tableName, "primaries", "docs", "count"));
             // The node that hosts the shard reports the table's rows next
             // to the reader's.
             Map<String, Object> lanceStats = parse(readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats"))));
