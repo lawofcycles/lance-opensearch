@@ -1822,7 +1822,16 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             client().performRequest(new Request("POST", "/" + pkTable + "/_open"));
             ensureGreen(pkTable);
             String pkDocStats = readAll(client().performRequest(new Request("GET", "/" + pkTable + "/_stats/docs")));
-            assertEquals(4, extractIntPath(pkDocStats, "indices", pkTable, "primaries", "docs", "count"));
+            assertEquals(12, extractIntPath(pkDocStats, "indices", pkTable, "primaries", "docs", "count"));
+            String pkLanceStats = readAll(client().performRequest(new Request("GET", "/_plugins/_lance/stats")));
+            Map<String, Object> pkNodes = castMap(parseJson(pkLanceStats).get("nodes"));
+            Map<String, Object> pkIndices = castMap(castMap(pkNodes.values().iterator().next()).get("indices"));
+            Map<String, Object> pkIndexStats = castMap(pkIndices.get(pkTable));
+            assertEquals(
+                "the reopened shard holds one fragment: " + pkLanceStats,
+                4,
+                ((Number) pkIndexStats.get("shard_reader_rows")).intValue()
+            );
             for (String key : List.of("alpha-0", "alpha-5", "alpha-11")) {
                 Response hit = client().performRequest(new Request("GET", "/" + pkTable + "/_doc/" + key));
                 assertEquals(200, hit.getStatusLine().getStatusCode());
