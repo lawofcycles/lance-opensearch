@@ -253,7 +253,8 @@ public final class LanceCircuitBreaker {
             return threadPool.scheduleWithFixedDelay(sample, every, ThreadPool.Names.GENERIC);
         }
 
-        private synchronized void setInterval(TimeValue newInterval) {
+        /** Reschedule at {@code newInterval}; the same interval leaves the current schedule in place. */
+        synchronized void setInterval(TimeValue newInterval) {
             if (newInterval.equals(interval)) {
                 return;
             }

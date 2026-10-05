@@ -7,7 +7,6 @@ package org.opensearch.lance.namespace;
 
 import java.io.Closeable;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
@@ -477,7 +476,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
                     // The tag points at another manifest: derive from that
                     // snapshot so the mapping matches the schema the shard
                     // is about to read.
-                    try (Dataset tagged = LanceRegistry.openDataset(table, storageOptions, Optional.of(target))) {
+                    try (Dataset tagged = LanceRegistry.openDatasetAt(table, storageOptions, target)) {
                         stored = driftDetector.rewriteOverridesForSchemaDrift(indexName, stored, tagged.getLanceSchema());
                         derivation = RestAttachAction.derive(tagged, stored, true);
                         driftDetector.warnOnLanceFieldRename(indexName, tagged.getLanceSchema());
@@ -505,11 +504,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
             entry.statisticsRequested = true;
             long statisticsVersion = target;
             warmCache.tableStatistics()
-                .prefetch(
-                    tableKey,
-                    statisticsVersion,
-                    () -> LanceRegistry.openDataset(table, storageOptions, Optional.of(statisticsVersion))
-                );
+                .prefetch(tableKey, statisticsVersion, () -> LanceRegistry.openDatasetAt(table, storageOptions, statisticsVersion));
         }
         boolean mappingChanged = false;
         String mappingError = null;

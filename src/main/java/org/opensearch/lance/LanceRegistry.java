@@ -6,7 +6,6 @@
 package org.opensearch.lance;
 
 import java.util.Map;
-import java.util.Optional;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -20,8 +19,9 @@ import org.lance.Session;
  * plugin-owned code path that needs to open a Lance dataset, plus the
  * single-source helper for constructing that {@link Dataset} instance.
  * Every call site goes through {@link #openDataset(String, StorageOptions)}
- * so the storage-options plumbing and the Session sharing both live in
- * one place.
+ * or {@link #openDatasetAt(String, StorageOptions, long)} so the
+ * storage-options plumbing and the Session sharing both live in one
+ * place.
  *
  * <p>Sharing one {@link Session} across every {@code Dataset} on the node
  * keeps Lance's inverted-index and metadata caches native-side and node
@@ -35,11 +35,21 @@ import org.lance.Session;
  */
 public final class LanceRegistry {
 
+    /**
+     * The node's root allocator, without an Arrow side limit. The off heap
+     * column data the fragment path holds goes through the child allocator
+     * {@code ColumnStore} creates from this one, whose limit is the column
+     * cache's share of {@code plugins.lance.native_memory.limit}, and a
+     * scan starts only after {@code ScanAdmission} admits it and the
+     * {@code lance_native} breaker ({@link LanceCircuitBreaker#checkAndTrip})
+     * lets it through, so a cap here would be a third bound that fails an
+     * allocation Lance is already inside instead of refusing the request.
+     */
     private static final BufferAllocator ALLOCATOR = new RootAllocator(Long.MAX_VALUE);
 
     /**
      * Node-wide Lance {@link Session}. Initialised by
-     * {@link #initSession(long, long)} from the plugin's
+     * {@link #initSession(NativeMemoryLimit.IndexCacheSizing, long)} from the plugin's
      * {@code createComponents} hook and released by
      * {@link #closeSession()} from {@code Plugin.close}. Kept as
      * {@code volatile} so the reader in {@link #openDataset(String, StorageOptions)}
@@ -66,26 +76,17 @@ public final class LanceRegistry {
     }
 
     /**
-     * Install a node-scoped {@link Session} with the given cache sizes.
-     * If a Session is already installed (e.g. an integration test
-     * framework restart within the same JVM) the existing Session is
-     * closed first so its native cache is released before the new one is
-     * built. The index cache capacity is handed to Lance as is; the shard
-     * count and share recorded for it describe what Lance does with that
-     * capacity on this node's CPU count.
-     *
-     * @param indexCacheBytes    upper bound of the shared index cache
-     * @param metadataCacheBytes upper bound of the shared metadata cache
-     */
-    public static synchronized void initSession(long indexCacheBytes, long metadataCacheBytes) {
-        initSession(NativeMemoryLimit.IndexCacheSizing.ofCapacity(indexCacheBytes, NativeMemoryLimit.availableCpus()), metadataCacheBytes);
-    }
-
-    /**
      * Install a node-scoped {@link Session} whose index cache capacity
-     * is {@code sizing.capacityBytes()}. Called once from
+     * is {@code sizing.capacityBytes()} and whose metadata cache is
+     * bounded by {@code metadataCacheBytes}. Called once from
      * {@code LancePlugin.createComponents} with the sizing chosen by
-     * {@link NativeMemoryLimit#sizeIndexCache}.
+     * {@link NativeMemoryLimit#sizeIndexCache}. If a Session is already
+     * installed (an integration test framework restart within the same
+     * JVM) the existing Session is closed first so its native cache is
+     * released before the new one is built. The capacity is handed to
+     * Lance as is; the shard count and share recorded in {@code sizing}
+     * describe what Lance does with that capacity on this node's CPU
+     * count.
      *
      * @param sizing             index cache capacity and its shard layout
      * @param metadataCacheBytes upper bound of the shared metadata cache
@@ -142,7 +143,7 @@ public final class LanceRegistry {
      * URIs when the map is empty.
      *
      * <p>If a node-scoped {@link Session} has been installed via
-     * {@link #initSession(long, long)}, the dataset is opened against
+     * {@link #initSession(NativeMemoryLimit.IndexCacheSizing, long)}, the dataset is opened against
      * that Session so its index and metadata caches are shared with
      * every other {@code Dataset} on this node. Otherwise Lance falls
      * back to a per-{@code Dataset} internal session with its own
@@ -152,25 +153,38 @@ public final class LanceRegistry {
      * the shared Session.
      */
     public static Dataset openDataset(String uri, StorageOptions storageOptions) {
-        return openDataset(uri, storageOptions, Optional.empty());
+        return open(uri, storageOptions, null);
     }
 
     /**
-     * Open a Lance dataset at a specific manifest version. When
-     * {@code pinnedVersion} is non-empty, the returned dataset is
-     * pinned to that Lance version and will not follow subsequent
+     * Open a Lance dataset at manifest {@code version}. The returned
+     * dataset is pinned to that version and does not follow subsequent
      * appends. An index pinned this way carries {@code index.plugins.lance.version},
      * which keeps it out of the freshness checks (see
      * {@code LanceIndexFreshnessService}) so refresh does not race with a
-     * manifest advance.
+     * manifest advance. The Session sharing is as in
+     * {@link #openDataset(String, StorageOptions)}.
      *
      * <p>Storage options and version pinning both go through
-     * {@link ReadOptions}, so this method combines them into a single
+     * {@link ReadOptions}, so the two are combined into a single
      * {@code ReadOptions} rather than round-tripping through
      * {@link StorageOptions#toReadOptionsOrNull} (which would drop
      * the version silently).
+     *
+     * @throws IllegalArgumentException when {@code version} is negative;
+     *         Lance manifest versions start at 1, and {@code -1} is the
+     *         "no version" encoding of {@code index.plugins.lance.version},
+     *         which belongs to {@link #openDataset(String, StorageOptions)}
      */
-    public static Dataset openDataset(String uri, StorageOptions storageOptions, Optional<Long> pinnedVersion) {
+    public static Dataset openDatasetAt(String uri, StorageOptions storageOptions, long version) {
+        if (version < 0) {
+            throw new IllegalArgumentException("version must be non negative, got [" + version + "]");
+        }
+        return open(uri, storageOptions, version);
+    }
+
+    /** The open behind the two public entries; {@code version} is null for the latest manifest. */
+    private static Dataset open(String uri, StorageOptions storageOptions, Long version) {
         OpenDatasetBuilder builder = Dataset.open().allocator(ALLOCATOR).uri(uri);
         Session session = SESSION;
         if (session != null && !session.isClosed()) {
@@ -178,12 +192,14 @@ public final class LanceRegistry {
         }
         Map<String, String> storageMap = storageOptions == null ? null : storageOptions.asMap();
         boolean hasStorage = storageMap != null && !storageMap.isEmpty();
-        if (hasStorage || pinnedVersion.isPresent()) {
+        if (hasStorage || version != null) {
             ReadOptions.Builder roBuilder = new ReadOptions.Builder();
             if (hasStorage) {
                 roBuilder.setStorageOptions(storageMap);
             }
-            pinnedVersion.ifPresent(roBuilder::setVersion);
+            if (version != null) {
+                roBuilder.setVersion(version);
+            }
             builder = builder.readOptions(roBuilder.build());
         }
         return builder.build();
@@ -195,7 +211,7 @@ public final class LanceRegistry {
      * one manifest, so the table is opened at its latest version first and
      * {@code Dataset.tags().getVersion(tag)} is read from there. Callers
      * then pass the returned version through
-     * {@link #openDataset(String, StorageOptions, java.util.Optional)} to
+     * {@link #openDatasetAt(String, StorageOptions, long)} to
      * read the tagged snapshot; this keeps tag following a two step
      * "resolve, then open at version" so the version-pinned open path is
      * the only place that checks out a specific manifest.

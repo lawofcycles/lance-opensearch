@@ -7,7 +7,6 @@ package org.opensearch.lance.dispatch;
 
 import java.io.IOException;
 import java.util.List;
-import java.util.Optional;
 
 import org.opensearch.action.FailedNodeException;
 import org.opensearch.action.support.ActionFilters;
@@ -103,7 +102,7 @@ public final class TransportLanceStatisticsPrefetchAction extends TransportNodes
         String tableUri = request.tableUri();
         long version = request.version();
         Outcome outcome;
-        if (statistics.prefetch(tableUri, version, () -> LanceRegistry.openDataset(table, storageOptions, Optional.of(version)))) {
+        if (statistics.prefetch(tableUri, version, () -> LanceRegistry.openDatasetAt(table, storageOptions, version))) {
             outcome = Outcome.STARTED;
         } else if (statistics.peek(tableUri, version) != null) {
             outcome = Outcome.HELD;

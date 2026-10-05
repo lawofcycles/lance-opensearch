@@ -260,6 +260,11 @@ public final class LanceNamespaceService implements Closeable {
         resurfaceGuard.setGrace(newGrace);
     }
 
+    /** The resurface guard's grace in force, for tests. */
+    TimeValue resurfaceGrace() {
+        return resurfaceGuard.grace();
+    }
+
     /**
      * Reconcile the per-node bookkeeping against the cluster's
      * {@link LanceNamespaceMetadata}. Called from the cluster state

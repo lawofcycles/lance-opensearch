@@ -406,7 +406,9 @@ public final class LanceIndexWarmer implements ClusterStateListener, Closeable {
             if (version.isEmpty() && task.tag != null) {
                 version = Optional.of(LanceRegistry.resolveTagVersion(task.table, task.storageOptions, task.tag));
             }
-            return LanceRegistry.openDataset(task.table, task.storageOptions, version);
+            return version.isPresent()
+                ? LanceRegistry.openDatasetAt(task.table, task.storageOptions, version.get())
+                : LanceRegistry.openDataset(task.table, task.storageOptions);
         });
     }
 

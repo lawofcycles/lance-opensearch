@@ -368,6 +368,11 @@ public final class TableStatisticsCache {
         this.collectDelayMillis = Math.max(0L, millis);
     }
 
+    /** Milliseconds a collection started from now on waits before it reads the table; zero for none. */
+    public long collectDelayMillis() {
+        return collectDelayMillis;
+    }
+
     /** Drop every entry. */
     public synchronized void clear() {
         entries.clear();

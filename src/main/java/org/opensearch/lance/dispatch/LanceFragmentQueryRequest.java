@@ -531,9 +531,12 @@ public final class LanceFragmentQueryRequest extends ActionRequest {
     }
 
     /**
-     * {@link #pinnedVersion()} in the shape
-     * {@link org.opensearch.lance.LanceRegistry#openDataset(String, StorageOptions, Optional)}
-     * takes: empty when no version was resolved.
+     * {@link #pinnedVersion()} wrapped for the caller that opens the
+     * dataset: present, it is the version to hand
+     * {@link org.opensearch.lance.LanceRegistry#openDatasetAt(String, StorageOptions, long)};
+     * empty, no version was resolved and the caller opens the latest
+     * manifest with
+     * {@link org.opensearch.lance.LanceRegistry#openDataset(String, StorageOptions)}.
      */
     public Optional<Long> pinnedVersionOrEmpty() {
         return pinnedVersion >= 0 ? Optional.of(pinnedVersion) : Optional.empty();

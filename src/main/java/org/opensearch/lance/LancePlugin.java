@@ -130,6 +130,55 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
 
     private static final Logger LOGGER = LogManager.getLogger(LancePlugin.class);
 
+    /**
+     * Name of the thread pool the coordinator side of the fragment path
+     * runs on: the entry of every {@code _search} against a Lance-backed
+     * index (resolving the request, enumerating fragments, sending the
+     * per-node requests) and the merge of the per-node responses (hit
+     * sort merge, aggregation reduce). The per-node fragment executors
+     * stay on the {@code search} pool. Keeping the two apart means a
+     * burst of coordinator work cannot fill the {@code search} queue of
+     * a data node, and a full {@code search} queue cannot make the
+     * transport layer drop a fragment response.
+     */
+    public static final String LANCE_COORDINATOR_THREAD_POOL = "lance_coordinator";
+
+    /**
+     * Default queue length of {@link #LANCE_COORDINATOR_THREAD_POOL}.
+     * Bounded, so a coordinator that cannot keep up rejects requests
+     * with 429 instead of queueing them without limit; large enough that
+     * the bound is only reached under a sustained overload.
+     */
+    static final int LANCE_COORDINATOR_QUEUE_SIZE = 10_000;
+
+    /** Default queue length of {@link LanceIndexWarmer#THREAD_POOL}: tables waiting for their warm-up. */
+    static final int LANCE_WARM_UP_QUEUE_SIZE = 1_000;
+
+    private LanceNamespaceService namespaceService;
+    private volatile LanceIndexFreshnessService freshnessService;
+    /** Served manifest version of every open Lance engine on this node, published by the engines. */
+    private final LanceServedVersions servedVersions = new LanceServedVersions();
+    /** The node's {@code IndicesService}, bound by Guice through {@link IndicesServiceHolder.Binder}; the engine factories read it. */
+    private final IndicesServiceHolder indicesServiceHolder = new IndicesServiceHolder();
+    /** The node's cluster service, kept so {@link #close} can take the listeners registered in createComponents off it. */
+    private volatile ClusterService clusterService;
+    private LanceDispatchActionFilter dispatchActionFilter;
+    private LanceCreateIndexActionFilter createIndexActionFilter;
+    private LanceClearCacheActionFilter clearCacheActionFilter;
+    private volatile LanceRequestCache requestCache;
+    private volatile LanceFetchCache fetchCache;
+    private volatile LanceWarmCache warmCache;
+    private volatile LanceIndexWarmer indexWarmer;
+    /** The loop that keeps the {@code lance_native} breaker's accounting aligned with the native caches; stopped by {@link #close}. */
+    private volatile LanceCircuitBreaker.Sampler circuitBreakerSampler;
+    /**
+     * Current {@link LanceSettings#MAX_DOCS_PER_READER_SETTING}, handed to
+     * the engine factories as a supplier so a reader opened after a
+     * settings update sees the new bound. The Lucene bound until the
+     * components are created.
+     */
+    private volatile long maxDocsPerReader = IndexWriter.MAX_DOCS;
+
     @Override
     public List<QuerySpec<?>> getQueries() {
         return List.of(
@@ -181,27 +230,6 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
     }
 
     /**
-     * Name of the thread pool the coordinator side of the fragment path
-     * runs on: the entry of every {@code _search} against a Lance-backed
-     * index (resolving the request, enumerating fragments, sending the
-     * per-node requests) and the merge of the per-node responses (hit
-     * sort merge, aggregation reduce). The per-node fragment executors
-     * stay on the {@code search} pool. Keeping the two apart means a
-     * burst of coordinator work cannot fill the {@code search} queue of
-     * a data node, and a full {@code search} queue cannot make the
-     * transport layer drop a fragment response.
-     */
-    public static final String LANCE_COORDINATOR_THREAD_POOL = "lance_coordinator";
-
-    /**
-     * Default queue length of {@link #LANCE_COORDINATOR_THREAD_POOL}.
-     * Bounded, so a coordinator that cannot keep up rejects requests
-     * with 429 instead of queueing them without limit; large enough that
-     * the bound is only reached under a sustained overload.
-     */
-    static final int LANCE_COORDINATOR_QUEUE_SIZE = 10_000;
-
-    /**
      * Register {@link #LANCE_COORDINATOR_THREAD_POOL} as a fixed pool of
      * {@code max(1, allocated processors / 2)} threads, and
      * {@link LanceIndexWarmer#THREAD_POOL} as a fixed pool of one thread
@@ -233,9 +261,6 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
             )
         );
     }
-
-    /** Default queue length of {@link LanceIndexWarmer#THREAD_POOL}: tables waiting for their warm-up. */
-    static final int LANCE_WARM_UP_QUEUE_SIZE = 1_000;
 
     /**
      * Lance-backed indexes get the read-only engine over the node's
@@ -306,33 +331,6 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         }
     }
 
-    private LanceNamespaceService namespaceService;
-    private volatile LanceIndexFreshnessService freshnessService;
-    /** Served manifest version of every open Lance engine on this node, published by the engines. */
-    private final LanceServedVersions servedVersions = new LanceServedVersions();
-    /** The node's {@code IndicesService}, bound by Guice through {@link IndicesServiceHolder.Binder}; the engine factories read it. */
-    private final IndicesServiceHolder indicesServiceHolder = new IndicesServiceHolder();
-    /** The node's cluster service, kept so {@link #close} can take the listeners registered in createComponents off it. */
-    private volatile ClusterService clusterService;
-    private AllowedTableRoots allowedTableRoots;
-    private AllowedCatalogEndpoints allowedCatalogEndpoints;
-    private LanceDispatchActionFilter dispatchActionFilter;
-    private LanceCreateIndexActionFilter createIndexActionFilter;
-    private LanceClearCacheActionFilter clearCacheActionFilter;
-    private volatile LanceRequestCache requestCache;
-    private volatile LanceFetchCache fetchCache;
-    private volatile LanceWarmCache warmCache;
-    private volatile LanceIndexWarmer indexWarmer;
-    /** The loop that keeps the {@code lance_native} breaker's accounting aligned with the native caches; stopped by {@link #close}. */
-    private volatile LanceCircuitBreaker.Sampler circuitBreakerSampler;
-    /**
-     * Current {@link LanceSettings#MAX_DOCS_PER_READER_SETTING}, handed to
-     * the engine factories as a supplier so a reader opened after a
-     * settings update sees the new bound. The Lucene bound until the
-     * components are created.
-     */
-    private volatile long maxDocsPerReader = IndexWriter.MAX_DOCS;
-
     /** The {@code lance_native} breaker, as {@link LanceCircuitBreaker#breakerSettings} describes it. */
     @Override
     public BreakerSettings getCircuitBreaker(Settings settings) {
@@ -392,8 +390,10 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         Settings settings = environment.settings();
         ClusterSettings clusterSettings = clusterService.getClusterSettings();
         this.clusterService = clusterService;
-        this.allowedTableRoots = new AllowedTableRoots(LanceSettings.ALLOWED_TABLE_ROOTS_SETTING.get(settings));
-        this.allowedCatalogEndpoints = new AllowedCatalogEndpoints(LanceSettings.ALLOWED_CATALOG_ENDPOINTS_SETTING.get(settings));
+        AllowedTableRoots allowedTableRoots = new AllowedTableRoots(LanceSettings.ALLOWED_TABLE_ROOTS_SETTING.get(settings));
+        AllowedCatalogEndpoints allowedCatalogEndpoints = new AllowedCatalogEndpoints(
+            LanceSettings.ALLOWED_CATALOG_ENDPOINTS_SETTING.get(settings)
+        );
 
         // 1. The shared Session.
         NativeMemoryLimit.Budget budget = NativeMemoryLimit.Budget.fromSettings(settings);
@@ -449,12 +449,13 @@ public class LancePlugin extends Plugin implements ActionPlugin, EnginePlugin, M
         LanceAggregateResults.bindSettings(settings, clusterSettings);
 
         // 5. The action filters and the namespace service. The dispatch
-        // filter intercepts every _search against a Lance backed index
-        // and hands it to the plugin's coordinator; the shard fan out
-        // through ReadOnlyEngine runs only for the shapes the fragment
-        // executor cannot answer yet. The clear cache filter drops the
-        // entries of a Lance backed index from every node's result cache
-        // before OpenSearch's own action clears the shard caches.
+        // filter intercepts every _search whose targets are all Lance
+        // backed and hands it to the plugin's coordinator, whatever the
+        // body; only a request that names a Lance backed index next to
+        // one that is not proceeds to the stock shard fan out. The clear
+        // cache filter drops the entries of a Lance backed index from
+        // every node's result cache before OpenSearch's own action clears
+        // the shard caches.
         this.dispatchActionFilter = new LanceDispatchActionFilter(clusterService, indexNameExpressionResolver, client, threadPool);
         this.createIndexActionFilter = new LanceCreateIndexActionFilter(threadPool);
         this.clearCacheActionFilter = new LanceClearCacheActionFilter(clusterService, indexNameExpressionResolver, client);

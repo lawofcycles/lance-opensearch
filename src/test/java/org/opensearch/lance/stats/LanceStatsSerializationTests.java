@@ -1052,7 +1052,7 @@ public class LanceStatsSerializationTests extends OpenSearchTestCase {
                 long version = lease.snapshot().version();
                 assertNotNull(
                     cache.tableStatistics()
-                        .lookup(tableUri, version, () -> LanceRegistry.openDataset(uri, StorageOptions.empty(), Optional.of(version)))
+                        .lookup(tableUri, version, () -> LanceRegistry.openDatasetAt(uri, StorageOptions.empty(), version))
                 );
                 assertEquals(
                     "a cache hit collects nothing",

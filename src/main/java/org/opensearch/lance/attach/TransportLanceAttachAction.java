@@ -238,7 +238,11 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         }
         RestAttachAction.Derivation derivation;
         long[] fragmentDocs;
-        try (Dataset dataset = LanceRegistry.openDataset(table, request.storageOptions(), openVersion)) {
+        try (
+            Dataset dataset = openVersion.isPresent()
+                ? LanceRegistry.openDatasetAt(table, request.storageOptions(), openVersion.get())
+                : LanceRegistry.openDataset(table, request.storageOptions())
+        ) {
             derivation = RestAttachAction.derive(dataset, request.overrides());
             List<Fragment> fragments = dataset.getFragments();
             fragmentDocs = new long[fragments.size()];

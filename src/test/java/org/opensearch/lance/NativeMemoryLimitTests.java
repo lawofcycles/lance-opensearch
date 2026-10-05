@@ -6,6 +6,7 @@
 package org.opensearch.lance;
 
 import org.opensearch.OpenSearchParseException;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.monitor.jvm.JvmInfo;
 import org.opensearch.monitor.os.OsProbe;
 import org.opensearch.test.OpenSearchTestCase;
@@ -247,5 +248,55 @@ public class NativeMemoryLimitTests extends OpenSearchTestCase {
         assertEquals("1gb", NativeMemoryLimit.humanReadable(1L * 1024 * 1024 * 1024));
         assertEquals("512mb", NativeMemoryLimit.humanReadable(512L * 1024 * 1024));
         assertEquals("0b", NativeMemoryLimit.humanReadable(0L));
+    }
+
+    public void testBudgetFromSettingsSplitsTheLimitLikeTheStaticMethods() {
+        // An absolute limit keeps the split independent of the host's
+        // memory; the shard count still depends on the CPU count, which
+        // the budget reports and the assertions reuse.
+        Settings settings = Settings.builder()
+            .put("plugins.lance.native_memory.limit", "14gb")
+            .put("plugins.lance.cache.column_share", 0.5)
+            .build();
+        NativeMemoryLimit.Budget budget = NativeMemoryLimit.Budget.fromSettings(settings);
+
+        assertEquals("14gb", budget.rawLimit());
+        assertEquals(0.5, budget.columnShare(), 0.0);
+        assertEquals(14 * GIB, budget.totalBytes());
+        assertEquals(7 * GIB, budget.columnCacheBytes());
+        assertEquals(7 * GIB, budget.sessionBytes());
+        assertEquals(NativeMemoryLimit.metadataCacheBytes(7 * GIB), budget.metadataCacheBytes());
+        assertEquals(NativeMemoryLimit.availableCpus(), budget.cpus());
+
+        long indexBudget = NativeMemoryLimit.indexCacheBudgetBytes(7 * GIB);
+        assertEquals(indexBudget, budget.indexCache().budgetBytes());
+        assertEquals(NativeMemoryLimit.sizeIndexCache(indexBudget, budget.cpus()), budget.indexCache());
+        assertEquals(NativeMemoryLimit.recommendedShards(budget.indexCache().capacityBytes(), budget.cpus()), budget.indexCache().shards());
+        assertEquals(
+            NativeMemoryLimit.shardShareBytes(budget.indexCache().capacityBytes(), budget.cpus()),
+            budget.indexCache().shardShareBytes()
+        );
+        // The three caches never exceed the limit, whatever was left unused.
+        assertTrue(budget.columnCacheBytes() + budget.metadataCacheBytes() + budget.indexCache().capacityBytes() <= budget.totalBytes());
+    }
+
+    public void testBudgetDescribeNamesEveryFigureAndItsSource() {
+        Settings settings = Settings.builder()
+            .put("plugins.lance.native_memory.limit", "14gb")
+            .put("plugins.lance.cache.column_share", 0.25)
+            .build();
+        NativeMemoryLimit.Budget budget = NativeMemoryLimit.Budget.fromSettings(settings);
+        String line = budget.describe();
+
+        assertTrue(line, line.contains("limit [14gb]"));
+        assertTrue(line, line.contains("index cache [" + NativeMemoryLimit.humanReadable(budget.indexCache().capacityBytes()) + "]"));
+        assertTrue(line, line.contains("shards " + budget.indexCache().shards()));
+        assertTrue(line, line.contains("share " + NativeMemoryLimit.humanReadable(budget.indexCache().shardShareBytes()) + " per shard"));
+        assertTrue(line, line.contains("metadata cache [" + NativeMemoryLimit.humanReadable(budget.metadataCacheBytes()) + "]"));
+        assertTrue(line, line.contains("column cache [" + NativeMemoryLimit.humanReadable(budget.columnCacheBytes()) + "]"));
+        assertTrue(line, line.contains("unused [" + NativeMemoryLimit.humanReadable(budget.indexCache().unusedBytes()) + "]"));
+        assertTrue(line, line.contains("plugins.lance.native_memory.limit [14gb]"));
+        assertTrue(line, line.contains("plugins.lance.cache.column_share [0.25]"));
+        assertTrue(line, line.contains(budget.cpus() + " cpus"));
     }
 }

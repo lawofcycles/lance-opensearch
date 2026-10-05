@@ -300,11 +300,7 @@ public final class LanceSchemas {
             // on its own: the snapshot's dataset closes with the
             // snapshot.
             TableStatistics statistics = warmCache.tableStatistics()
-                .lookup(
-                    dataset.uri(),
-                    snapshotVersion,
-                    () -> LanceRegistry.openDataset(tableUri, storageOptions, Optional.of(snapshotVersion))
-                );
+                .lookup(dataset.uri(), snapshotVersion, () -> LanceRegistry.openDatasetAt(tableUri, storageOptions, snapshotVersion));
             if (statistics != null) {
                 try {
                     statistics.readZoneMaps(dataset, queryFields);

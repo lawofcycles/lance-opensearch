@@ -556,7 +556,9 @@ public final class LanceEngineFactory implements EngineFactory {
             if (warmCache != null) {
                 return openSnapshotReader(directory, commit, version);
             }
-            Dataset dataset = LanceRegistry.openDataset(tablePath, storageOptions, version);
+            Dataset dataset = version.isPresent()
+                ? LanceRegistry.openDatasetAt(tablePath, storageOptions, version.get())
+                : LanceRegistry.openDataset(tablePath, storageOptions);
             // If wrapping the dataset in a directory reader fails, close it
             // here — otherwise the JNI-owned Dataset handle leaks and
             // eventually starves the native allocator. `LanceDirectoryReader`
@@ -1045,7 +1047,7 @@ public final class LanceEngineFactory implements EngineFactory {
                     requestBreaker()
                 );
             } else {
-                Dataset own = LanceRegistry.openDataset(tablePath, storageOptions, Optional.of(dataset.version()));
+                Dataset own = LanceRegistry.openDatasetAt(tablePath, storageOptions, dataset.version());
                 try {
                     single = LanceDirectoryReader.openForFragments(
                         new ByteBuffersDirectory(),

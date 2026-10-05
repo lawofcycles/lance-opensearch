@@ -131,6 +131,16 @@ public final class LanceAggregateResults {
         defaultTopkSlack = slack;
     }
 
+    /** The bins in force, for tests. */
+    static int percentilesBins() {
+        return defaultPercentilesBins;
+    }
+
+    /** The slack in force, for tests. */
+    static int topkSlack() {
+        return defaultTopkSlack;
+    }
+
     /**
      * Read the two planning parameters from the node settings and
      * register for their dynamic updates. Called once by the plugin at

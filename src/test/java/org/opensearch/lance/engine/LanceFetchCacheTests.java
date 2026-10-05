@@ -20,6 +20,8 @@ import org.apache.lucene.index.FilterLeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.StoredFieldVisitor;
 import org.apache.lucene.store.ByteBuffersDirectory;
+import org.opensearch.common.settings.ClusterSettings;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.common.xcontent.XContentType;
@@ -28,6 +30,7 @@ import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.index.mapper.Uid;
 import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceTableFactory;
+import org.opensearch.lance.LanceTestSettings;
 import org.opensearch.lance.StorageOptions;
 import org.opensearch.lance.engine.LanceEngineFactory.LancePrimaryKeyType;
 import org.opensearch.lance.engine.LanceFragmentSchema.TakeProjection;
@@ -316,6 +319,37 @@ public class LanceFetchCacheTests extends OpenSearchTestCase {
         LanceNodeStats.FetchCacheStats stats = cache.stats();
         assertEquals(new LanceNodeStats.FetchCacheStats(true, 152L, 4096L, 1, 1L, 1L, 0L, 0L, 3L, 1L), stats);
         assertEquals("LanceFetchCache[entries=1, bytes=152, limit=4096]", cache.toString());
+    }
+
+    public void testFromSettingsReadsTheNodeSettingsAndFollowsTheirUpdates() throws Exception {
+        Settings settings = Settings.builder()
+            .put("plugins.lance.fetch_cache.size", "4kb")
+            .put("plugins.lance.fetch_cache.max_entry_size", "100b")
+            .put("plugins.lance.fetch_cache.enabled", true)
+            .build();
+        ClusterSettings clusterSettings = LanceTestSettings.clusterSettings(settings);
+        AtomicLong nanos = new AtomicLong(1_000_000_000L);
+        LanceFetchCache cache = LanceFetchCache.fromSettings(settings, clusterSettings, nanos::get);
+
+        assertTrue(cache.isEnabled());
+        assertEquals(4096L, cache.stats().limitBytes());
+        LanceFetchCache.Table table = cache.table("uuid", 1L);
+        table.put(address(0, 1), List.of("id", "body"), new Object[] { 1L, "x".repeat(200) });
+        assertEquals("the entry bound from the settings keeps the 200 character cell out", 1, cache.count());
+        nanos.addAndGet(TimeValue.timeValueHours(24).nanos());
+        assertArrayEquals(
+            "no expiry from the settings keeps the small cell however old",
+            new Object[] { 1L },
+            table.lookup(address(0, 1), List.of("id"))
+        );
+
+        clusterSettings.applySettings(Settings.builder().put("plugins.lance.fetch_cache.expire", "1ms").build());
+        assertNull("the expire consumer is registered: the aged cell is dropped", table.lookup(address(0, 1), List.of("id")));
+
+        clusterSettings.applySettings(
+            Settings.builder().put("plugins.lance.fetch_cache.expire", "1ms").put("plugins.lance.fetch_cache.enabled", false).build()
+        );
+        assertFalse("the enabled consumer is registered", cache.isEnabled());
     }
 
     /**

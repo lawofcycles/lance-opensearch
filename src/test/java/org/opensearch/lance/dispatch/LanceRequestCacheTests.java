@@ -32,6 +32,7 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
+import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.XContentType;
@@ -42,6 +43,7 @@ import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.lance.LanceTestSettings;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
@@ -397,6 +399,60 @@ public class LanceRequestCacheTests extends OpenSearchTestCase {
         again.complete(took -> response(1.0d, 1L, false));
         now.addAndGet(TimeUnit.DAYS.toMillis(1));
         assertNotNull("no expiry keeps the entry", begin(cache, request, metadata, node("n1")).find(1L));
+    }
+
+    public void testFromSettingsReadsTheNodeSettingsAndFollowsTheirUpdates() throws Exception {
+        // The entry bound is set to the serialised size of one sum, so a
+        // one sum answer is stored and a two sum answer is refused.
+        long oneSumBytes = LanceRequestCache.aggregationBytes((InternalAggregations) response(1.0d, 1L, false).getAggregations());
+        Settings settings = Settings.builder()
+            .put("plugins.lance.request_cache.size", "4kb")
+            .put("plugins.lance.request_cache.max_entry_size", oneSumBytes + "b")
+            .put("plugins.lance.request_cache.enabled", true)
+            .build();
+        ClusterSettings clusterSettings = LanceTestSettings.clusterSettings(settings);
+        AtomicLong now = new AtomicLong(1_000L);
+        LanceRequestCache cache = LanceRequestCache.fromSettings(settings, clusterSettings, now::get);
+        IndexMetadata metadata = indexMetadata("demo", "uuid-1");
+
+        assertTrue(cache.isEnabled());
+        assertEquals(4096L, cache.stats().limitBytes());
+        SearchRequest twoSums = new SearchRequest("demo").source(
+            body("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"a\"}},\"t\":{\"sum\":{\"field\":\"b\"}}}}")
+        );
+        LanceRequestCache.Lookup refused = begin(cache, twoSums, metadata, node("n1"));
+        assertNull(refused.find(1L));
+        refused.complete(took -> responseWith(twoSums(1.0d, 2.0d)));
+        assertEquals("the entry bound from the settings refuses the two sum answer", 0, cache.count());
+        assertEquals(1L, cache.stats().skipped());
+
+        SearchRequest oneSum = new SearchRequest("demo").source(body("{\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"a\"}}}}"));
+        LanceRequestCache.Lookup stored = begin(cache, oneSum, metadata, node("n1"));
+        assertNull(stored.find(1L));
+        stored.complete(took -> response(1.0d, 1L, false));
+        assertEquals("the one sum answer is within the bound", 1, cache.count());
+        now.addAndGet(TimeUnit.DAYS.toMillis(1));
+        assertNotNull("no expiry from the settings keeps the entry however old", begin(cache, oneSum, metadata, node("n1")).find(1L));
+
+        clusterSettings.applySettings(Settings.builder().put("plugins.lance.request_cache.expire", "1ms").build());
+        assertNull("the expire consumer is registered: the aged entry is dropped", begin(cache, oneSum, metadata, node("n1")).find(1L));
+
+        clusterSettings.applySettings(
+            Settings.builder().put("plugins.lance.request_cache.expire", "1ms").put("plugins.lance.request_cache.enabled", false).build()
+        );
+        assertFalse("the enabled consumer is registered", cache.isEnabled());
+    }
+
+    private static InternalAggregations twoSums(double first, double second) {
+        return InternalAggregations.from(
+            List.of(new InternalSum("s", first, DocValueFormat.RAW, Map.of()), new InternalSum("t", second, DocValueFormat.RAW, Map.of()))
+        );
+    }
+
+    private static SearchResponse responseWith(InternalAggregations aggregations) {
+        SearchHits hits = new SearchHits(new SearchHit[0], new TotalHits(1L, TotalHits.Relation.EQUAL_TO), Float.NaN);
+        SearchResponseSections sections = new SearchResponseSections(hits, aggregations, null, false, null, null, 1);
+        return new SearchResponse(sections, null, 1, 1, 0, 5L, ShardSearchFailure.EMPTY_ARRAY, SearchResponse.Clusters.EMPTY);
     }
 
     public void testEvictionUnderTheWeightLimitCounts() throws IOException {
