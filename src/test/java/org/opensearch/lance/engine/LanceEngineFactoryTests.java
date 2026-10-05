@@ -6,8 +6,11 @@
 package org.opensearch.lance.engine;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.lucene.index.IndexWriter;
@@ -377,6 +380,11 @@ public class LanceEngineFactoryTests extends EngineTestCase {
                     assertEquals(attached + 1, ((LanceEngineFactory.LanceReadOnlyEngine) engine).servedVersion());
                     assertEquals(6, engine.docStats().getCount());
                     assertEquals(2L, cache.snapshotBuildCount());
+                    assertEquals(
+                        "a following engine reads the manifest on every call",
+                        3L,
+                        ((LanceEngineFactory.LanceReadOnlyEngine) engine).docStatsManifestReads()
+                    );
                 }
             }
 
@@ -396,9 +404,44 @@ public class LanceEngineFactoryTests extends EngineTestCase {
                 lanceStore.associateIndexWithNewTranslog(translogUuid);
                 EngineConfig config = config(pinnedSettings, lanceStore, pinnedTranslog, newMergePolicy(), null);
                 try (Engine engine = new LanceEngineFactory(cache).newReadWriteEngine(config)) {
+                    LanceEngineFactory.LanceReadOnlyEngine lanceEngine = (LanceEngineFactory.LanceReadOnlyEngine) engine;
                     long builds = cache.snapshotBuildCount();
                     long opens = cache.datasetOpenCount();
+                    assertEquals(0L, lanceEngine.docStatsManifestReads());
+
+                    // Concurrent first callers: one reads the manifest, the
+                    // others wait for its values.
+                    int callers = 4;
+                    CountDownLatch start = new CountDownLatch(1);
+                    List<Thread> threads = new ArrayList<>(callers);
+                    List<Exception> failures = new CopyOnWriteArrayList<>();
+                    List<DocsStats> answers = new CopyOnWriteArrayList<>();
+                    for (int i = 0; i < callers; i++) {
+                        Thread thread = new Thread(() -> {
+                            try {
+                                start.await();
+                                answers.add(engine.docStats());
+                            } catch (Exception e) {
+                                failures.add(e);
+                            }
+                        }, getTestName() + "-docStats-" + i);
+                        thread.start();
+                        threads.add(thread);
+                    }
+                    start.countDown();
+                    for (Thread thread : threads) {
+                        thread.join(30_000L);
+                    }
+                    assertTrue(failures.toString(), failures.isEmpty());
+                    assertEquals(callers, answers.size());
+                    for (DocsStats answer : answers) {
+                        assertEquals(4, answer.getCount());
+                    }
+                    assertEquals("one caller read the manifest, the rest waited for it", 1L, lanceEngine.docStatsManifestReads());
+
                     assertEquals(4, engine.docStats().getCount());
+                    assertEquals(4, engine.docStats().getCount());
+                    assertEquals("a pinned engine reads the manifest once", 1L, lanceEngine.docStatsManifestReads());
                     try (
                         Engine.GetResult miss = engine.get(
                             new Engine.Get(true, true, "alpha-5", new Term("_id", "alpha-5")),
@@ -409,7 +452,7 @@ public class LanceEngineFactoryTests extends EngineTestCase {
                     }
                     assertEquals(builds, cache.snapshotBuildCount());
                     assertEquals(opens, cache.datasetOpenCount());
-                    assertEquals(attached, ((LanceEngineFactory.LanceReadOnlyEngine) engine).servedVersion());
+                    assertEquals(attached, lanceEngine.servedVersion());
                 }
             }
         }

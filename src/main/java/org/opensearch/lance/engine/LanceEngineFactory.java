@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
@@ -395,6 +396,9 @@ public final class LanceEngineFactory implements EngineFactory {
         private final IndicesService indicesService;
         /** Doc stats of the last manifest {@link #docStats()} read, answered when the manifest cannot be read right now. */
         private volatile DocsStats lastDocStats;
+        /** Held by the one caller of a pinned engine that reads the manifest; the rest wait for its publish. */
+        private final Object docStatsLock = new Object();
+        private final LongAdder docStatsManifestReads = new LongAdder();
 
         LanceReadOnlyEngine(
             EngineConfig config,
@@ -774,8 +778,9 @@ public final class LanceEngineFactory implements EngineFactory {
         // as the coordinator does for a search), not from the shard reader:
         // the reader holds at most the Lucene document bound of rows and
         // counts nested children as docs, the manifest counts the table.
-        // One manifest open per call, the same cost the fragment path pays
-        // per request. The reader is neither acquired nor refreshed here.
+        // One manifest open per call (once per engine when the version is
+        // pinned), the same cost the fragment path pays per request. The
+        // reader is neither acquired nor refreshed here.
         //
         // totalSizeInBytes is the manifest data file total. It is not
         // what IndexShard.storeStats() reports as store.size: that is
@@ -787,12 +792,30 @@ public final class LanceEngineFactory implements EngineFactory {
         @Override
         public DocsStats docStats() {
             ensureOpen();
+            if (pinnedVersion.isEmpty()) {
+                return readDocStats();
+            }
+            // A pinned version never changes, so the manifest read once
+            // answers every later call. Callers that arrive while the first
+            // read is in flight wait for it instead of opening the manifest
+            // themselves; after it is published nobody takes the lock.
             DocsStats last = lastDocStats;
-            if (pinnedVersion.isPresent() && last != null) {
-                // A pinned version never changes, so the manifest read once
-                // answers every later call.
+            if (last != null) {
                 return last;
             }
+            synchronized (docStatsLock) {
+                last = lastDocStats;
+                return last != null ? last : readDocStats();
+            }
+        }
+
+        /**
+         * Open the manifest of the version the index follows, build its
+         * doc stats and publish them as {@link #lastDocStats}. When the
+         * manifest cannot be read and a previous read exists, answer that.
+         */
+        private DocsStats readDocStats() {
+            docStatsManifestReads.increment();
             try {
                 Optional<Long> target = pinnedVersion;
                 String currentTag = currentTag();
@@ -832,6 +855,15 @@ public final class LanceEngineFactory implements EngineFactory {
                 );
                 return fallback;
             }
+        }
+
+        /**
+         * Times {@link #docStats()} went to the table for its values rather
+         * than answering from the values it had read; one per call unless the
+         * version is pinned, in which case one for the engine.
+         */
+        long docStatsManifestReads() {
+            return docStatsManifestReads.sum();
         }
 
         @Override
