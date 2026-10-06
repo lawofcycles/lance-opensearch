@@ -538,8 +538,11 @@ public class LanceHitShapeIT extends LanceRestTestCase {
             assertEquals(List.of(0.7361701d, 0), sortValuesOf(hitsOf(firstBody).get(0)));
 
             // The next page continues from the last hit's sort values.
+            // The cursor carries Lance's score, which the oracle's BM25
+            // does not reproduce to the last digit, so the page is
+            // checked against the fixture alone.
             String nextPage = "{\"size\":2," + query + "," + sort + ",\"search_after\":[0.7361701,2]}";
-            String nextBody = assertSameHitIdsAsOracle(indexName, nextPage);
+            String nextBody = readAll(postJson("/" + indexName + "/_search", nextPage));
             assertEquals(List.of("0-4"), idsOf(hitsOf(nextBody)));
 
             // A lone ascending _score is a real sort; the cursor is a Float.

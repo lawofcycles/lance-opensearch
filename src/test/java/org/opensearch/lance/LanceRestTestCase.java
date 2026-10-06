@@ -757,6 +757,17 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
             if (copy.containsKey("_index")) {
                 copy.put("_index", lanceIndexNameOf(copy.get("_index")));
             }
+            if (copy.get("fields") instanceof Map<?, ?> fields) {
+                // A fields pattern on an oracle index also expands to the
+                // keyword sub field its text columns carry.
+                Map<String, Object> kept = new java.util.LinkedHashMap<>();
+                for (Map.Entry<?, ?> field : fields.entrySet()) {
+                    if (!((String) field.getKey()).endsWith("." + ORACLE_RAW_SUBFIELD)) {
+                        kept.put((String) field.getKey(), field.getValue());
+                    }
+                }
+                copy.put("fields", kept);
+            }
             out.add(copy);
         }
         return out;

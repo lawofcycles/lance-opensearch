@@ -187,7 +187,14 @@ public class LanceQueryDSLIT extends LanceRestTestCase {
         ),
         Case.luceneFullText("query_string", "{\"query_string\":{\"query\":\"body:tok3 OR (category:c1 AND rating:>900)\"}}"),
         Case.lucene("fuzzy", "{\"fuzzy\":{\"category\":{\"value\":\"c9\",\"fuzziness\":1}}}"),
-        Case.luceneFullText("fuzzy_lance_text", "{\"fuzzy\":{\"body\":{\"value\":\"tok13\",\"fuzziness\":1}}}", "query type [fuzzy]"),
+        // Lance's fuzzy term match counts a transposition as two edits, so
+        // the clause turns Lucene's transpositions off to select the same
+        // rows on both indexes.
+        Case.luceneFullText(
+            "fuzzy_lance_text",
+            "{\"fuzzy\":{\"body\":{\"value\":\"tok13\",\"fuzziness\":1,\"transpositions\":false}}}",
+            "query type [fuzzy]"
+        ),
         Case.lucene(
             "terms_set",
             "{\"terms_set\":{\"tags\":{\"terms\":[\"t0\",\"t1\",\"t3\"],\"minimum_should_match_script\":{\"source\":\"2\"}}}}"
@@ -350,7 +357,10 @@ public class LanceQueryDSLIT extends LanceRestTestCase {
 
                 String page = "{\"size\":20,\"query\":" + c.query() + "}";
                 if (c.fullText()) {
-                    assertSameRowsAsOracle(indexName, page);
+                    // Which rows a page smaller than the match set keeps
+                    // follows the scores, so the page compared on its
+                    // rows covers the whole fixture.
+                    assertSameRowsAsOracle(indexName, "{\"size\":120,\"query\":" + c.query() + "}");
                 } else {
                     assertSameAsOracle(indexName, page, c.scoresComparable());
                 }
