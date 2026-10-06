@@ -40,10 +40,10 @@ import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.attach.MappingDerivation;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.query.LanceInvalidInput;
-import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
@@ -880,11 +880,11 @@ public final class LanceNamespaceService implements Closeable {
         // is persisted in the index settings, ready for a manifest that
         // adds the column.
         LanceOverrides overrides = LanceOverrides.parse(overridesJson);
-        RestAttachAction.Derivation derivation;
+        MappingDerivation.Derivation derivation;
         try (Dataset dataset = LanceRegistry.openDataset(table, storageOptions)) {
             // Derive first so the CreateIndex settings and mapping reflect
             // the current Lance schema.
-            derivation = RestAttachAction.derive(dataset, overrides, true);
+            derivation = MappingDerivation.derive(dataset, overrides, true);
         }
         if (!derivation.notes().isEmpty() && LOG.isDebugEnabled()) {
             for (String note : derivation.notes()) {

@@ -48,6 +48,7 @@ import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.attach.MappingDerivation;
 import org.opensearch.lance.dispatch.LanceStatisticsPrefetchAction;
 import org.opensearch.lance.dispatch.LanceStatisticsPrefetchRequest;
 import org.opensearch.lance.dispatch.LanceStatisticsPrefetchResponse;
@@ -55,7 +56,6 @@ import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceServedVersions;
 import org.opensearch.lance.engine.LanceWarmCache;
 import org.opensearch.lance.plan.metadata.TableStatisticsCache;
-import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.test.client.NoOpClient;
 import org.opensearch.threadpool.TestThreadPool;
@@ -688,7 +688,7 @@ public class LanceIndexFreshnessServiceTests extends OpenSearchTestCase {
             if (tableUri != null) {
                 try (Dataset dataset = LanceRegistry.openDataset(tableUri, StorageOptions.empty())) {
                     shard.served = dataset.version();
-                    shard.currentMapping = parse(RestAttachAction.derive(dataset, LanceOverrides.EMPTY, true).mappingJson());
+                    shard.currentMapping = parse(MappingDerivation.derive(dataset, LanceOverrides.EMPTY, true).mappingJson());
                 }
             }
             return shard;

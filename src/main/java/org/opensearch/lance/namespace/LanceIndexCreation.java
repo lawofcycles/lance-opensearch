@@ -12,8 +12,8 @@ import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.lance.LanceInternalHeaders;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.attach.MappingDerivation;
 import org.opensearch.lance.engine.LanceEngineFactory;
-import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 
@@ -41,7 +41,7 @@ final class LanceIndexCreation {
         String indexName,
         String table,
         StorageOptions storageOptions,
-        RestAttachAction.Derivation derivation,
+        MappingDerivation.Derivation derivation,
         Settings carried
     ) {
         Settings.Builder settings = Settings.builder();

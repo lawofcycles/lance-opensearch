@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-package org.opensearch.lance.rest;
+package org.opensearch.lance.attach;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
@@ -29,13 +29,13 @@ import org.opensearch.test.OpenSearchTestCase;
  * (Lance indexes target top-level columns).
  */
 @ThreadLeakScope(ThreadLeakScope.Scope.NONE)
-public class RestAttachActionDeriveTests extends OpenSearchTestCase {
+public class MappingDerivationTests extends OpenSearchTestCase {
 
     public void testStructColumnDerivesObjectMapping() throws Exception {
         Path scratchDir = createTempDir();
         String uri = LanceTableFactory.writeStructTable(scratchDir, "derive-" + getTestName().toLowerCase(Locale.ROOT), 0);
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset);
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(dataset);
 
             String mapping = derivation.mappingJson();
             assertTrue("meta must map as object: " + mapping, mapping.contains("\"meta\":{\"type\":\"object\",\"properties\":{"));
@@ -80,7 +80,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
         Path scratchDir = createTempDir();
         String uri = LanceTableFactory.writeNestedTable(scratchDir, "derive-" + getTestName().toLowerCase(Locale.ROOT), 0);
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset);
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(dataset);
 
             String mapping = derivation.mappingJson();
             assertTrue("items must map as nested: " + mapping, mapping.contains("\"items\":{\"type\":\"nested\",\"properties\":{"));
@@ -107,7 +107,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
 
     public void testDateOverrideOnInt64DerivesDateMapping() throws Exception {
         try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, overrides(Map.of("ts", Map.of("type", "date"))));
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(dataset, overrides(Map.of("ts", Map.of("type", "date"))));
             String mapping = derivation.mappingJson();
             assertTrue("ts must map as date: " + mapping, mapping.contains("\"ts\":{\"type\":\"date\""));
             assertTrue("default format must be epoch_millis: " + mapping, mapping.contains("\"format\":\"epoch_millis\""));
@@ -119,7 +119,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
 
     public void testDateOverrideEmitsDeclaredFormat() throws Exception {
         try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(
                 dataset,
                 overrides(Map.of("ts", Map.of("type", "date", "format", "strict_date_optional_time||epoch_millis")))
             );
@@ -134,7 +134,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
         Path scratchDir = createTempDir();
         String uri = LanceTableFactory.writeDatedTable(scratchDir, "derive-" + getTestName().toLowerCase(Locale.ROOT));
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, overrides(Map.of("ts", Map.of("type", "date"))));
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(dataset, overrides(Map.of("ts", Map.of("type", "date"))));
             assertTrue(derivation.mappingJson(), derivation.mappingJson().contains("\"ts\":{\"type\":\"date\""));
         }
     }
@@ -143,7 +143,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
         try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
             IllegalArgumentException e = expectThrows(
                 IllegalArgumentException.class,
-                () -> RestAttachAction.derive(dataset, overrides(Map.of("label", Map.of("type", "date"))))
+                () -> MappingDerivation.derive(dataset, overrides(Map.of("label", Map.of("type", "date"))))
             );
             assertTrue(e.getMessage(), e.getMessage().contains("needs a signed 32 or 64 bit integer"));
             assertTrue(e.getMessage(), e.getMessage().contains("label"));
@@ -152,7 +152,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
 
     public void testKeywordOverrideOnInvertedIndexColumnDerivesKeyword() throws Exception {
         try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(
                 dataset,
                 overrides(Map.of("label", Map.of("type", "keyword")))
             );
@@ -170,7 +170,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
         try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
             IllegalArgumentException e = expectThrows(
                 IllegalArgumentException.class,
-                () -> RestAttachAction.derive(dataset, overrides(Map.of("ts", Map.of("type", "keyword"))))
+                () -> MappingDerivation.derive(dataset, overrides(Map.of("ts", Map.of("type", "keyword"))))
             );
             assertTrue(e.getMessage(), e.getMessage().contains("needs a Utf8 or List<Utf8> column"));
         }
@@ -180,7 +180,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
         try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
             IllegalArgumentException e = expectThrows(
                 IllegalArgumentException.class,
-                () -> RestAttachAction.derive(dataset, overrides(Map.of("nope", Map.of("type", "date"))))
+                () -> MappingDerivation.derive(dataset, overrides(Map.of("nope", Map.of("type", "date"))))
             );
             assertTrue(e.getMessage(), e.getMessage().contains("unknown column [nope]"));
         }
@@ -192,7 +192,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
         try (Dataset dataset = LanceRegistry.openDataset(uri, StorageOptions.empty())) {
             IllegalArgumentException e = expectThrows(
                 IllegalArgumentException.class,
-                () -> RestAttachAction.derive(dataset, overrides(Map.of("id", Map.of("type", "date"))))
+                () -> MappingDerivation.derive(dataset, overrides(Map.of("id", Map.of("type", "date"))))
             );
             assertTrue(e.getMessage(), e.getMessage().contains("primary key"));
         }
@@ -203,7 +203,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
             LinkedHashMap<String, Object> body = new LinkedHashMap<>();
             body.put("nope", Map.of("type", "date"));
             body.put("ts", Map.of("type", "date"));
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, overrides(body), true);
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(dataset, overrides(body), true);
             assertTrue(
                 "ts override must still apply: " + derivation.mappingJson(),
                 derivation.mappingJson().contains("\"ts\":{\"type\":\"date\"")
@@ -220,7 +220,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
 
     public void testFieldsOverrideEmitsSubFieldBlock() throws Exception {
         try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(
                 dataset,
                 overrides(Map.of("label", Map.of("fields", Map.of("raw", Map.of("type", "keyword")))))
             );
@@ -230,7 +230,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
 
     public void testTypeAndFieldsTogetherApplyBoth() throws Exception {
         try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(
                 dataset,
                 overrides(Map.of("label", Map.of("type", "keyword", "fields", Map.of("raw", Map.of("type", "keyword")))))
             );
@@ -244,7 +244,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
         try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
             IllegalArgumentException e = expectThrows(
                 IllegalArgumentException.class,
-                () -> RestAttachAction.derive(dataset, overrides(Map.of("ts", Map.of("fields", Map.of("raw", Map.of("type", "keyword"))))))
+                () -> MappingDerivation.derive(dataset, overrides(Map.of("ts", Map.of("fields", Map.of("raw", Map.of("type", "keyword"))))))
             );
             assertTrue(e.getMessage(), e.getMessage().contains("must be Utf8"));
         }
@@ -254,7 +254,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
         try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
             IllegalArgumentException e = expectThrows(
                 IllegalArgumentException.class,
-                () -> RestAttachAction.derive(dataset, overrides(Map.of("label", Map.of("fields", Map.of("raw", Map.of("type", "text"))))))
+                () -> MappingDerivation.derive(dataset, overrides(Map.of("label", Map.of("fields", Map.of("raw", Map.of("type", "text"))))))
             );
             assertTrue(e.getMessage(), e.getMessage().contains("must be [keyword]"));
         }
@@ -267,7 +267,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
 
     public void testIpOverrideOnUtf8DerivesIpMapping() throws Exception {
         try (Dataset dataset = LanceRegistry.openDataset(ipTable(), StorageOptions.empty())) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, overrides(Map.of("ip", Map.of("type", "ip"))));
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(dataset, overrides(Map.of("ip", Map.of("type", "ip"))));
             String mapping = derivation.mappingJson();
             assertTrue("ip must map as ip: " + mapping, mapping.contains("\"ip\":{\"type\":\"ip\""));
             assertTrue("meta must keep the real Arrow type: " + mapping, mapping.contains("\"lance_arrow_type\":\"Utf8\""));
@@ -279,7 +279,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
 
     public void testIpOverrideOnListOfUtf8DerivesIpMapping() throws Exception {
         try (Dataset dataset = LanceRegistry.openDataset(ipTable(), StorageOptions.empty())) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, overrides(Map.of("addrs", Map.of("type", "ip"))));
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(dataset, overrides(Map.of("addrs", Map.of("type", "ip"))));
             String mapping = derivation.mappingJson();
             assertTrue("addrs must map as ip: " + mapping, mapping.contains("\"addrs\":{\"type\":\"ip\""));
             assertTrue("meta must keep the list shape: " + mapping, mapping.contains("\"lance_arrow_type\":\"list<utf8>\""));
@@ -288,7 +288,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
 
     public void testIpOverrideWithKeywordSubFieldEmitsBoth() throws Exception {
         try (Dataset dataset = LanceRegistry.openDataset(ipTable(), StorageOptions.empty())) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(
                 dataset,
                 overrides(Map.of("ip", Map.of("type", "ip", "fields", Map.of("raw", Map.of("type", "keyword")))))
             );
@@ -302,7 +302,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
         try (Dataset dataset = LanceRegistry.openDataset(ipTable(), StorageOptions.empty())) {
             IllegalArgumentException e = expectThrows(
                 IllegalArgumentException.class,
-                () -> RestAttachAction.derive(dataset, overrides(Map.of("id", Map.of("type", "ip"))))
+                () -> MappingDerivation.derive(dataset, overrides(Map.of("id", Map.of("type", "ip"))))
             );
             assertTrue(e.getMessage(), e.getMessage().contains("needs a Utf8 or List<Utf8> column"));
             assertTrue(e.getMessage(), e.getMessage().contains("id"));
@@ -314,7 +314,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
         // inverted index; an ip override takes it off the FTS path like
         // a keyword override does.
         try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(dataset, overrides(Map.of("label", Map.of("type", "ip"))));
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(dataset, overrides(Map.of("label", Map.of("type", "ip"))));
             String mapping = derivation.mappingJson();
             assertTrue("label must map as ip: " + mapping, mapping.contains("\"label\":{\"type\":\"ip\""));
             assertFalse("label must not map as lance_text: " + mapping, mapping.contains("lance_text"));
@@ -324,7 +324,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
 
     public void testWildcardOverrideDerivesKeywordMappingWithIntentMeta() throws Exception {
         try (Dataset dataset = LanceRegistry.openDataset(ipTable(), StorageOptions.empty())) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(
                 dataset,
                 overrides(Map.of("path", Map.of("type", "wildcard")))
             );
@@ -337,7 +337,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
 
     public void testWildcardOverrideOnInvertedIndexColumnLeavesFts() throws Exception {
         try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(
                 dataset,
                 overrides(Map.of("label", Map.of("type", "wildcard")))
             );
@@ -352,13 +352,13 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
         try (Dataset dataset = LanceRegistry.openDataset(ipTable(), StorageOptions.empty())) {
             IllegalArgumentException onInt = expectThrows(
                 IllegalArgumentException.class,
-                () -> RestAttachAction.derive(dataset, overrides(Map.of("id", Map.of("type", "wildcard"))))
+                () -> MappingDerivation.derive(dataset, overrides(Map.of("id", Map.of("type", "wildcard"))))
             );
             assertTrue(onInt.getMessage(), onInt.getMessage().contains("needs a Utf8 column"));
             // Unlike ip, the multi-valued List<Utf8> shape is refused.
             IllegalArgumentException onList = expectThrows(
                 IllegalArgumentException.class,
-                () -> RestAttachAction.derive(dataset, overrides(Map.of("addrs", Map.of("type", "wildcard"))))
+                () -> MappingDerivation.derive(dataset, overrides(Map.of("addrs", Map.of("type", "wildcard"))))
             );
             assertTrue(onList.getMessage(), onList.getMessage().contains("needs a Utf8 column"));
         }
@@ -376,7 +376,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
 
     public void testGeoPointOverrideOnStructDerivesGeoPointMapping() throws Exception {
         try (Dataset dataset = LanceRegistry.openDataset(geoStructTable(), StorageOptions.empty())) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(
                 dataset,
                 overrides(Map.of("location", Map.of("type", "geo_point")))
             );
@@ -398,7 +398,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
 
     public void testGeoPointOverrideOnFslDerivesGeoPointMapping() throws Exception {
         try (Dataset dataset = LanceRegistry.openDataset(geoFslTable(true), StorageOptions.empty())) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(
                 dataset,
                 overrides(Map.of("location", Map.of("type", "geo_point")))
             );
@@ -415,7 +415,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
 
     public void testGeoPointOverrideOnFslWithLonLatOrder() throws Exception {
         try (Dataset dataset = LanceRegistry.openDataset(geoFslTable(false), StorageOptions.empty())) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(
                 dataset,
                 overrides(Map.of("location", Map.of("type", "geo_point", "order", "lon_lat")))
             );
@@ -429,7 +429,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
         try (Dataset dataset = LanceRegistry.openDataset(geoStructTable(), StorageOptions.empty())) {
             IllegalArgumentException e = expectThrows(
                 IllegalArgumentException.class,
-                () -> RestAttachAction.derive(dataset, overrides(Map.of("location", Map.of("type", "geo_point", "order", "lat_lon"))))
+                () -> MappingDerivation.derive(dataset, overrides(Map.of("location", Map.of("type", "geo_point", "order", "lat_lon"))))
             );
             assertTrue(e.getMessage(), e.getMessage().contains("only accepted on a FixedSizeList"));
         }
@@ -440,7 +440,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
             // A signed integer column is not a valid geo_point shape.
             IllegalArgumentException e = expectThrows(
                 IllegalArgumentException.class,
-                () -> RestAttachAction.derive(dataset, overrides(Map.of("ts", Map.of("type", "geo_point"))))
+                () -> MappingDerivation.derive(dataset, overrides(Map.of("ts", Map.of("type", "geo_point"))))
             );
             assertTrue(e.getMessage(), e.getMessage().contains("geo_point"));
             assertTrue(e.getMessage(), e.getMessage().contains("Struct with two Float64 children"));
@@ -451,7 +451,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
         try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
             IllegalArgumentException e = expectThrows(
                 IllegalArgumentException.class,
-                () -> RestAttachAction.derive(dataset, overrides(Map.of("ts", Map.of("type", "date", "order", "lat_lon"))))
+                () -> MappingDerivation.derive(dataset, overrides(Map.of("ts", Map.of("type", "date", "order", "lat_lon"))))
             );
             assertTrue(e.getMessage(), e.getMessage().contains("only accepted together with [type: geo_point]"));
         }
@@ -461,7 +461,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
         try (Dataset dataset = LanceRegistry.openDataset(geoFslTable(true), StorageOptions.empty())) {
             IllegalArgumentException e = expectThrows(
                 IllegalArgumentException.class,
-                () -> RestAttachAction.derive(dataset, overrides(Map.of("location", Map.of("type", "geo_point", "order", "xy"))))
+                () -> MappingDerivation.derive(dataset, overrides(Map.of("location", Map.of("type", "geo_point", "order", "xy"))))
             );
             assertTrue(e.getMessage(), e.getMessage().contains("order=xy"));
             assertTrue(e.getMessage(), e.getMessage().contains("lat_lon"));
@@ -479,14 +479,14 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
         // lance_text, the declaration is in the field meta and the
         // column joins ftsColumns.
         try (Dataset dataset = LanceRegistry.openDataset(englishTextTable(), StorageOptions.empty())) {
-            RestAttachAction.Derivation plain = RestAttachAction.derive(dataset);
+            MappingDerivation.Derivation plain = MappingDerivation.derive(dataset);
             assertTrue(
                 "body maps keyword without the override: " + plain.mappingJson(),
                 plain.mappingJson().contains("\"body\":{\"type\":\"keyword\"")
             );
             assertFalse(plain.ftsColumns().contains("body"));
 
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(
                 dataset,
                 overrides(Map.of("body", Map.of("type", "lance_text", "fields", Map.of("raw", Map.of("type", "keyword")))))
             );
@@ -509,7 +509,7 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
         // inverted index: the override pins the type the derivation
         // picks anyway and records the declaration.
         try (Dataset dataset = LanceRegistry.openDataset(epochMillisTable(), StorageOptions.empty())) {
-            RestAttachAction.Derivation derivation = RestAttachAction.derive(
+            MappingDerivation.Derivation derivation = MappingDerivation.derive(
                 dataset,
                 overrides(Map.of("label", Map.of("type", "lance_text")))
             );
@@ -524,14 +524,14 @@ public class RestAttachActionDeriveTests extends OpenSearchTestCase {
         try (Dataset dataset = LanceRegistry.openDataset(ipTable(), StorageOptions.empty())) {
             IllegalArgumentException onInt = expectThrows(
                 IllegalArgumentException.class,
-                () -> RestAttachAction.derive(dataset, overrides(Map.of("id", Map.of("type", "lance_text"))))
+                () -> MappingDerivation.derive(dataset, overrides(Map.of("id", Map.of("type", "lance_text"))))
             );
             assertTrue(onInt.getMessage(), onInt.getMessage().contains("type=lance_text] needs a Utf8 column"));
             assertTrue(onInt.getMessage(), onInt.getMessage().contains("id"));
             // The multi-valued List<Utf8> shape is refused as well.
             IllegalArgumentException onList = expectThrows(
                 IllegalArgumentException.class,
-                () -> RestAttachAction.derive(dataset, overrides(Map.of("addrs", Map.of("type", "lance_text"))))
+                () -> MappingDerivation.derive(dataset, overrides(Map.of("addrs", Map.of("type", "lance_text"))))
             );
             assertTrue(onList.getMessage(), onList.getMessage().contains("type=lance_text] needs a Utf8 column"));
             assertTrue(onList.getMessage(), onList.getMessage().contains("addrs"));

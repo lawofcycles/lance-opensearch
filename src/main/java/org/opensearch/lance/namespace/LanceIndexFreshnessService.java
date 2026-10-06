@@ -34,6 +34,7 @@ import org.opensearch.lance.LanceOverrides;
 import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.attach.MappingDerivation;
 import org.opensearch.lance.dispatch.LanceCoordinatorThreads;
 import org.opensearch.lance.dispatch.LanceStatisticsPrefetchAction;
 import org.opensearch.lance.dispatch.LanceStatisticsPrefetchNodeResponse;
@@ -41,7 +42,6 @@ import org.opensearch.lance.dispatch.LanceStatisticsPrefetchRequest;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.engine.LanceServedVersions;
 import org.opensearch.lance.engine.LanceWarmCache;
-import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.lance.stats.LanceNodeStats;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
@@ -442,7 +442,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         // The table URI as Lance spells it, the key the statistics cache
         // and the coordinator's lookup share.
         String tableKey;
-        RestAttachAction.Derivation derivation = null;
+        MappingDerivation.Derivation derivation = null;
         // One open of the latest manifest answers both questions: the
         // latest version for a latest following index, and the version
         // the tag points at now for a tag following one (tags live in the
@@ -470,7 +470,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
                 LanceOverrides stored = LanceOverrides.of(settings);
                 if (target == latestVersion) {
                     stored = driftDetector.rewriteOverridesForSchemaDrift(indexName, stored, latest.getLanceSchema());
-                    derivation = RestAttachAction.derive(latest, stored, true);
+                    derivation = MappingDerivation.derive(latest, stored, true);
                     driftDetector.warnOnLanceFieldRename(indexName, latest.getLanceSchema());
                 } else {
                     // The tag points at another manifest: derive from that
@@ -478,7 +478,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
                     // is about to read.
                     try (Dataset tagged = LanceRegistry.openDatasetAt(table, storageOptions, target)) {
                         stored = driftDetector.rewriteOverridesForSchemaDrift(indexName, stored, tagged.getLanceSchema());
-                        derivation = RestAttachAction.derive(tagged, stored, true);
+                        derivation = MappingDerivation.derive(tagged, stored, true);
                         driftDetector.warnOnLanceFieldRename(indexName, tagged.getLanceSchema());
                     }
                 }
@@ -651,7 +651,7 @@ public final class LanceIndexFreshnessService implements IndexEventListener, Clo
         String indexName,
         String table,
         StorageOptions storageOptions,
-        RestAttachAction.Derivation derivation,
+        MappingDerivation.Derivation derivation,
         Settings previousSettings,
         long target,
         String cause

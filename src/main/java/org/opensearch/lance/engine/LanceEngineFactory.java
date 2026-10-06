@@ -211,8 +211,8 @@ public final class LanceEngineFactory implements EngineFactory {
      * a base → (sub → type) map on shard open and forwards it to the
      * reader so keyword sub-fields ({@code body.raw} on a {@code body}
      * Utf8 column) become queryable through doc values. See
-     * {@link org.opensearch.lance.rest.RestAttachAction#serialiseMultiFields}
-     * / {@link org.opensearch.lance.rest.RestAttachAction#deserialiseMultiFields}.
+     * {@link org.opensearch.lance.attach.MappingDerivation#serialiseMultiFields}
+     * / {@link org.opensearch.lance.attach.MappingDerivation#deserialiseMultiFields}.
      */
     public static final String MULTI_FIELDS_SETTING = "index.plugins.lance.multi_fields";
 
