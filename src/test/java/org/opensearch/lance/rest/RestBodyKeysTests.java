@@ -17,7 +17,7 @@ import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.test.rest.FakeRestRequest;
 
 /**
- * The attach and namespace bodies reject a top level key outside their
+ * The namespace bodies reject a top level key outside their
  * accepted list before anything else is read: the first unknown key is an
  * {@link IllegalArgumentException} naming it and the accepted keys, and a
  * body made only of accepted keys never trips the check. The accepted
@@ -39,71 +39,6 @@ public class RestBodyKeysTests extends OpenSearchTestCase {
 
         RestBodyKeys.rejectUnknown("lance_x", Map.of("a", 1, "b", 2), List.of("a", "b"));
         RestBodyKeys.rejectUnknown("lance_x", Map.of(), List.of("a", "b"));
-    }
-
-    public void testAttachAcceptedKeysArePinned() {
-        assertEquals(
-            List.of("table", "name", "version", "tag", "storage_options", "overrides", "multi_fields"),
-            RestAttachAction.ACCEPTED_KEYS
-        );
-    }
-
-    public void testAttachRejectsAnUnknownTopLevelKey() {
-        RestAttachAction action = new RestAttachAction();
-        String[] unknown = { "indexes", "index_placement", "derive", "fts_columns", "tokenizer", "with_position", "settings" };
-        for (String key : unknown) {
-            String json = "{\"table\":\"/tmp/t.lance\",\"" + key + "\":{}}";
-            IllegalArgumentException e = expectThrows(
-                IllegalArgumentException.class,
-                () -> action.prepareRequest(post("/_plugins/_lance/attach", json), null)
-            );
-            assertEquals(
-                "[lance_attach] unknown key ["
-                    + key
-                    + "]; accepted keys are table, name, version, tag, storage_options, overrides, multi_fields",
-                e.getMessage()
-            );
-        }
-        // The first unknown key in document order is the one named, even
-        // when it comes before the required key.
-        IllegalArgumentException first = expectThrows(
-            IllegalArgumentException.class,
-            () -> action.prepareRequest(
-                post("/_plugins/_lance/attach", "{\"indexes\":[],\"table\":\"/tmp/t.lance\",\"derive\":true}"),
-                null
-            )
-        );
-        assertTrue(first.getMessage(), first.getMessage().startsWith("[lance_attach] unknown key [indexes]"));
-    }
-
-    public void testAttachReadsEveryAcceptedKey() {
-        // Each accepted key, sent alone next to the required table, passes
-        // the key check and reaches its own parser, so none of them is a
-        // dead entry in the list.
-        RestAttachAction action = new RestAttachAction();
-        Map<String, String> validValue = Map.of(
-            "table",
-            "\"/tmp/t.lance\"",
-            "name",
-            "\"t\"",
-            "version",
-            "3",
-            "tag",
-            "\"v1\"",
-            "storage_options",
-            "{\"aws_region\":\"us-east-1\"}",
-            "overrides",
-            "{\"body\":{\"type\":\"keyword\"}}",
-            "multi_fields",
-            "{\"body\":{\"raw\":{\"type\":\"keyword\"}}}"
-        );
-        assertEquals(RestAttachAction.ACCEPTED_KEYS.size(), validValue.size());
-        for (String key : RestAttachAction.ACCEPTED_KEYS) {
-            String json = "table".equals(key)
-                ? "{\"table\":" + validValue.get(key) + "}"
-                : "{\"table\":\"/tmp/t.lance\",\"" + key + "\":" + validValue.get(key) + "}";
-            assertNotNull(key, action.prepareRequest(post("/_plugins/_lance/attach", json), null));
-        }
     }
 
     public void testNamespaceAcceptedKeysArePinned() {

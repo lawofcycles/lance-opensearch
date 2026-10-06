@@ -151,19 +151,17 @@ public class LanceAttachIT extends LanceRestTestCase {
     }
 
     public void testAttachRejectsUnknownTopLevelKeys() throws Exception {
-        // A key the parser never reads answers 400 naming it and the
-        // accepted list, in core's illegal_argument_exception shape,
-        // instead of creating the index as if the key were absent.
-        String accepted = "accepted keys are table, name, version, tag, storage_options, overrides, multi_fields";
+        // A field the parser does not declare answers 400 naming it, in
+        // core's x_content_parse_exception shape, instead of creating the
+        // index as if the field were absent.
         for (String key : new String[] { "indexes", "fts_columns" }) {
             String payload = "{\"table\":\"/tmp/does-not-matter.lance\",\"" + key + "\":[\"body\"]}";
             ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_plugins/_lance/attach", payload));
             int status = failure.getResponse().getStatusLine().getStatusCode();
             assertEquals("expected 400 for [" + key + "], saw " + status, 400, status);
             String body = readAll(failure.getResponse());
-            assertTrue("expected illegal_argument_exception, saw: " + body, body.contains("illegal_argument_exception"));
-            assertTrue("expected the key named, saw: " + body, body.contains("[lance_attach] unknown key [" + key + "]"));
-            assertTrue("expected the accepted list, saw: " + body, body.contains(accepted));
+            assertTrue("expected x_content_parse_exception, saw: " + body, body.contains("x_content_parse_exception"));
+            assertTrue("expected the field named, saw: " + body, body.contains("[lance_attach] unknown field [" + key + "]"));
         }
 
         // The same body without the unknown key attaches.
