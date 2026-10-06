@@ -64,7 +64,10 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         int status = failure.getResponse().getStatusLine().getStatusCode();
         assertEquals("expected 400 for non-string path, saw " + status, 400, status);
         String body = readAll(failure.getResponse());
-        assertTrue("expected message about [path], saw: " + body, body.contains("[path]"));
+        assertTrue(
+            "expected the parser to name path and the value type, saw: " + body,
+            body.contains("path doesn't support values of type: VALUE_NUMBER")
+        );
     }
 
     public void testRegisterNamespaceRejectsNonExistentPath() throws IOException {
@@ -409,19 +412,16 @@ public class LanceNamespaceIT extends LanceRestTestCase {
     }
 
     public void testRegisterNamespaceRejectsUnknownTopLevelKey() throws IOException {
-        // A key the parser never reads answers 400 naming it and the
-        // accepted list instead of registering as if the key were absent.
+        // A field the parser does not declare answers 400 naming it instead
+        // of registering as if the field were absent.
         ResponseException failure = expectThrows(
             ResponseException.class,
             () -> postJson("/_plugins/_lance/namespace", "{\"path\":\"/tmp\",\"indexes\":[\"body\"]}")
         );
         assertEquals(400, failure.getResponse().getStatusLine().getStatusCode());
         String body = readAll(failure.getResponse());
-        assertTrue("expected illegal_argument_exception, saw: " + body, body.contains("illegal_argument_exception"));
-        assertTrue(
-            "expected the key and the accepted list, saw: " + body,
-            body.contains("[lance_namespace] unknown key [indexes]; accepted keys are path, type, name, config, storage_options, overrides")
-        );
+        assertTrue("expected x_content_parse_exception, saw: " + body, body.contains("x_content_parse_exception"));
+        assertTrue("expected the field named, saw: " + body, body.contains("[lance_namespace] unknown field [indexes]"));
 
         ResponseException tables = expectThrows(
             ResponseException.class,
@@ -429,10 +429,7 @@ public class LanceNamespaceIT extends LanceRestTestCase {
         );
         assertEquals(400, tables.getResponse().getStatusLine().getStatusCode());
         String tablesBody = readAll(tables.getResponse());
-        assertTrue(
-            "expected the key and the accepted list, saw: " + tablesBody,
-            tablesBody.contains("[lance_namespace] unknown key [type]; accepted keys are path, name")
-        );
+        assertTrue("expected the field named, saw: " + tablesBody, tablesBody.contains("[lance_namespace] unknown field [type]"));
     }
 
     public void testRegisterCatalogTypesRequireTheirConfigKeys() throws IOException {
