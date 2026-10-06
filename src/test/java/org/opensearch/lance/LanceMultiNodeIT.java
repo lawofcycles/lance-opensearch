@@ -1121,15 +1121,33 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             assertEquals(fragments, extractIntPath(readAll(attach), "fragments"));
             client().performRequest(new Request("GET", "/_cluster/health/" + indexName + "?wait_for_status=green&timeout=60s"));
 
-            for (String shape : shapes) {
-                assertFragmentPathMatchesOracleRows(indexName, shape);
+            // The pages in score order that keep ten of a few hundred
+            // matches follow Lance's BM25 (which Lucene's, with its
+            // quantised norms, does not reproduce), so those shapes
+            // compare their total with the oracle and their rows with
+            // the fixture below.
+            Set<Integer> scoreOrderedPages = Set.of(1, 4, 5, 8);
+            for (int i = 0; i < shapes.size(); i++) {
+                if (scoreOrderedPages.contains(i)) {
+                    assertFragmentPathMatchesOracleTotal(indexName, shapes.get(i));
+                } else {
+                    assertFragmentPathMatchesOracleRows(indexName, shapes.get(i));
+                }
             }
             // Analytic check of the bare top 10, independent of the
             // oracle: the score grows with the id, row i is
-            // (i % 3)-(i / 3).
+            // (i % 3)-(i / 3). The same page under an exact and a bounded
+            // total, and the c1 rows (ids 1 modulo 3) under the filter.
+            List<Integer> topIds = List.of(299, 298, 297, 296, 295, 294, 293, 292, 291, 290);
             Map<String, Object> top = parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(1) + "}")));
-            assertEquals(List.of(299, 298, 297, 296, 295, 294, 293, 292, 291, 290), sourceIds(top));
+            assertEquals(topIds, sourceIds(top));
             assertEquals(fragments * rowsPerFragment, extractIntPath(top, "hits", "total", "value"));
+            assertEquals(topIds, sourceIds(parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(5) + "}")))));
+            assertEquals(topIds, sourceIds(parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(8) + "}")))));
+            assertEquals(
+                List.of(298, 295, 292, 289, 286, 283, 280, 277, 274, 271),
+                sourceIds(parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(4) + "}"))))
+            );
             Map<String, Object> single = parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(0) + "}")));
             assertEquals(List.of(137), sourceIds(single));
             assertEquals(1, extractIntPath(single, "hits", "total", "value"));
@@ -1155,8 +1173,16 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
             // that need every match repeat their scan restricted to the
             // node's fragments and must still agree with the oracle.
             updateClusterSetting("plugins.lance.fts.subset_probe_limit", "50");
-            for (String shape : shapes) {
-                assertFragmentPathMatchesOracleRows(indexName, shape);
+            for (int i = 0; i < shapes.size(); i++) {
+                if (scoreOrderedPages.contains(i)) {
+                    assertFragmentPathMatchesOracleTotal(indexName, shapes.get(i));
+                    assertEquals(
+                        i == 4 ? List.of(298, 295, 292, 289, 286, 283, 280, 277, 274, 271) : topIds,
+                        sourceIds(parse(readAll(postJson("/" + indexName + "/_search", "{" + shapes.get(i) + "}"))))
+                    );
+                } else {
+                    assertFragmentPathMatchesOracleRows(indexName, shapes.get(i));
+                }
             }
 
             // The coordinator logs the fragments it hands to each node;
@@ -2872,6 +2898,27 @@ public class LanceMultiNodeIT extends OpenSearchRestTestCase {
                 assertEquals(shape + " hit " + i, expected, actual, 1e-6d);
             }
         }
+        assertEquals(shape, extractIntPath(oracle, "hits", "total", "value"), extractIntPath(fragmentPath, "hits", "total", "value"));
+        assertEquals(shape, relation(oracle), relation(fragmentPath));
+        assertEquals(shape, bucketSummary(oracle), bucketSummary(fragmentPath));
+    }
+
+    /**
+     * As {@link #assertFragmentPathMatchesOracleRows} for a page in
+     * score order that keeps fewer rows than match: the total, its
+     * relation and the buckets are compared, the rows are the caller's
+     * to check against the fixture.
+     */
+    private static void assertFragmentPathMatchesOracleTotal(String indexName, String shape) throws Exception {
+        Map<String, Object> fragmentPath = parse(readAll(postJson("/" + indexName + "/_search", "{" + shape + "}")));
+        Map<String, Object> oracle = parse(
+            readAll(
+                postJson(
+                    "/" + LanceRestTestCase.oracleIndexFor(indexName) + "/_search",
+                    LanceRestTestCase.oracleBody(indexName, "{" + shape + "}")
+                )
+            )
+        );
         assertEquals(shape, extractIntPath(oracle, "hits", "total", "value"), extractIntPath(fragmentPath, "hits", "total", "value"));
         assertEquals(shape, relation(oracle), relation(fragmentPath));
         assertEquals(shape, bucketSummary(oracle), bucketSummary(fragmentPath));
