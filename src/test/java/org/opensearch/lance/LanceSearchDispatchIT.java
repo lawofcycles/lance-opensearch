@@ -26,7 +26,7 @@ import org.opensearch.core.rest.RestStatus;
  * Search request shapes served by the fragment dispatch path (scalar
  * filters, date ranges, unmapped fields, top-k, pagination, post_filter,
  * search_after, scripts, response envelope), the shapes it refuses, and
- * the mixed targets the stock search action keeps.
+ * the mixed targets it refuses.
  */
 public class LanceSearchDispatchIT extends LanceRestTestCase {
 
@@ -1312,9 +1312,8 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
      * the two indexes' aggregation trees together; the answer is the
      * stock search path's for hits, totals, metrics, buckets and a pipeline over
      * the buckets. A Lance backed index next to an ordinary Lucene index,
-     * named directly or through an alias, keeps the stock search path (no
-     * fragment request runs) and the stock search path answers hits and metrics
-     * over both.
+     * named directly or through an alias, is refused with 400 before any
+     * fragment request runs.
      */
     @SuppressWarnings("unchecked")
     public void testCrossIndexSearchRoutesByTheTargetsBacking() throws Exception {
@@ -1377,20 +1376,19 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertEquals("every request above fanned out once per index", executedBefore + 2 + 3 * 2, fragmentRequestsExecuted());
 
             // A Lance backed index next to a Lucene index, directly and
-            // through the alias: the stock search path answers over both and no
-            // fragment request runs.
+            // through the alias: refused before any fragment request runs.
             for (String target : List.of(small + "," + lucene, small + "," + alias)) {
-                String mixed = readAll(postJson("/" + target + "/_search", hitsAndMetrics));
-                assertEquals("the stock search path served " + target, executedBefore + 8, fragmentRequestsExecuted());
-                assertEquals(target, 8, extractIntPath(mixed, "hits", "total", "value"));
-                assertEquals(target, 2, extractIntPath(mixed, "_shards", "total"));
-                List<Map<String, Object>> hits = fullHitsOf(mixed);
-                assertEquals(target, 8, hits.size());
-                assertEquals(target, small, hits.get(0).get("_index"));
-                assertEquals(target, lucene, hits.get(7).get("_index"));
-                // 15 from the table, 201 from the two Lucene documents.
-                assertEquals(target, 216.0d, extractDoublePath(mixed, "aggregations", "s", "value"), 0d);
-                assertEquals(target, 8, extractIntPath(mixed, "aggregations", "st", "count"));
+                ResponseException refused = expectThrows(
+                    ResponseException.class,
+                    () -> postJson("/" + target + "/_search", hitsAndMetrics)
+                );
+                String response = readAll(refused.getResponse());
+                assertEquals(target + ": " + response, 400, refused.getResponse().getStatusLine().getStatusCode());
+                assertTrue(
+                    target + ": " + response,
+                    response.contains("cannot search Lance backed index [" + small + "] together with a target that is not Lance backed")
+                );
+                assertEquals("no fragment request ran for " + target, executedBefore + 8, fragmentRequestsExecuted());
             }
         } finally {
             try {

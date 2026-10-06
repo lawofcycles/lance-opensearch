@@ -140,30 +140,20 @@ public class LanceFreshnessIT extends LanceRestTestCase {
     }
 
     public void testEngineReadsSeeACommitOnTheNextCallWithoutASyncOrACadence() throws Exception {
-        // The engine refreshes before every read of its own, so a row
-        // committed to the table is answered by GET and _mget, counted by
-        // _stats and read by a mixed target _search on the call right
-        // after the commit, with no sync and no wait for the scheduled
-        // check. A string PK table gives GET something to look up.
+        // The GET filter and _stats read the manifest of the version the
+        // index follows on every call, so a row committed to the table is
+        // answered by GET and _mget and counted by _stats on the call
+        // right after the commit, with no sync and no wait for the
+        // scheduled check. A string PK table gives GET something to look up.
         String suffix = "engine-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
         String tableUri = LanceTableFactory.writeStringPkTable(scratchDir, tableName, 4);
         String indexName = tableName;
-        String plain = "plain-" + suffix;
         try {
             Response attach = postJson("/_plugins/_lance/attach", "{\"table\":\"" + tableUri + "\"}");
             assertEquals(RestStatus.OK.getStatus(), attach.getStatusLine().getStatusCode());
             ensureGreen(indexName);
-            Request create = new Request("PUT", "/" + plain);
-            create.setJsonEntity(
-                "{\"settings\":{\"number_of_shards\":1,\"number_of_replicas\":0},"
-                    + "\"mappings\":{\"properties\":{\"key\":{\"type\":\"keyword\"},\"label\":{\"type\":\"keyword\"}}}}"
-            );
-            client().performRequest(create);
-            Request doc = new Request("PUT", "/" + plain + "/_doc/1?refresh=true");
-            doc.setJsonEntity("{\"key\":\"plain-1\",\"label\":\"row-1\"}");
-            client().performRequest(doc);
             assertEquals(4, engineDocCount(indexName));
             ResponseException missing = expectThrows(
                 ResponseException.class,
@@ -190,16 +180,12 @@ public class LanceFreshnessIT extends LanceRestTestCase {
             assertEquals(mgetBody, "col-5", mgetSource.get("label"));
             assertEquals("the next _stats counts the appended rows", 6, engineDocCount(indexName));
 
-            // A third commit, read by the stock search path over a mixed
-            // target (the Lance index next to a plain one) on its next call.
+            // A third commit, counted by the next _stats call.
             LanceTableFactory.appendStringPkRows(tableUri, 6, 1);
-            String mixed = readAll(postJson("/" + indexName + "," + plain + "/_search", "{\"size\":0,\"track_total_hits\":true}"));
-            assertEquals("the mixed target search read the shard reader", 2, extractIntPath(mixed, "_shards", "total"));
-            assertEquals(mixed, 7 + 1, extractIntPath(mixed, "hits", "total", "value"));
             assertEquals(7, engineDocCount(indexName));
         } finally {
             try {
-                client().performRequest(new Request("DELETE", "/" + indexName + "," + plain));
+                client().performRequest(new Request("DELETE", "/" + indexName));
             } catch (Exception ignored) {}
         }
     }

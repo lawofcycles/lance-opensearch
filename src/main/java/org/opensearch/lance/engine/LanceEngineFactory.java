@@ -81,11 +81,10 @@ import org.opensearch.lance.plan.explain.ReaderWrapperProbe;
  *       empty because there are no Lucene segments to describe.</li>
  *   <li>Refresh lifecycle: every searcher acquisition and
  *       {@link Engine#refresh(String)} advance the shared reader when
- *       the Lance manifest version advances, so {@code GET /_doc/{id}}
- *       and a {@code _search} whose target mixes a Lance backed index
- *       with an ordinary one (which the dispatch filter leaves to the
- *       stock search action) read the table's current version, as the
- *       fragment path does per request.</li>
+ *       the Lance manifest version advances. No {@code _search} reads
+ *       the reader: a Lance backed target alone takes the fragment
+ *       path and a target that mixes a Lance backed index with an
+ *       ordinary one is refused by the dispatch filter.</li>
  * </ul>
  *
  * <p>Under the hood, the empty Lucene commit created at shard bootstrap
