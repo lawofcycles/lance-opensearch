@@ -663,9 +663,8 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // min_score is applied by the stock MinimumScoreCollector around
         // the executor's hits, count and aggregation collectors, so the
         // documents below the threshold are neither returned, counted
-        // nor aggregated. Every shape is compared with the stock search path's
-        // answer (the same body with a highlighter, which routes
-        // there) and the executed counter proves the fragment path
+        // nor aggregated. Every shape is compared with the oracle's
+        // answer and the executed counter proves the fragment path
         // served the plain body.
         String suffix = "min-score-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
@@ -686,53 +685,54 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertEquals(0, extractIntPath(aboveBody, "hits", "total", "value"));
             assertEquals("eq", stringPath(aboveBody, "hits", "total", "relation"));
             assertTrue("no hit reaches min_score 2.0: " + aboveBody, fullHitsOf(aboveBody).isEmpty());
-            assertSameHitsAsStockSearch(indexName, above);
+            assertSameHitsAsOracle(indexName, above);
 
             String below = "{\"size\":10,\"query\":{\"match_all\":{}},\"min_score\":0.5}";
             String belowBody = readAll(postJson("/" + indexName + "/_search", below));
             assertEquals(6, extractIntPath(belowBody, "hits", "total", "value"));
             assertEquals(6, fullHitsOf(belowBody).size());
-            assertSameHitsAsStockSearch(indexName, below);
+            assertSameHitsAsOracle(indexName, below);
 
             // size 0 counts through the same collector.
             String countOnly = "{\"size\":0,\"query\":{\"match_all\":{}},\"min_score\":2.0}";
             assertEquals(0, extractIntPath(readAll(postJson("/" + indexName + "/_search", countOnly)), "hits", "total", "value"));
-            assertSameHitsAsStockSearch(indexName, countOnly);
+            assertSameHitsAsOracle(indexName, countOnly);
 
             // A scalar filter planned as a Lance scan scores 1.0 too.
             String term = "{\"size\":10,\"query\":{\"term\":{\"id\":2}},\"min_score\":0.5}";
             String termBody = readAll(postJson("/" + indexName + "/_search", term));
             assertEquals(1, extractIntPath(termBody, "hits", "total", "value"));
             assertEquals(List.of("0-2"), idsOf(hitsOf(termBody)));
-            assertSameHitsAsStockSearch(indexName, term);
+            assertSameHitsAsOracle(indexName, term);
 
             // A pushed FTS query: the BM25 scores of the three "hello
             // lance" rows are 0.7361701, so a low threshold keeps all
             // three (counted through the collector, not the Lance scan)
-            // and a high one drops them.
+            // and a high one drops them. The oracle agrees on the rows,
+            // not on Lance's scores.
             String ftsLow = "{\"size\":10,\"query\":{\"match\":{\"body\":\"lance\"}},\"min_score\":0.01}";
             String ftsLowBody = readAll(postJson("/" + indexName + "/_search", ftsLow));
             assertEquals(3, extractIntPath(ftsLowBody, "hits", "total", "value"));
             assertEquals(List.of("0-0", "0-2", "0-4"), idsOf(hitsOf(ftsLowBody)));
             assertEquals(0.7361701d, extractDoublePath(ftsLowBody, "hits", "max_score"), 1e-6d);
-            assertSameHitsAsStockSearch(indexName, ftsLow);
+            assertSameHitIdsAsOracle(indexName, ftsLow);
 
             String ftsHigh = "{\"size\":10,\"query\":{\"match\":{\"body\":\"lance\"}},\"min_score\":100}";
             String ftsHighBody = readAll(postJson("/" + indexName + "/_search", ftsHigh));
             assertEquals(0, extractIntPath(ftsHighBody, "hits", "total", "value"));
             assertTrue(fullHitsOf(ftsHighBody).isEmpty());
-            assertSameHitsAsStockSearch(indexName, ftsHigh);
+            assertSameHitIdsAsOracle(indexName, ftsHigh);
 
             String ftsCount = "{\"size\":0,\"query\":{\"match\":{\"body\":\"lance\"}},\"min_score\":0.01}";
             assertEquals(3, extractIntPath(readAll(postJson("/" + indexName + "/_search", ftsCount)), "hits", "total", "value"));
-            assertSameHitsAsStockSearch(indexName, ftsCount);
+            assertSameHitIdsAsOracle(indexName, ftsCount);
 
             // Aggregations see only the documents above the threshold.
             String agg = "{\"size\":0,\"query\":{\"match_all\":{}},\"min_score\":2.0,\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}}}}";
             String aggBody = readAll(postJson("/" + indexName + "/_search", agg));
             assertEquals(0, extractIntPath(aggBody, "hits", "total", "value"));
             assertEquals(0.0d, extractDoublePath(aggBody, "aggregations", "s", "value"), 0.0d);
-            assertSameHitsAsStockSearch(indexName, agg);
+            assertSameHitsAsOracle(indexName, agg);
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
@@ -768,7 +768,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertEquals("the fragment path served the request", executedBefore + 1, fragmentRequestsExecuted());
             assertTrue("terminated_early: " + countOnlyBody, countOnlyBody.contains("\"terminated_early\":true"));
             assertEquals(6, extractIntPath(countOnlyBody, "hits", "total", "value"));
-            assertSameHitsAsStockSearch(indexName, countOnly);
+            assertSameHitsAsOracle(indexName, countOnly);
 
             String page = "{\"size\":10,\"query\":{\"match_all\":{}},\"terminate_after\":2}";
             String pageBody = readAll(postJson("/" + indexName + "/_search", page));
@@ -776,25 +776,25 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertEquals(2, extractIntPath(pageBody, "hits", "total", "value"));
             assertEquals("eq", stringPath(pageBody, "hits", "total", "relation"));
             assertEquals(List.of("0-0", "0-1"), idsOf(hitsOf(pageBody)));
-            assertSameHitsAsStockSearch(indexName, page);
+            assertSameHitsAsOracle(indexName, page);
 
             String smallPage = "{\"size\":1,\"query\":{\"match_all\":{}},\"terminate_after\":2}";
             String smallPageBody = readAll(postJson("/" + indexName + "/_search", smallPage));
             assertEquals(2, extractIntPath(smallPageBody, "hits", "total", "value"));
             assertEquals(List.of("0-0"), idsOf(hitsOf(smallPageBody)));
-            assertSameHitsAsStockSearch(indexName, smallPage);
+            assertSameHitsAsOracle(indexName, smallPage);
 
             String accurate = "{\"size\":0,\"query\":{\"match_all\":{}},\"terminate_after\":2,\"track_total_hits\":true}";
             String accurateBody = readAll(postJson("/" + indexName + "/_search", accurate));
             assertTrue(accurateBody.contains("\"terminated_early\":true"));
             assertEquals(6, extractIntPath(accurateBody, "hits", "total", "value"));
-            assertSameHitsAsStockSearch(indexName, accurate);
+            assertSameHitsAsOracle(indexName, accurate);
 
             String notReached = "{\"size\":0,\"query\":{\"match_all\":{}},\"terminate_after\":20}";
             String notReachedBody = readAll(postJson("/" + indexName + "/_search", notReached));
             assertTrue("bound above the row count: " + notReachedBody, notReachedBody.contains("\"terminated_early\":false"));
             assertEquals(6, extractIntPath(notReachedBody, "hits", "total", "value"));
-            assertSameHitsAsStockSearch(indexName, notReached);
+            assertSameHitsAsOracle(indexName, notReached);
 
             // A pushed FTS query stops after two of its three hits.
             String fts = "{\"size\":10,\"query\":{\"match\":{\"body\":\"lance\"}},\"terminate_after\":2}";
@@ -802,7 +802,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertTrue(ftsBody.contains("\"terminated_early\":true"));
             assertEquals(2, extractIntPath(ftsBody, "hits", "total", "value"));
             assertEquals(List.of("0-0", "0-2"), idsOf(hitsOf(ftsBody)));
-            assertSameHitsAsStockSearch(indexName, fts);
+            assertSameHitIdsAsOracle(indexName, fts);
 
             // The aggregators see the two documents collected before the
             // bound: ids 0 and 1 sum to 1.
@@ -811,7 +811,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertTrue(aggBody.contains("\"terminated_early\":true"));
             assertEquals(6, extractIntPath(aggBody, "hits", "total", "value"));
             assertEquals(1.0d, extractDoublePath(aggBody, "aggregations", "s", "value"), 0.0d);
-            assertSameHitsAsStockSearch(indexName, agg);
+            assertSameHitsAsOracle(indexName, agg);
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
@@ -822,9 +822,10 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     public void testRescoreRunsOnTheFragmentPath() throws Exception {
         // The executor collects the largest rescore window through the
         // Lucene collector, runs each rescorer over it and cuts the page;
-        // every shape is compared with the stock search path's answer to the
-        // same body. Twelve rows over three fragments: body scores are
-        // distinct (BM25 grows with id), category is c<id % 3>.
+        // every shape is compared with the oracle's answer to the same
+        // body, on the rows alone where a full text clause scores.
+        // Twelve rows over three fragments: body scores are distinct
+        // (BM25 grows with id), category is c<id % 3>.
         String suffix = "rescore-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -845,7 +846,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertEquals("the fragment path served the request", executedBefore + 1, fragmentRequestsExecuted());
             assertEquals(10, extractIntPath(scalarThenFtsBody, "hits", "total", "value"));
             assertEquals(List.of("2-3", "1-3", "0-3", "2-2", "1-2"), idsOf(hitsOf(scalarThenFtsBody)));
-            assertSameHitsAsStockSearch(indexName, scalarThenFts);
+            assertSameHitIdsAsOracle(indexName, scalarThenFts);
 
             // A full text first pass re scored by a scalar query under
             // explicit weights: rows of category c1 gain the rescore
@@ -855,7 +856,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
                 + "\"query_weight\":0.5,\"rescore_query_weight\":2.0}}}";
             String ftsThenScalarBody = readAll(postJson("/" + indexName + "/_search", ftsThenScalar));
             assertEquals(12, extractIntPath(ftsThenScalarBody, "hits", "total", "value"));
-            assertSameHitsAsStockSearch(indexName, ftsThenScalar);
+            assertSameHitIdsAsOracle(indexName, ftsThenScalar);
 
             // A window smaller than the page: the three top rows are re
             // scored, the rest of the page is not.
@@ -863,24 +864,24 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
                 + "\"rescore\":{\"window_size\":3,\"query\":{\"rescore_query\":{\"term\":{\"category\":\"c2\"}}}}}";
             String smallWindowBody = readAll(postJson("/" + indexName + "/_search", smallWindow));
             assertEquals(8, fullHitsOf(smallWindowBody).size());
-            assertSameHitsAsStockSearch(indexName, smallWindow);
+            assertSameHitsAsOracle(indexName, smallWindow);
 
             // Two rescorers in a row, the second over the first's scores.
             String chained = "{\"size\":5,\"query\":{\"match_all\":{}},\"rescore\":["
                 + "{\"window_size\":12,\"query\":{\"rescore_query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}}}},"
                 + "{\"window_size\":4,\"query\":{\"rescore_query\":{\"term\":{\"category\":\"c0\"}},\"rescore_query_weight\":10}}]}";
-            assertSameHitsAsStockSearch(indexName, chained);
+            assertSameHitIdsAsOracle(indexName, chained);
 
             // score_mode max with weights on both sides.
             String maxMode = "{\"size\":5,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}},"
                 + "\"rescore\":{\"window_size\":12,\"query\":{\"rescore_query\":{\"term\":{\"bucket\":1}},"
                 + "\"query_weight\":0.3,\"rescore_query_weight\":1.5,\"score_mode\":\"max\"}}}";
-            assertSameHitsAsStockSearch(indexName, maxMode);
+            assertSameHitIdsAsOracle(indexName, maxMode);
 
             // from skips the leading rescored rows.
             String paged = "{\"from\":2,\"size\":3,\"query\":{\"match_all\":{}},"
                 + "\"rescore\":{\"window_size\":12,\"query\":{\"rescore_query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}}}}}";
-            assertSameHitsAsStockSearch(indexName, paged);
+            assertSameHitIdsAsOracle(indexName, paged);
 
             // The refusals core applies, with its messages.
             ConcurrentResult sorted = postForStatus(
@@ -913,7 +914,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
         // The executor collects one hit per distinct value through the
         // collapsing collector and the coordinator keeps one per value
         // across executors, expanding inner_hits with one search per
-        // group; every shape is compared with the stock search path's answer.
+        // group; every shape is compared with the oracle's answer.
         // Twelve rows: category c<id % 3>, bucket id % 4, body scores
         // grow with id.
         String suffix = "collapse-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
@@ -939,31 +940,31 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
                 "the collapse value is a field of the hit: " + keywordBody,
                 keywordBody.contains("\"fields\":{\"category\":[\"c0\"]}")
             );
-            assertSameHitsAsStockSearch(indexName, keyword);
+            assertSameHitsAsOracle(indexName, keyword);
 
             // Numeric field with a sort on another field: the highest id
             // of each bucket.
             String numeric = "{\"size\":10,\"sort\":[{\"id\":\"desc\"}],\"collapse\":{\"field\":\"bucket\"}}";
             String numericBody = readAll(postJson("/" + indexName + "/_search", numeric));
             assertEquals(List.of("2-3", "1-3", "0-3", "2-2"), idsOf(hitsOf(numericBody)));
-            assertSameHitsAsStockSearch(indexName, numeric);
+            assertSameHitsAsOracle(indexName, numeric);
 
             // from skips leading groups; a full text first pass picks the
             // best scored row of every category.
             String paged = "{\"from\":1,\"size\":2,\"sort\":[{\"ts\":\"desc\"}],\"collapse\":{\"field\":\"category\"}}";
-            assertSameHitsAsStockSearch(indexName, paged);
+            assertSameHitsAsOracle(indexName, paged);
             String fts =
                 "{\"size\":10,\"query\":{\"lance_match\":{\"field\":\"body\",\"query\":\"lance\"}},\"collapse\":{\"field\":\"category\"}}";
             String ftsBody = readAll(postJson("/" + indexName + "/_search", fts));
             assertEquals(List.of("2-3", "1-3", "0-3"), idsOf(hitsOf(ftsBody)));
-            assertSameHitsAsStockSearch(indexName, fts);
+            assertSameHitIdsAsOracle(indexName, fts);
 
             // inner_hits: one group search per collapsed hit with the
-            // block's size, sort and source filter. The stock search path
-            // refuses inner_hits on every Lance field (core wants the
-            // collapse field indexed, and the derived mapping says index:
-            // false), so the expansion is compared with the group search
-            // it issues instead of with the stock search path's answer.
+            // block's size, sort and source filter. Core refuses
+            // inner_hits on a collapse field that is not indexed (the
+            // derived mapping says index: false, and so does the
+            // oracle's), so the expansion is compared with the group
+            // search it issues instead of with the oracle's answer.
             String innerHits = "{\"size\":10,\"query\":{\"range\":{\"id\":{\"gte\":1}}},\"sort\":[{\"id\":\"asc\"}],"
                 + "\"collapse\":{\"field\":\"category\",\"inner_hits\":{\"name\":\"top\",\"size\":2,\"sort\":[{\"id\":\"desc\"}],"
                 + "\"_source\":[\"id\"]}}}";
@@ -987,9 +988,9 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             );
             assertEquals(fullHitsOf(groupSearch), firstInnerRows);
             assertEquals(totalOf(groupSearch), castMap(firstInnerHits.get("total")));
-            ConcurrentResult shardPathInnerHits = postForStatus("/" + withStockOracle(indexName) + "/_search", innerHits);
-            assertEquals(shardPathInnerHits.body(), 400, shardPathInnerHits.status());
-            assertTrue(shardPathInnerHits.body(), shardPathInnerHits.body().contains("only indexed field can retrieve `inner_hits`"));
+            ConcurrentResult oracleInnerHits = postForStatus("/" + oracleIndexFor(indexName) + "/_search", innerHits);
+            assertEquals(oracleInnerHits.body(), 400, oracleInnerHits.status());
+            assertTrue(oracleInnerHits.body(), oracleInnerHits.body().contains("only indexed field can retrieve `inner_hits`"));
 
             // max_concurrent_group_searches bounds the expansion; every
             // bucket (id % 4) still expands to its three rows.
@@ -1013,7 +1014,7 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
                 "{\"size\":2,\"sort\":[{\"category\":\"asc\"}],\"search_after\":[\"c0\"],\"collapse\":{\"field\":\"category\"}}";
             String cursorBody = readAll(postJson("/" + indexName + "/_search", cursor));
             assertEquals(List.of("1-0", "2-0"), idsOf(hitsOf(cursorBody)));
-            assertSameHitsAsStockSearch(indexName, cursor);
+            assertSameHitsAsOracle(indexName, cursor);
 
             // The refusals core applies, with its messages.
             ConcurrentResult text = postForStatus("/" + indexName + "/_search", "{\"size\":2,\"collapse\":{\"field\":\"body\"}}");
@@ -1055,21 +1056,21 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
      * Assert that {@code body} answers the same {@code hits} (total,
      * max_score and every rendered hit key), the same
      * {@code terminated_early} and the same {@code aggregations} on the
-     * fragment path as on the stock search action, which the same body
-     * against the target of {@link #withStockOracle} runs on.
+     * Lance index as on its oracle, the ordinary index of the same rows
+     * {@link #oracleIndexFor} loads.
      */
-    private static void assertSameHitsAsStockSearch(String indexName, String body) throws IOException {
+    private static void assertSameHitsAsOracle(String indexName, String body) throws Exception {
         String fragmentBody = readAll(postJson("/" + indexName + "/_search", body));
-        String shardBody = readAll(postJson("/" + withStockOracle(indexName) + "/_search", body));
+        String oracleBody = readAll(postJson("/" + oracleIndexFor(indexName) + "/_search", oracleBody(indexName, body)));
         Map<String, Object> fragmentPath = parseJson(fragmentBody);
-        Map<String, Object> shardPath = parseJson(shardBody);
+        Map<String, Object> oraclePath = parseJson(oracleBody);
         Map<String, Object> fragmentHits = new java.util.LinkedHashMap<>(hitsBlock(fragmentPath));
-        Map<String, Object> shardHits = new java.util.LinkedHashMap<>(hitsBlock(shardPath));
+        Map<String, Object> oracleHits = new java.util.LinkedHashMap<>(hitsBlock(oraclePath));
         fragmentHits.put("hits", fullHitsOf(fragmentBody));
-        shardHits.put("hits", fullHitsOf(shardBody));
-        assertEquals(body, shardHits, fragmentHits);
-        assertEquals(body, shardPath.get("terminated_early"), fragmentPath.get("terminated_early"));
-        assertEquals(body, aggregationsBlock(shardPath.get("aggregations")), aggregationsBlock(fragmentPath.get("aggregations")));
+        oracleHits.put("hits", fullHitsOf(oracleBody));
+        assertEquals(body, oracleHits, fragmentHits);
+        assertEquals(body, oraclePath.get("terminated_early"), fragmentPath.get("terminated_early"));
+        assertEquals(body, aggregationsBlock(oraclePath.get("aggregations")), aggregationsBlock(fragmentPath.get("aggregations")));
     }
 
     @SuppressWarnings("unchecked")
@@ -1365,15 +1366,15 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
             assertEquals(12, buckets.size());
             assertEquals(2, ((Number) buckets.get(0).get("doc_count")).intValue());
             assertEquals(1, ((Number) buckets.get(11).get("doc_count")).intValue());
-            assertSameHitsAsStockSearchInAnyOrder(small + "," + large, hitsAndMetrics);
+            assertSameHitsAsOraclesInAnyOrder(small + "," + large, hitsAndMetrics);
 
             String pipeline = "{\"size\":0,\"aggs\":{\"h\":{\"histogram\":{\"field\":\"id\",\"interval\":4},"
                 + "\"aggs\":{\"s\":{\"sum\":{\"field\":\"id\"}},\"cs\":{\"cumulative_sum\":{\"buckets_path\":\"s\"}}}},"
                 + "\"ab\":{\"avg_bucket\":{\"buckets_path\":\"h>s\"}}}}";
-            assertSameHitsAsStockSearchInAnyOrder(small + "," + large, pipeline);
+            assertSameHitsAsOraclesInAnyOrder(small + "," + large, pipeline);
             String filtered = "{\"size\":5,\"query\":{\"range\":{\"id\":{\"gte\":3}}},\"sort\":[{\"id\":\"desc\"}],"
                 + "\"aggs\":{\"m\":{\"max\":{\"field\":\"id\"}}}}";
-            assertSameHitsAsStockSearchInAnyOrder(small + "," + large, filtered);
+            assertSameHitsAsOraclesInAnyOrder(small + "," + large, filtered);
             assertEquals("every request above fanned out once per index", executedBefore + 2 + 3 * 2, fragmentRequestsExecuted());
 
             // A Lance backed index next to a Lucene index, directly and
@@ -1400,21 +1401,22 @@ public class LanceSearchDispatchIT extends LanceRestTestCase {
     }
 
     /**
-     * As {@link #assertSameHitsAsStockSearch}, for a target of several
-     * indexes: the hits are compared as a set keyed on {@code _index} and
-     * {@code _id}, since the two paths order equal sort values of
-     * different indexes differently (the stock search action by shard
-     * iteration order, the fragment path by the request's target order).
+     * As {@link #assertSameHitsAsOracle}, for a target of several
+     * indexes, against the oracles of every index: the hits are compared
+     * as a set keyed on {@code _index} and {@code _id}, since the two
+     * order equal sort values of different indexes differently (the
+     * stock search action by shard iteration order, the fragment path by
+     * the request's target order).
      */
-    private static void assertSameHitsAsStockSearchInAnyOrder(String target, String body) throws IOException {
+    private static void assertSameHitsAsOraclesInAnyOrder(String target, String body) throws Exception {
         String fragmentBody = readAll(postJson("/" + target + "/_search", body));
-        String shardBody = readAll(postJson("/" + withStockOracle(target) + "/_search", body));
+        String oracleBody = readAll(postJson("/" + oracleTargetFor(target) + "/_search", body));
         Map<String, Object> fragmentPath = parseJson(fragmentBody);
-        Map<String, Object> shardPath = parseJson(shardBody);
-        assertEquals(body, hitsBlock(shardPath).get("total"), hitsBlock(fragmentPath).get("total"));
-        assertEquals(body, hitsBlock(shardPath).get("max_score"), hitsBlock(fragmentPath).get("max_score"));
-        assertEquals(body, keyedHits(shardBody), keyedHits(fragmentBody));
-        assertEquals(body, aggregationsBlock(shardPath.get("aggregations")), aggregationsBlock(fragmentPath.get("aggregations")));
+        Map<String, Object> oraclePath = parseJson(oracleBody);
+        assertEquals(body, hitsBlock(oraclePath).get("total"), hitsBlock(fragmentPath).get("total"));
+        assertEquals(body, hitsBlock(oraclePath).get("max_score"), hitsBlock(fragmentPath).get("max_score"));
+        assertEquals(body, keyedHits(oracleBody), keyedHits(fragmentBody));
+        assertEquals(body, aggregationsBlock(oraclePath.get("aggregations")), aggregationsBlock(fragmentPath.get("aggregations")));
     }
 
     private static Map<String, Map<String, Object>> keyedHits(String searchBody) {
