@@ -22,8 +22,10 @@ import org.opensearch.core.rest.RestStatus;
  * The stock query DSL against a Lance backed index, one case per query
  * type: every case runs on the fragment path under four envelopes (a
  * count, a page in score order, a page ordered by a column, and an
- * aggregation) and must answer what the stock search action answers for
- * the same body against the target of {@link #withStockOracle}, while
+ * aggregation) and must answer what the oracle, the ordinary index of
+ * the same rows {@link #oracleIndexFor} loads, answers for the same body
+ * (a clause that scores a {@code lance_text} column agrees on the rows
+ * and the total, not on Lance's scores), while
  * {@code GET /_plugins/_lance/explain/<index>} must report the route the matrix
  * in {@code docs/features.md} promises: a predicate the Lance scan
  * evaluates, the Lance inverted index, or the Lucene composition of the
@@ -55,19 +57,20 @@ public class LanceQueryDSLIT extends LanceRestTestCase {
     /**
      * One query type: the clause, its route, the {@code unplanned}
      * message explain reports for a Lucene route (null on the scan and
-     * FTS routes), and whether the {@code _score} of a page can be
-     * compared with the stock search action (a predicate the scan
-     * evaluates scores every row 1.0, so a {@code bool} of several
-     * scoring clauses differs from Lucene's sum while a single clause
-     * does not).
+     * FTS routes), whether the {@code _score} of a page can be compared
+     * with the oracle (a predicate the scan evaluates scores every row
+     * 1.0, so a {@code bool} of several scoring clauses differs from
+     * Lucene's sum while a single clause does not), and whether the
+     * clause scores a {@code lance_text} column, in which case the page
+     * in score order is compared on its rows alone.
      */
-    private record Case(String name, String query, Route route, String unplanned, boolean scoresComparable) {
+    private record Case(String name, String query, Route route, String unplanned, boolean scoresComparable, boolean fullText) {
         static Case scan(String name, String query) {
-            return new Case(name, query, Route.SCAN, null, true);
+            return new Case(name, query, Route.SCAN, null, true, false);
         }
 
         static Case scanNoScores(String name, String query) {
-            return new Case(name, query, Route.SCAN, null, false);
+            return new Case(name, query, Route.SCAN, null, false, false);
         }
 
         static Case unlessScored(String name, String query) {
@@ -75,19 +78,28 @@ public class LanceQueryDSLIT extends LanceRestTestCase {
         }
 
         static Case unlessScored(String name, String query, String unplanned) {
-            return new Case(name, query, Route.SCAN_UNLESS_SCORED, unplanned, true);
+            return new Case(name, query, Route.SCAN_UNLESS_SCORED, unplanned, true, false);
         }
 
         static Case fts(String name, String query) {
-            return new Case(name, query, Route.FTS, null, true);
+            return new Case(name, query, Route.FTS, null, true, true);
         }
 
         static Case lucene(String name, String query) {
-            return new Case(name, query, Route.LUCENE, "query type [" + name + "]", true);
+            return new Case(name, query, Route.LUCENE, "query type [" + name + "]", true, false);
         }
 
         static Case lucene(String name, String query, String unplanned) {
-            return new Case(name, query, Route.LUCENE, unplanned, true);
+            return new Case(name, query, Route.LUCENE, unplanned, true, false);
+        }
+
+        /** A Lucene route whose clause scores the {@code lance_text} column. */
+        static Case luceneFullText(String name, String query) {
+            return new Case(name, query, Route.LUCENE, "query type [" + name + "]", true, true);
+        }
+
+        static Case luceneFullText(String name, String query, String unplanned) {
+            return new Case(name, query, Route.LUCENE, unplanned, true, true);
         }
     }
 
@@ -98,7 +110,7 @@ public class LanceQueryDSLIT extends LanceRestTestCase {
         .encodeToString("{\"term\":{\"category\":\"c1\"}}".getBytes(StandardCharsets.UTF_8));
 
     private static final List<Case> CASES = List.of(
-        new Case("match_all", "{\"match_all\":{}}", Route.BARE_SCAN, null, true),
+        new Case("match_all", "{\"match_all\":{}}", Route.BARE_SCAN, null, true, false),
         Case.scan("match_none", "{\"match_none\":{}}"),
         Case.scan("term", "{\"term\":{\"category\":\"c1\"}}"),
         Case.scan("term_integer", "{\"term\":{\"rating\":37}}"),
@@ -167,15 +179,15 @@ public class LanceQueryDSLIT extends LanceRestTestCase {
                 + "\"script\":{\"source\":\"doc['rating'].size() == 0 ? 0 : doc['rating'].value\"}}}"
         ),
         Case.lucene("script", "{\"script\":{\"script\":{\"source\":\"doc['rating'].size() > 0 && doc['rating'].value % 7 == 0\"}}}"),
-        Case.lucene("simple_query_string", "{\"simple_query_string\":{\"query\":\"tok3 | tok7 | tok11\",\"fields\":[\"body\"]}}"),
+        Case.luceneFullText("simple_query_string", "{\"simple_query_string\":{\"query\":\"tok3 | tok7 | tok11\",\"fields\":[\"body\"]}}"),
         Case.lucene(
             "simple_query_string_keyword",
             "{\"simple_query_string\":{\"query\":\"c0\",\"fields\":[\"category\"]}}",
             "query type [simple_query_string]"
         ),
-        Case.lucene("query_string", "{\"query_string\":{\"query\":\"body:tok3 OR (category:c1 AND rating:>900)\"}}"),
+        Case.luceneFullText("query_string", "{\"query_string\":{\"query\":\"body:tok3 OR (category:c1 AND rating:>900)\"}}"),
         Case.lucene("fuzzy", "{\"fuzzy\":{\"category\":{\"value\":\"c9\",\"fuzziness\":1}}}"),
-        Case.lucene("fuzzy_lance_text", "{\"fuzzy\":{\"body\":{\"value\":\"tok13\",\"fuzziness\":1}}}", "query type [fuzzy]"),
+        Case.luceneFullText("fuzzy_lance_text", "{\"fuzzy\":{\"body\":{\"value\":\"tok13\",\"fuzziness\":1}}}", "query type [fuzzy]"),
         Case.lucene(
             "terms_set",
             "{\"terms_set\":{\"tags\":{\"terms\":[\"t0\",\"t1\",\"t3\"],\"minimum_should_match_script\":{\"source\":\"2\"}}}}"
@@ -186,7 +198,7 @@ public class LanceQueryDSLIT extends LanceRestTestCase {
             "column [tags] behind field [tags] is not a supported scalar column"
         ),
         Case.lucene("match", "{\"match\":{\"category\":\"c2\"}}"),
-        Case.lucene("multi_match", "{\"multi_match\":{\"query\":\"tok5\",\"fields\":[\"body\"],\"type\":\"most_fields\"}}"),
+        Case.luceneFullText("multi_match", "{\"multi_match\":{\"query\":\"tok5\",\"fields\":[\"body\"],\"type\":\"most_fields\"}}"),
         Case.fts("match_lance_text", "{\"match\":{\"body\":\"grp3\"}}"),
         Case.fts("match_phrase", "{\"match_phrase\":{\"body\":\"hello tok5\"}}"),
         Case.fts("multi_match_best_fields", "{\"multi_match\":{\"query\":\"tok5\",\"fields\":[\"body\"]}}"),
@@ -209,30 +221,38 @@ public class LanceQueryDSLIT extends LanceRestTestCase {
     }
 
     /**
-     * Runs {@code body} on the fragment path and on the stock search
-     * action and asserts the two {@code hits} blocks agree: the total,
-     * the max score and every rendered hit key when scores are
-     * comparable, the total and every hit key but {@code _score}
-     * otherwise. Also asserts the fragment path served the body (the
-     * executed counter advanced). Returns the fragment path body.
+     * Runs {@code body} on the Lance index and on its oracle and asserts
+     * the two {@code hits} blocks agree: the total, the max score and
+     * every rendered hit key when scores are comparable, the total and
+     * every hit key but {@code _score} otherwise. Also asserts the
+     * fragment path served the body (the executed counter advanced).
+     * Returns the Lance index's body.
      */
-    private static String assertSameAsStockSearch(String indexName, String body, boolean scoresComparable) throws IOException {
+    private static String assertSameAsOracle(String indexName, String body, boolean scoresComparable) throws Exception {
         long executedBefore = fragmentRequestsExecuted();
         String fragmentBody = readAll(postJson("/" + indexName + "/_search", body));
         assertEquals("the fragment path served " + body, executedBefore + 1, fragmentRequestsExecuted());
-        String shardBody = readAll(postJson("/" + withStockOracle(indexName) + "/_search", body));
-        assertEquals(body, totalOf(shardBody), totalOf(fragmentBody));
+        String oracleBody = readAll(postJson("/" + oracleIndexFor(indexName) + "/_search", oracleBody(indexName, body)));
+        assertEquals(body, totalOf(oracleBody), totalOf(fragmentBody));
         if (scoresComparable) {
-            assertEquals(body, maxScoreOf(shardBody), maxScoreOf(fragmentBody));
-            assertEquals(body, fullHitsOf(shardBody), fullHitsOf(fragmentBody));
+            assertEquals(body, maxScoreOf(oracleBody), maxScoreOf(fragmentBody));
+            assertEquals(body, fullHitsOf(oracleBody), fullHitsOf(fragmentBody));
         } else {
-            assertEquals(body, hitsOf(shardBody), hitsOf(fragmentBody));
+            assertEquals(body, hitsOf(oracleBody), hitsOf(fragmentBody));
         }
         assertEquals(
             body,
-            aggregationsBlock(parseJson(shardBody).get("aggregations")),
+            aggregationsBlock(parseJson(oracleBody).get("aggregations")),
             aggregationsBlock(parseJson(fragmentBody).get("aggregations"))
         );
+        return fragmentBody;
+    }
+
+    /** As {@link #assertSameAsOracle} for a page whose clause scores a {@code lance_text} column: the rows and the total alone. */
+    private static String assertSameRowsAsOracle(String indexName, String body) throws Exception {
+        long executedBefore = fragmentRequestsExecuted();
+        String fragmentBody = assertSameHitIdsAsOracle(indexName, body);
+        assertEquals("the fragment path served " + body, executedBefore + 1, fragmentRequestsExecuted());
         return fragmentBody;
     }
 
@@ -320,24 +340,28 @@ public class LanceQueryDSLIT extends LanceRestTestCase {
         assertNull("no Lance clause: " + what, plan.get("lance_clause"));
     }
 
-    public void testEveryQueryTypeAnswersLikeTheStockSearchActionOnItsRoute() throws Exception {
+    public void testEveryQueryTypeAnswersLikeTheOracleOnItsRoute() throws Exception {
         try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 40, "querydsl")) {
             String indexName = fixture.indexName();
             for (Case c : CASES) {
                 String count = "{\"size\":0,\"track_total_hits\":true,\"query\":" + c.query() + "}";
-                assertSameAsStockSearch(indexName, count, false);
+                assertSameAsOracle(indexName, count, false);
                 assertRoute(indexName, c, count, Envelope.COUNT);
 
                 String page = "{\"size\":20,\"query\":" + c.query() + "}";
-                assertSameAsStockSearch(indexName, page, c.scoresComparable());
+                if (c.fullText()) {
+                    assertSameRowsAsOracle(indexName, page);
+                } else {
+                    assertSameAsOracle(indexName, page, c.scoresComparable());
+                }
                 assertRoute(indexName, c, page, Envelope.PAGE);
 
                 String sorted = "{\"size\":20,\"query\":" + c.query() + ",\"sort\":[{\"id\":\"asc\"}]}";
-                assertSameAsStockSearch(indexName, sorted, false);
+                assertSameAsOracle(indexName, sorted, false);
                 assertRoute(indexName, c, sorted, Envelope.SORTED);
 
                 String aggregation = "{\"size\":0,\"query\":" + c.query() + ",\"aggs\":{\"n\":{\"value_count\":{\"field\":\"id\"}}}}";
-                assertSameAsStockSearch(indexName, aggregation, false);
+                assertSameAsOracle(indexName, aggregation, false);
                 if (c.route() != Route.FTS) {
                     // An aggregation over a full text root stays on the
                     // aggregators, which the FTS route does not pin.
@@ -429,10 +453,7 @@ public class LanceQueryDSLIT extends LanceRestTestCase {
 
     /**
      * {@code ids} compares the primary key column; the string key
-     * fixture declares one. The stock search action is no oracle here:
-     * its whole table reader answers {@code ids} from {@code _id}
-     * postings the fragment leaves do not have, so the expected keys are
-     * pinned instead.
+     * fixture declares one. The expected keys are pinned.
      */
     public void testIdsQueryComparesThePrimaryKey() throws Exception {
         String suffix = "querydsl-ids-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
@@ -463,54 +484,53 @@ public class LanceQueryDSLIT extends LanceRestTestCase {
     }
 
     /**
-     * The query types the mapping refuses answer the same 400 on both
-     * paths: {@code intervals} and {@code match_phrase_prefix} need a
-     * {@code text} field, {@code has_child} / {@code has_parent} a join
-     * field no Lance table maps.
+     * The query types the mapping refuses answer 400: {@code intervals}
+     * and {@code match_phrase_prefix} need a {@code text} field,
+     * {@code has_child} / {@code has_parent} a join field no Lance table
+     * maps (the oracle, with no join field either, refuses it the same).
      */
-    public void testRefusedQueryTypesAnswerTheSame400AsTheStockSearchAction() throws Exception {
+    public void testRefusedQueryTypesAnswer400() throws Exception {
         try (LanceTestCluster fixture = LanceTestCluster.setUp(6, "querydsl-refused")) {
             String indexName = fixture.indexName();
-            assertSameRefusalAsStockSearch(
+            assertRefusal(
                 indexName,
                 "{\"query\":{\"intervals\":{\"body\":{\"match\":{\"query\":\"hello lance\"}}}}}",
                 "Can only use interval queries on text fields - not on [body] which is of type [lance_text]"
             );
-            assertSameRefusalAsStockSearch(
+            assertRefusal(
                 indexName,
                 "{\"query\":{\"match_phrase_prefix\":{\"body\":\"hello lan\"}}}",
                 "Can only use phrase prefix queries on text fields - not on [body] which is of type [lance_text]"
             );
-            assertSameRefusalAsStockSearch(
-                indexName,
-                "{\"query\":{\"has_child\":{\"type\":\"child\",\"query\":{\"match_all\":{}}}}}",
-                "[has_child] no join field has been configured"
-            );
+            String hasChild = "{\"query\":{\"has_child\":{\"type\":\"child\",\"query\":{\"match_all\":{}}}}}";
+            String noJoin = "[has_child] no join field has been configured";
+            assertRefusal(indexName, hasChild, noJoin);
+            assertRefusal(oracleIndexFor(indexName), hasChild, noJoin);
         }
     }
 
     /**
-     * The query types that need postings or term statistics answer 400
-     * on both paths: a span query extracts a Lucene term from the field
-     * type's term query, which the Lance full text query does not carry,
-     * and {@code more_like_this} accepts {@code text} and {@code keyword}
+     * The query types that need postings or term statistics answer 400:
+     * a span query extracts a Lucene term from the field type's term
+     * query, which the Lance full text query does not carry, and
+     * {@code more_like_this} accepts {@code text} and {@code keyword}
      * fields only. The same text matches through the Lance inverted
-     * index.
+     * index, on the rows the oracle's {@code text} field matches.
      */
-    public void testQueryTypesWithoutPostingsAreRefusedOnBothPaths() throws Exception {
+    public void testQueryTypesWithoutPostingsAreRefused() throws Exception {
         try (LanceTestCluster fixture = LanceTestCluster.setUp(6, "querydsl-nopostings")) {
             String indexName = fixture.indexName();
             String control = "{\"size\":0,\"track_total_hits\":true,\"query\":{\"match\":{\"body\":\"hello\"}}}";
-            assertEquals(3, extractIntPath(assertSameAsStockSearch(indexName, control, false), "hits", "total", "value"));
+            assertEquals(3, extractIntPath(assertSameRowsAsOracle(indexName, control), "hits", "total", "value"));
             String noTerm = "Cannot extract a term from a query of type class org.opensearch.lance.query.LanceFtsQuery";
-            assertSameRefusalAsStockSearch(indexName, "{\"query\":{\"span_term\":{\"body\":\"hello\"}}}", noTerm);
-            assertSameRefusalAsStockSearch(
+            assertRefusal(indexName, "{\"query\":{\"span_term\":{\"body\":\"hello\"}}}", noTerm);
+            assertRefusal(
                 indexName,
                 "{\"query\":{\"span_near\":{\"clauses\":[{\"span_term\":{\"body\":\"hello\"}},{\"span_term\":{\"body\":\"lance\"}}],"
                     + "\"slop\":0,\"in_order\":true}}}",
                 noTerm
             );
-            assertSameRefusalAsStockSearch(
+            assertRefusal(
                 indexName,
                 "{\"query\":{\"more_like_this\":{\"fields\":[\"body\"],\"like\":\"hello lance\",\"min_term_freq\":1,\"min_doc_freq\":1}}}",
                 "more_like_this only supports text/keyword fields: [body]"
@@ -519,20 +539,14 @@ public class LanceQueryDSLIT extends LanceRestTestCase {
     }
 
     /**
-     * Assert that {@code body} is refused with 400 on both paths with a
-     * root cause reason containing {@code reason} (the shard level query
-     * build prefixes {@code failed to create query: }); see
-     * {@code LanceHitShapeIT} for why the oracle target asks for no
-     * partial results.
+     * Assert that {@code body} is refused with 400 on {@code indexName}
+     * with a root cause reason containing {@code reason} (the shard
+     * level query build prefixes {@code failed to create query: }).
      */
-    private static void assertSameRefusalAsStockSearch(String indexName, String body, String reason) throws IOException {
-        ConcurrentResult fragmentPath = postForStatus("/" + indexName + "/_search", body);
-        ConcurrentResult shardPath = postForStatus("/" + withStockOracle(indexName) + "/_search?allow_partial_search_results=false", body);
-        assertEquals(fragmentPath.body(), 400, fragmentPath.status());
-        assertEquals(shardPath.body(), 400, shardPath.status());
-        String fragmentReason = stringPath(fragmentPath.body(), "error", "root_cause", "0", "reason");
-        String shardReason = stringPath(shardPath.body(), "error", "root_cause", "0", "reason");
-        assertTrue(fragmentReason, fragmentReason.contains(reason));
-        assertTrue(shardReason, shardReason.contains(reason));
+    private static void assertRefusal(String indexName, String body, String reason) throws IOException {
+        ConcurrentResult result = postForStatus("/" + indexName + "/_search", body);
+        assertEquals(result.body(), 400, result.status());
+        String actual = stringPath(result.body(), "error", "root_cause", "0", "reason");
+        assertTrue(actual, actual.contains(reason));
     }
 }

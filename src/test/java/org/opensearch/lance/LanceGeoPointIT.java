@@ -216,8 +216,9 @@ public class LanceGeoPointIT extends LanceRestTestCase {
         assertEquals(2, extractIntPath(rings, "aggregations", "rings", "buckets", "2", "doc_count"));
 
         // The fragment executors served both (one executor on this
-        // cluster), and every geo aggregation type answers what the
-        // stock search path answers over the same encoded doc values.
+        // cluster), and every geo aggregation type answers what an
+        // ordinary index of the same rows answers over the same encoded
+        // doc values.
         long before = fragmentRequestsExecuted();
         for (String shape : new String[] {
             "{\"size\":0,\"aggs\":{\"c\":{\"geo_centroid\":{\"field\":\"location\"}}}}",
@@ -228,10 +229,10 @@ public class LanceGeoPointIT extends LanceRestTestCase {
                 + TOKYO
                 + ",\"unit\":\"km\",\"ranges\":[{\"to\":10},{\"from\":10}]},\"aggs\":{\"c\":{\"geo_centroid\":{\"field\":\"location\"}}}}}}" }) {
             Map<String, Object> fragmentPath = parseJson(readAll(postJson("/" + indexName + "/_search", shape)));
-            Map<String, Object> shardPath = parseJson(
-                readAll(postJson("/" + withStockOracle(indexName) + "/_search?request_cache=false", shape))
+            Map<String, Object> oracle = parseJson(
+                readAll(postJson("/" + oracleIndexFor(indexName) + "/_search?request_cache=false", shape))
             );
-            assertEquals(shape, shardPath.get("aggregations"), fragmentPath.get("aggregations"));
+            assertEquals(shape, oracle.get("aggregations"), fragmentPath.get("aggregations"));
         }
         assertEquals("every geo aggregation ran on the fragment path", before + 5, fragmentRequestsExecuted());
     }
