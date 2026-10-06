@@ -5,8 +5,10 @@
 
 package org.opensearch.lance.dispatch;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.stream.Collectors;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -20,7 +22,6 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
-import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.AbstractRunnable;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
@@ -47,8 +48,10 @@ import org.opensearch.transport.client.Client;
  *
  * <p>The filter owns three responsibilities:
  * <ul>
- *   <li>Recognise whether every target is Lance backed
- *       ({@link #allLanceBacked}). Nothing about the request body
+ *   <li>Recognise which targets are Lance backed
+ *       ({@link #lanceBackedNamesOf}), after the index expressions were
+ *       resolved, so patterns and aliases are judged by what they expand
+ *       to. Nothing about the request body
  *       takes part in that decision: the coordinator plans every body
  *       over a Lance backed target, and a body no plan answers
  *       ({@code suggest}, {@code highlight}) is refused there with 400
@@ -66,11 +69,12 @@ import org.opensearch.transport.client.Client;
  *       one local hop. When the pool refuses the request, the
  *       request fails with the pool's rejection (HTTP 429).</li>
  *   <li>Fall through to the standard shard fan-out via
- *       {@code chain.proceed} when a target is not Lance backed,
- *       alone or next to Lance backed ones. That is the only request
- *       over a Lance backed index the stock search action still
- *       serves; a Lance backed target alone never leaves the
- *       fragment path, whatever its body. Until every request shape
+ *       {@code chain.proceed} when no target is Lance backed, and
+ *       refuse with 400 ({@link #mixedTargetMessage}) a target that
+ *       puts a Lance backed index next to one that is not. A Lance
+ *       backed index therefore never reaches the stock search action:
+ *       alone it takes the fragment path whatever its body, and mixed
+ *       it is refused. Until every request shape
  *       ran on the fragment executors, a body they did not serve
  *       (a suggester, a highlighter, aggregation types off an allow
  *       list) proceeded here onto the stock action over the shard's
@@ -132,10 +136,33 @@ public class LanceDispatchActionFilter implements ActionFilter {
 
         SearchRequest searchRequest = (SearchRequest) request;
         Index[] concrete = resolveConcreteIndexes(searchRequest);
-        if (concrete == null || concrete.length == 0 || !allLanceBacked(concrete)) {
-            // Mixed and non-Lance requests continue on the standard
-            // shard fan-out.
+        if (concrete == null || concrete.length == 0) {
+            // An expression the resolver rejects, or one that expands
+            // to nothing, continues on the standard shard fan-out and
+            // surfaces OpenSearch's own error.
             chain.proceed(task, action, request, listener);
+            return;
+        }
+        List<String> lanceBacked = lanceBackedNamesOf(concrete);
+        if (lanceBacked == null || lanceBacked.isEmpty()) {
+            // No Lance backed index among the targets (or an index the
+            // cluster state no longer has, which the stock action
+            // reports): the standard shard fan-out serves the request.
+            chain.proceed(task, action, request, listener);
+            return;
+        }
+        if (lanceBacked.size() < concrete.length) {
+            // A Lance backed index next to a target that is not Lance
+            // backed. The fragment path reads Lance backed indexes only
+            // and the stock search action would read the Lance index
+            // through the shard engine's reader, a view the plugin is
+            // retiring; the request is refused rather than answered
+            // from a route whose rows differ from the fragment path's.
+            // The resolver has already expanded patterns and aliases,
+            // so a pattern or an alias that spans both kinds arrives
+            // here as well, and _msearch reaches this filter once per
+            // line, so one mixed line is refused and the others answer.
+            listener.onFailure(new IllegalArgumentException(mixedTargetMessage(lanceBacked)));
             return;
         }
 
@@ -301,25 +328,41 @@ public class LanceDispatchActionFilter implements ActionFilter {
     }
 
     /**
-     * True when every concrete index is Lance-backed, judged by the
-     * presence of {@link LanceEngineFactory#TABLE_SETTING} on the
-     * index metadata. That setting is stamped by
-     * {@code RestAttachAction} and the namespace poller at index
-     * creation time.
+     * The names of the concrete indexes that are Lance backed, judged by
+     * the presence of {@link LanceEngineFactory#TABLE_SETTING} on the
+     * index metadata (stamped by {@code RestAttachAction} and the
+     * namespace poller at index creation time), in the resolver's
+     * order. {@code null} when one of the indexes has no metadata in the
+     * current cluster state (deleted between resolution and this
+     * check), so the caller lets the stock action report it.
      */
-    private boolean allLanceBacked(Index[] concrete) {
+    private List<String> lanceBackedNamesOf(Index[] concrete) {
         Metadata metadata = clusterService.state().metadata();
+        List<String> names = new ArrayList<>(concrete.length);
         for (Index index : concrete) {
             IndexMetadata indexMetadata = metadata.index(index);
             if (indexMetadata == null) {
-                return false;
+                return null;
             }
-            Settings settings = indexMetadata.getSettings();
-            String tableSetting = LanceEngineFactory.tableOf(settings);
-            if (tableSetting == null || tableSetting.isEmpty()) {
-                return false;
+            String tableSetting = LanceEngineFactory.tableOf(indexMetadata.getSettings());
+            if (tableSetting != null && !tableSetting.isEmpty()) {
+                names.add(index.getName());
             }
         }
-        return true;
+        return names;
+    }
+
+    /**
+     * The message of the 400 a search over a Lance backed index next to
+     * a target that is not Lance backed is refused with. Names every
+     * Lance backed index of the target, sorted (a wildcard expands in no
+     * fixed order), so the client can see which ones to search alone.
+     */
+    static String mixedTargetMessage(List<String> lanceBacked) {
+        return "cannot search Lance backed "
+            + (lanceBacked.size() == 1 ? "index" : "indexes")
+            + " ["
+            + lanceBacked.stream().sorted().collect(Collectors.joining(", "))
+            + "] together with a target that is not Lance backed; run the request against the Lance backed target alone, or split the targets";
     }
 }

@@ -88,8 +88,8 @@ when the body carries an element no plan answers (`suggest` or `highlight`, see
 route `unplanned` carries the message a `_search` with the same body is refused with (400), and
 `logical`, `physical`, `fragment_plan`, `refinements_possible`, `traits` and `cacheable` are
 absent, since nothing was planned; the endpoint answers 200 because it reports rather than executes. The
-dispatch filter's mixed target check (a target that is not Lance backed sends the whole request to
-the stock search action) is applied outside the plan and is not reflected in `route`.
+dispatch filter's mixed target check (a target that puts a Lance backed index next to one that is
+not Lance backed is refused with 400) is applied outside the plan and is not reflected in `route`.
 
 `logical` is the tree the translator built, one operator per line, indented by depth, as Calcite
 prints it. `physical` is the tree the planner chose, printed the same way. On the fragment route
