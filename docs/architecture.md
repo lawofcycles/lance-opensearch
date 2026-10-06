@@ -105,9 +105,9 @@ The dispatch layer intercepts every `_search` whose targets are all Lance backed
 OpenSearch's shard fan-out and hands it to the fragment path, which distributes the table's
 fragments across the data nodes and merges the per-node answers. Every body over such a target
 takes that path; a body no plan answers (`suggest`, `highlight`) is refused at the coordinator
-with 400 naming the element. Only a target that mixes a Lance backed index with an ordinary one
-stays on OpenSearch's stock search action, which reads the Lance index through the shard engine's
-whole table reader.
+with 400 naming the element. A target that mixes a Lance backed index with an ordinary one is
+refused with 400 naming the Lance backed index ([limitations.md](limitations.md#mixed-targets)), so
+no `_search` over a Lance backed index reaches OpenSearch's stock search action.
 
 The query planner, built on Apache Calcite, decides once per request, on the coordinating node,
 how the work executes on every data node: folded into the Lance native scan, or run through
@@ -312,8 +312,9 @@ identical either way; only where the grouping happened differs.
 There is no third route. Until every request shape ran on the fragment executors, a body they
 did not serve proceeded onto stock OpenSearch, one node reading the whole table through the Lance
 backed directory reader; that fallback is gone, and the executor decides at plan time whether a
-body has an answer. The directory reader itself stays for `GET /_doc/{id}` and a `_search` over a
-target that mixes a Lance backed index with an ordinary one; `_stats` reads the manifest.
+body has an answer. The directory reader itself stays on the shard, read by no `_search` (a target
+that mixes a Lance backed index with an ordinary one is refused); `GET /_doc/{id}` is answered by
+the GET filter and `_stats` reads the manifest.
 
 ### Search: hits
 
