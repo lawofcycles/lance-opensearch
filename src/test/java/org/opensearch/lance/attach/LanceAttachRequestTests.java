@@ -16,7 +16,9 @@ import org.opensearch.test.OpenSearchTestCase;
 
 /**
  * The attach body parser: every declared top level field reaches the
- * request, an unknown field is refused naming it, {@code number_of_shards}
+ * request, an unknown field is refused naming it, a JSON {@code null} on a
+ * declared field is refused as a value type error, a quoted number is
+ * accepted for {@code version}, {@code number_of_shards}
  * is refused with its reason, and the checks that need more than one
  * field ({@code version} with {@code tag}) or a parsed object
  * ({@code overrides} with {@code multi_fields}) run in
@@ -91,6 +93,34 @@ public class LanceAttachRequestTests extends OpenSearchTestCase {
             overrides.getMessage(),
             overrides.getMessage().contains("[lance_attach] overrides doesn't support values of type: START_ARRAY")
         );
+    }
+
+    public void testNullValueIsRefusedNamingTheField() {
+        // The fields are declared strictly, so a JSON null is a value type
+        // error from the parser, not an absent field.
+        XContentParseException version = expectThrows(
+            XContentParseException.class,
+            () -> parse("{\"table\":\"/tmp/t.lance\",\"version\":null}")
+        );
+        assertTrue(
+            version.getMessage(),
+            version.getMessage().contains("[lance_attach] version doesn't support values of type: VALUE_NULL")
+        );
+        XContentParseException storageOptions = expectThrows(
+            XContentParseException.class,
+            () -> parse("{\"table\":\"/tmp/t.lance\",\"storage_options\":null}")
+        );
+        assertTrue(
+            storageOptions.getMessage(),
+            storageOptions.getMessage().contains("[lance_attach] storage_options doesn't support values of type: VALUE_NULL")
+        );
+    }
+
+    public void testNumericStringVersionIsAccepted() throws IOException {
+        // declareLong reads VALUE_STRING as well as VALUE_NUMBER, so a
+        // quoted version pins the same manifest as the bare number.
+        LanceAttachRequest request = parse("{\"table\":\"/tmp/t.lance\",\"version\":\"3\"}");
+        assertEquals(Long.valueOf(3L), request.pinnedVersion().orElseThrow());
     }
 
     public void testBuildChecksTheFieldsTogether() {
