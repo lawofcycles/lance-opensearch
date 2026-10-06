@@ -15,6 +15,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -269,54 +270,364 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
         }
     }
 
-    /** Suffix of the empty ordinary index {@link #withStockOracle} puts next to a Lance index. */
-    private static final String STOCK_ORACLE_SUFFIX = "-stock-oracle";
+    /** Suffix of the ordinary index {@link #oracleIndexFor} loads next to a Lance index. */
+    static final String ORACLE_SUFFIX = "-oracle";
+
+    /** Sub field name under which an oracle index keeps the whole value of a full text column, for prefix, wildcard and regexp. */
+    static final String ORACLE_RAW_SUBFIELD = "oracle_raw";
 
     /**
-     * {@code target} (a {@code _search} index expression) with an empty
-     * ordinary index appended, so the request runs on OpenSearch's stock
-     * search action instead of the fragment coordinator. The dispatch
-     * filter hands a target with an index that is not Lance backed to the
-     * stock action, which searches the Lance index through the shard
-     * engine's whole table reader: one shard's Lucene query phase over
-     * the same rows the fragment executors read. That answer is the
-     * oracle the fragment path tests compare against. The appended index
-     * holds no document, so it adds no hit, no count and no bucket; it
-     * copies the mapping of the target's first index so that a sort, a
-     * collapse, a nested aggregation or a doc values clause resolves on
-     * its shard too, and both shards refuse the same requests with the
-     * same message (a failure on one shard alone would answer 200 with
-     * partial results). The index is created on first use and the test
-     * framework wipes it with every other index after each test.
+     * The {@code lance_text} columns of every oracle index this JVM has
+     * loaded, by oracle index name; {@link #oracleBody} rewrites the
+     * string pattern clauses on them to the {@link #ORACLE_RAW_SUBFIELD}.
+     */
+    private static final Map<String, Set<String>> ORACLE_TEXT_COLUMNS = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * The ordinary index that holds the same rows as the Lance index
+     * {@code lanceIndex}, created and loaded on first use. Its mapping
+     * is the Lance index's mapping with the plugin's own types replaced:
+     * {@code lance_text} becomes an indexed {@code text} field under the
+     * standard analyzer with a keyword sub field named
+     * {@link #ORACLE_RAW_SUBFIELD}, {@code lance_vector} is left out
+     * (core has no vector type), and every other property keeps its
+     * type and its {@code index: false, doc_values: true} options so a
+     * term, range, prefix or sort resolves through doc values on both
+     * indexes and scores a filter 1.0 on both. The field {@code meta}
+     * and the mapping {@code _meta} are dropped. The rows are read from
+     * the Lance table with {@link LanceTableRows#readRows} at the
+     * version the index pins (or the latest) and written with
+     * {@code _bulk}, one document per row under the {@code _id} the
+     * plugin renders, projected onto the mapped columns the way the
+     * fragment path renders {@code _source}; a {@code _refresh} follows.
+     * The test framework wipes the index with every other index after
+     * each test.
      */
     @SuppressWarnings("unchecked")
-    static String withStockOracle(String target) throws IOException {
-        String first = target.split(",")[0];
-        String oracle = first.replaceAll("[^a-z0-9_-]", "-") + STOCK_ORACLE_SUFFIX;
+    static String oracleIndexFor(String lanceIndex) throws Exception {
+        String oracle = lanceIndex + ORACLE_SUFFIX;
         Request exists = new Request("HEAD", "/" + oracle);
         exists.addParameter("ignore", "404");
-        if (client().performRequest(exists).getStatusLine().getStatusCode() == 404) {
-            Map<String, Object> mappingResponse = parseJson(
-                readAll(client().performRequest(new Request("GET", "/" + first + "/_mapping")))
+        if (client().performRequest(exists).getStatusLine().getStatusCode() != 404) {
+            return oracle;
+        }
+        Map<String, Object> settingsResponse = parseJson(
+            readAll(client().performRequest(new Request("GET", "/" + lanceIndex + "/_settings?flat_settings=true")))
+        );
+        Map<String, Object> settings = (Map<String, Object>) ((Map<String, Object>) settingsResponse.get(lanceIndex)).get("settings");
+        String tableUri = (String) settings.get("index.plugins.lance.table");
+        assertNotNull("index " + lanceIndex + " is not Lance backed: " + settings, tableUri);
+        Long version = null;
+        Object pinned = settings.get("index.plugins.lance.version");
+        if (pinned != null && !pinned.toString().isEmpty() && Long.parseLong(pinned.toString()) >= 0) {
+            version = Long.parseLong(pinned.toString());
+        }
+        Object tag = settings.get("index.plugins.lance.tag");
+        if (tag != null && !tag.toString().isEmpty()) {
+            version = LanceTableRows.tagVersion(tableUri, tag.toString());
+        }
+
+        Map<String, Object> mappingResponse = parseJson(
+            readAll(client().performRequest(new Request("GET", "/" + lanceIndex + "/_mapping")))
+        );
+        Map<String, Object> mappings = (Map<String, Object>) ((Map<String, Object>) mappingResponse.get(lanceIndex)).get("mappings");
+        Map<String, Object> properties = (Map<String, Object>) mappings.get("properties");
+        Set<String> textColumns = new java.util.HashSet<>();
+        Map<String, Object> oracleProperties = oracleProperties(properties, textColumns);
+        ORACLE_TEXT_COLUMNS.put(oracle, textColumns);
+
+        try (XContentBuilder builder = MediaTypeRegistry.JSON.contentBuilder()) {
+            builder.map(
+                Map.of(
+                    "settings",
+                    Map.of("index.number_of_shards", 1, "index.number_of_replicas", 0),
+                    "mappings",
+                    Map.of("dynamic", "strict", "properties", oracleProperties)
+                )
             );
-            Map<String, Object> mappings = new LinkedHashMap<>(
-                (Map<String, Object>) ((Map<String, Object>) mappingResponse.values().iterator().next()).get("mappings")
-            );
-            mappings.remove("_meta");
-            Map<String, Object> body = Map.of(
-                "settings",
-                Map.of("index.number_of_shards", 1, "index.number_of_replicas", 0),
-                "mappings",
-                mappings
-            );
-            try (XContentBuilder builder = MediaTypeRegistry.JSON.contentBuilder()) {
-                builder.map(body);
-                Request create = new Request("PUT", "/" + oracle);
-                create.setJsonEntity(builder.toString());
-                client().performRequest(create);
+            Request create = new Request("PUT", "/" + oracle);
+            create.setJsonEntity(builder.toString());
+            client().performRequest(create);
+        }
+
+        List<LanceTableRows.TableRow> rows = LanceTableRows.readRows(tableUri, version);
+        StringBuilder bulk = new StringBuilder();
+        int inChunk = 0;
+        for (LanceTableRows.TableRow row : rows) {
+            try (
+                XContentBuilder action = MediaTypeRegistry.JSON.contentBuilder();
+                XContentBuilder source = MediaTypeRegistry.JSON.contentBuilder()
+            ) {
+                action.map(Map.of("index", Map.of("_id", row.id())));
+                source.map(oracleSource(row.values(), properties));
+                bulk.append(action.toString()).append('\n').append(source.toString()).append('\n');
+            }
+            if (++inChunk == 1000) {
+                postBulk(oracle, bulk.toString());
+                bulk.setLength(0);
+                inChunk = 0;
             }
         }
-        return target + "," + oracle;
+        if (inChunk > 0) {
+            postBulk(oracle, bulk.toString());
+        }
+        client().performRequest(new Request("POST", "/" + oracle + "/_refresh"));
+        // One segment, so a collector that keeps a bounded set per
+        // segment (the samplers) sees the rows in the one order the
+        // fragment path's single slice does.
+        client().performRequest(new Request("POST", "/" + oracle + "/_forcemerge?max_num_segments=1"));
+        client().performRequest(new Request("POST", "/" + oracle + "/_refresh"));
+        return oracle;
+    }
+
+    /** {@code target} (a comma separated {@code _search} index expression) with every index replaced by its oracle. */
+    static String oracleTargetFor(String target) throws Exception {
+        List<String> oracles = new ArrayList<>();
+        for (String index : target.split(",")) {
+            oracles.add(oracleIndexFor(index));
+        }
+        return String.join(",", oracles);
+    }
+
+    private static void postBulk(String oracle, String body) throws IOException {
+        Request request = new Request("POST", "/" + oracle + "/_bulk");
+        request.setJsonEntity(body);
+        String response = readAll(client().performRequest(request));
+        assertFalse("bulk into " + oracle + " failed: " + response, response.contains("\"errors\":true"));
+    }
+
+    /**
+     * The oracle's {@code properties} for the Lance index's
+     * {@code properties}; see {@link #oracleIndexFor}. Collects the
+     * dotted paths of the {@code lance_text} columns into
+     * {@code textColumns}.
+     */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> oracleProperties(Map<String, Object> properties, Set<String> textColumns) {
+        return oracleProperties(properties, "", textColumns);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> oracleProperties(Map<String, Object> properties, String prefix, Set<String> textColumns) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> entry : properties.entrySet()) {
+            String name = entry.getKey();
+            Map<String, Object> definition = new LinkedHashMap<>((Map<String, Object>) entry.getValue());
+            definition.remove("meta");
+            String type = (String) definition.get("type");
+            if ("lance_vector".equals(type)) {
+                continue;
+            }
+            if ("lance_text".equals(type)) {
+                textColumns.add(prefix + name);
+                Map<String, Object> fields = new LinkedHashMap<>();
+                if (definition.get("fields") instanceof Map<?, ?> subFields) {
+                    fields.putAll(oracleProperties((Map<String, Object>) subFields, prefix + name + ".", textColumns));
+                }
+                fields.put(ORACLE_RAW_SUBFIELD, Map.of("type", "keyword"));
+                out.put(name, Map.of("type", "text", "analyzer", "standard", "fields", fields));
+                continue;
+            }
+            if (definition.get("properties") instanceof Map<?, ?> children) {
+                definition.put("properties", oracleProperties((Map<String, Object>) children, prefix + name + ".", textColumns));
+            }
+            if (definition.get("fields") instanceof Map<?, ?> subFields) {
+                definition.put("fields", oracleProperties((Map<String, Object>) subFields, prefix + name + ".", textColumns));
+            }
+            if ("date".equals(type) && definition.get("format") instanceof String format && !format.contains("epoch_millis")) {
+                // The rows carry dates as epoch millis, as the fragment
+                // path renders them; the declared pattern stays first so
+                // docvalue_fields and fields print through it.
+                definition.put("format", format + "||epoch_millis");
+            }
+            out.put(name, definition);
+        }
+        return out;
+    }
+
+    /**
+     * The row's values projected onto {@code properties}, the way the
+     * fragment path renders {@code _source}: only mapped columns, a
+     * struct recursing into its mapped children with nulls kept, a
+     * nested column as the array of its mapped elements, and a
+     * {@code geo_point} column as {@code {lat, lon}} whatever the Arrow
+     * storage was.
+     */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> oracleSource(Map<String, Object> values, Map<String, Object> properties) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> entry : values.entrySet()) {
+            Map<String, Object> definition = (Map<String, Object>) properties.get(entry.getKey());
+            if (definition == null || "lance_vector".equals(definition.get("type"))) {
+                continue;
+            }
+            Object value = oracleValue(entry.getValue(), definition);
+            if (value != null) {
+                out.put(entry.getKey(), value);
+            }
+        }
+        return out;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object oracleValue(Object value, Map<String, Object> definition) {
+        if (value == null) {
+            return null;
+        }
+        String type = (String) definition.get("type");
+        if ("geo_point".equals(type)) {
+            Map<String, Object> meta = (Map<String, Object>) definition.get("meta");
+            boolean latFirst = meta == null || !"lon_lat".equals(meta.get("lance_geo_order"));
+            List<Object> pair;
+            if (value instanceof Map<?, ?> struct) {
+                pair = new ArrayList<>(struct.values());
+            } else {
+                pair = (List<Object>) value;
+            }
+            if (pair.size() != 2 || pair.get(0) == null || pair.get(1) == null) {
+                return null;
+            }
+            double first = ((Number) pair.get(0)).doubleValue();
+            double second = ((Number) pair.get(1)).doubleValue();
+            Map<String, Object> point = new LinkedHashMap<>();
+            point.put("lat", latFirst ? first : second);
+            point.put("lon", latFirst ? second : first);
+            return point;
+        }
+        Map<String, Object> children = (Map<String, Object>) definition.get("properties");
+        if (children != null && value instanceof Map<?, ?> struct) {
+            Map<String, Object> out = new LinkedHashMap<>();
+            for (Map.Entry<?, ?> child : struct.entrySet()) {
+                Map<String, Object> childDefinition = children.get(child.getKey()) instanceof Map<?, ?> m ? (Map<String, Object>) m : null;
+                if (childDefinition == null) {
+                    continue;
+                }
+                out.put((String) child.getKey(), oracleValue(child.getValue(), childDefinition));
+            }
+            return out;
+        }
+        if (children != null && value instanceof List<?> elements) {
+            List<Object> out = new ArrayList<>(elements.size());
+            for (Object element : elements) {
+                out.add(element == null ? null : oracleValue(element, definition));
+            }
+            return out;
+        }
+        return value;
+    }
+
+    /**
+     * {@code body} as the oracle index of {@code lanceIndex} accepts it:
+     * every {@code lance_match}, {@code lance_match_phrase} and
+     * {@code lance_multi_match} clause becomes the core clause of the
+     * same name and arguments, and a {@code prefix}, {@code wildcard}
+     * or {@code regexp} on a {@code lance_text} column moves to the
+     * column's {@link #ORACLE_RAW_SUBFIELD}, where it reads the whole
+     * value as the Lance scan does. Everything else is copied.
+     */
+    static String oracleBody(String lanceIndex, String body) {
+        Set<String> textColumns = ORACLE_TEXT_COLUMNS.getOrDefault(lanceIndex + ORACLE_SUFFIX, Set.of());
+        Object rewritten = rewriteForOracle(parseJson(body), textColumns);
+        try (XContentBuilder builder = MediaTypeRegistry.JSON.contentBuilder()) {
+            builder.value(rewritten);
+            return builder.toString();
+        } catch (IOException e) {
+            throw new AssertionError("could not render the oracle body of " + body, e);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object rewriteForOracle(Object node, Set<String> textColumns) {
+        if (node instanceof List<?> list) {
+            List<Object> out = new ArrayList<>(list.size());
+            for (Object element : list) {
+                out.add(rewriteForOracle(element, textColumns));
+            }
+            return out;
+        }
+        if (!(node instanceof Map<?, ?> map)) {
+            return node;
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            String key = (String) entry.getKey();
+            Object value = rewriteForOracle(entry.getValue(), textColumns);
+            switch (key) {
+                case "lance_match", "lance_match_phrase" -> {
+                    Map<String, Object> clause = new LinkedHashMap<>((Map<String, Object>) value);
+                    String field = (String) clause.remove("field");
+                    out.put(key.substring("lance_".length()), Map.of(field, clause));
+                }
+                case "lance_multi_match" -> {
+                    Map<String, Object> clause = new LinkedHashMap<>((Map<String, Object>) value);
+                    List<String> fields = new ArrayList<>();
+                    Map<String, Object> boosts = (Map<String, Object>) clause.remove("boosts");
+                    for (Object field : (List<Object>) clause.get("fields")) {
+                        Object boost = boosts == null ? null : boosts.get(field);
+                        fields.add(boost == null ? (String) field : field + "^" + boost);
+                    }
+                    clause.put("fields", fields);
+                    out.put("multi_match", clause);
+                }
+                case "prefix", "wildcard", "regexp" -> {
+                    Map<String, Object> clause = (Map<String, Object>) value;
+                    Map<String, Object> moved = new LinkedHashMap<>();
+                    for (Map.Entry<String, Object> argument : clause.entrySet()) {
+                        String field = argument.getKey();
+                        moved.put(textColumns.contains(field) ? field + "." + ORACLE_RAW_SUBFIELD : field, argument.getValue());
+                    }
+                    out.put(key, moved);
+                }
+                default -> out.put(key, value);
+            }
+        }
+        return out;
+    }
+
+    /** {@code index} with the oracle suffix removed when it carries one, so a hit of an oracle index names the Lance index. */
+    static String lanceIndexNameOf(Object index) {
+        String name = String.valueOf(index);
+        return name.endsWith(ORACLE_SUFFIX) ? name.substring(0, name.length() - ORACLE_SUFFIX.length()) : name;
+    }
+
+    /**
+     * Assert that {@code body} selects the same rows on the Lance index
+     * and on its oracle: the same {@code hits.total} and the same set of
+     * hit {@code _id} values, in any order. The comparison of a full text
+     * query, whose scores and order of equal scores Lance's tokenizer
+     * and BM25 do not share with Lucene's. Returns the Lance index's
+     * body.
+     */
+    static String assertSameHitIdsAsOracle(String indexName, String body) throws Exception {
+        String fragmentBody = readAll(postJson("/" + indexName + "/_search", body));
+        String oracleBody = readAll(postJson("/" + oracleIndexFor(indexName) + "/_search", oracleBody(indexName, body)));
+        assertEquals(body, totalOf(oracleBody), totalOf(fragmentBody));
+        assertEquals(body, new java.util.HashSet<>(idsOf(hitsOf(oracleBody))), new java.util.HashSet<>(idsOf(hitsOf(fragmentBody))));
+        return fragmentBody;
+    }
+
+    /**
+     * Whether {@code body} reads a {@code lance_text} column through a
+     * clause Lance scores: a {@code match}, {@code match_phrase},
+     * {@code multi_match}, {@code simple_query_string},
+     * {@code query_string}, {@code fuzzy} or any {@code lance_*} clause.
+     * The comparison with the oracle of such a body is
+     * {@link #assertSameHitIdsAsOracle}.
+     */
+    static boolean isFullTextBody(String body) {
+        for (String clause : new String[] {
+            "\"match\"",
+            "\"match_phrase\"",
+            "\"multi_match\"",
+            "\"simple_query_string\"",
+            "\"query_string\"",
+            "\"fuzzy\"",
+            "\"lance_" }) {
+            if (body.contains(clause)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -431,8 +742,8 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
      * The hits of {@code searchBody} with every rendered key ({@code _score}
      * included) except {@code _shard} and {@code _node}, which
      * {@code explain: true} adds and which name the node that rendered
-     * the hit (the coordinating node on the fragment path, the data
-     * node on the stock search action).
+     * the hit. A hit of an oracle index names its Lance index in
+     * {@code _index}, so the hits of the two can be compared.
      */
     @SuppressWarnings("unchecked")
     static List<Map<String, Object>> fullHitsOf(String searchBody) {
@@ -443,6 +754,9 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
             Map<String, Object> copy = new java.util.LinkedHashMap<>((Map<String, Object>) hit);
             copy.remove("_shard");
             copy.remove("_node");
+            if (copy.containsKey("_index")) {
+                copy.put("_index", lanceIndexNameOf(copy.get("_index")));
+            }
             out.add(copy);
         }
         return out;
@@ -514,6 +828,9 @@ public abstract class LanceRestTestCase extends OpenSearchRestTestCase {
                 // drop it so the comparison is about order, ids, sort
                 // values and _source only.
                 copy.remove("_score");
+                if (copy.containsKey("_index")) {
+                    copy.put("_index", lanceIndexNameOf(copy.get("_index")));
+                }
                 out.add(copy);
             }
             return out;
