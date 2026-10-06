@@ -10,6 +10,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -617,20 +618,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
             String again = withoutTook(readAll(postJson("/" + index + "/_search?request_cache=false", sum)));
             assertEquals(first, again);
             assertEquals(rejectionsBefore + 1, longNumber(columnStoreStats().get("heap_fallback_rejections")));
-
-            // The shard engine's reader (the stock search action over a
-            // mixed target reads through it) stays open for the life of
-            // the shard, so its heap column stays charged and the gauge
-            // shows it until the index goes away.
-            String viaShard = readAll(postJson("/" + withStockOracle(index) + "/_search", sum));
-            assertEquals(expectedSum, extractDoublePath(viaShard, "aggregations", "s", "value"), 0d);
-            long held = longNumber(columnStoreStats().get("heap_fallback_bytes"));
-            assertTrue(
-                "the engine reader holds rating in heap: " + held,
-                held >= 3 * 200 * Long.BYTES && held < 3 * 200 * Long.BYTES + 1024
-            );
-            client().performRequest(new Request("DELETE", "/" + index));
-            assertBusy(() -> assertEquals(0L, longNumber(columnStoreStats().get("heap_fallback_bytes"))));
+            assertEquals(0L, longNumber(columnStoreStats().get("heap_fallback_bytes")));
         } finally {
             putTransientSetting("plugins.lance.cache.enabled", null);
             putTransientSetting("plugins.lance.aggregation.pushdown", null);
@@ -779,7 +767,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
      * fragments, so a single executor's answer is exact, and the
      * coordinator's reduce of one answer derives no error, as it does
      * for a single shard. The keys, the counts and the other count match the
-     * stock search path over the same rows.
+     * oracle over the same rows.
      */
     @SuppressWarnings("unchecked")
     public void testPushedTermsOnOneExecutorReportsNoDocCountError() throws Exception {
@@ -805,18 +793,17 @@ public class LanceAggregationIT extends LanceRestTestCase {
                     for (Map<String, Object> bucket : buckets) {
                         assertEquals(shape + " bucket " + bucket, 0, ((Number) bucket.get("doc_count_error_upper_bound")).intValue());
                     }
-                    // The stock oracle target is two indexes (the Lance
-                    // index and an empty ordinary one) and the stock
-                    // search slices the Lance shard's three leaves, so
-                    // its reduce derives errors of its own for a cut
-                    // terms; the keys, the counts and the other count are
-                    // what both paths must agree on.
-                    Map<String, Object> stock = aggregation(
-                        parse(readAll(postJson("/" + LanceRestTestCase.withStockOracle(index) + "/_search?request_cache=false", shape))),
+                    // The oracle is one ordinary index whose shard the
+                    // stock search slices by segment, so its reduce
+                    // derives errors of its own for a cut terms; the
+                    // keys, the counts and the other count are what both
+                    // must agree on.
+                    Map<String, Object> oracle = aggregation(
+                        parse(readAll(postJson("/" + oracleIndexFor(index) + "/_search?request_cache=false", shape))),
                         shape.contains("\"c\"") ? "c" : "r"
                     );
-                    assertEquals(shape, keysAndCounts(stock), keysAndCounts(terms));
-                    assertEquals(shape, stock.get("sum_other_doc_count"), terms.get("sum_other_doc_count"));
+                    assertEquals(shape, keysAndCounts(oracle), keysAndCounts(terms));
+                    assertEquals(shape, oracle.get("sum_other_doc_count"), terms.get("sum_other_doc_count"));
                 }
                 assertBusy(() -> assertEquals("every shape took the pushdown", before + shapes.length, pushdownLogLines(index)));
             } finally {
@@ -911,8 +898,8 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "{\"size\":0,\"aggs\":{\"d\":{\"composite\":{\"sources\":[{\"d\":{\"date_histogram\":{\"field\":\"ts\",\"fixed_interval\":\"30d\",\"time_zone\":\"+09:00\"}}}]}}}}" };
             assertPushdownAgreesWithAggregators(indexName, shapes, aggregatorShapes);
             // auto_date_histogram is served by the aggregators and equals
-            // the stock search path.
-            assertStockSearchAgrees(indexName, "\"size\":0,\"aggs\":{\"d\":{\"auto_date_histogram\":{\"field\":\"ts\",\"buckets\":3}}}");
+            // the oracle.
+            assertOracleAgrees(indexName, "\"size\":0,\"aggs\":{\"d\":{\"auto_date_histogram\":{\"field\":\"ts\",\"buckets\":3}}}");
         } finally {
             try {
                 client().performRequest(new Request("DELETE", "/" + indexName));
@@ -1303,15 +1290,15 @@ public class LanceAggregationIT extends LanceRestTestCase {
     /**
      * Every aggregation type the coordinator's former allow list sent to
      * the stock search path now runs on the fragment path, through the stock
-     * aggregators over the fragment leaves, and answers what the shard
-     * path answers: {@code multi_terms}, {@code matrix_stats},
+     * aggregators over the fragment leaves, and answers what the oracle
+     * answers: {@code multi_terms}, {@code matrix_stats},
      * {@code sampler} / {@code diversified_sampler}, scripted builders,
      * {@code filter} / {@code filters} over a Lance full text or knn
      * clause or over a query outside the pushdown's vocabulary, and the
      * multi value and clustering metrics. The samplers keep
      * {@code shard_size} documents per collection slice, as they do per
      * slice under concurrent segment search, so the collection runs in
-     * one slice to equal the single slice stock search path. The executed
+     * one slice to equal the single segment oracle. The executed
      * counter proves the fragment path served every shape.
      */
     public void testAggregationsOffTheFormerAllowListRunOnTheFragmentPath() throws Exception {
@@ -1335,8 +1322,6 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "\"size\":0,\"aggs\":{\"s\":{\"sum\":{\"script\":{\"source\":\"doc['rating'].size() == 0 ? 0 : doc['rating'].value\"}}}}",
                 "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"lance_match\":{\"field\":\"body\",\"query\":\"grp7\"}},\"aggs\":{\"c\":{\"terms\":{\"field\":\"category\"}}}}}",
                 "\"size\":0,\"aggs\":{\"fs\":{\"filters\":{\"filters\":{\"a\":{\"term\":{\"category\":\"c0\"}},\"b\":{\"lance_match\":{\"field\":\"body\",\"query\":\"grp7\"}}}}}}",
-                "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"lance_knn\":{\"field\":\"embedding\",\"vector\":[250.4,0,0,0,0,0,0,0],\"k\":5}},"
-                    + "\"aggs\":{\"m\":{\"max\":{\"field\":\"id\"}}}}}",
                 "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"match\":{\"body\":\"grp7\"}}}}",
                 "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"prefix\":{\"category\":\"c\"}}}}",
                 "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"script\":{\"script\":{\"source\":\"doc['id'].value % 2 == 0\"}}}}}",
@@ -1345,12 +1330,29 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "\"size\":2,\"query\":{\"term\":{\"category\":\"c1\"}},\"aggs\":{\"mt\":{\"multi_terms\":{\"terms\":[{\"field\":\"category\"},{\"field\":\"flag\"}]}}}" };
             long before = fragmentRequestsExecuted();
             for (String shape : shapes) {
-                assertStockSearchAgrees(index, shape);
+                assertOracleAgrees(index, shape);
             }
-            // median_absolute_deviation is a TDigest sketch, and the
-            // oracle target reduces one more (empty) shard's digest, which
-            // moves the interpolated quantile within the sketch's error;
-            // it is compared with a tolerance instead of byte for byte.
+            // A filter bucket over a knn clause: the oracle has no vector
+            // column, so the bucket is checked against the fixture, whose
+            // row i sits at (i, 0, ...). The five rows nearest to 250.4
+            // are 248 to 252.
+            String knnFilter =
+                "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"lance_knn\":{\"field\":\"embedding\",\"vector\":[250.4,0,0,0,0,0,0,0],\"k\":5}},"
+                    + "\"aggs\":{\"m\":{\"max\":{\"field\":\"id\"}}}}}";
+            List<Integer> nearest = nearestRowIds(600, 250.4d, 5);
+            assertEquals(List.of(250, 251, 249, 252, 248), nearest);
+            Map<String, Object> knnBucket = parse(readAll(postJson("/" + index + "/_search", "{" + knnFilter + "}")));
+            assertEquals(nearest.size(), ((Number) aggregation(knnBucket, "f").get("doc_count")).intValue());
+            assertEquals(
+                Collections.max(nearest).doubleValue(),
+                ((Number) ((Map<String, Object>) aggregation(knnBucket, "f").get("m")).get("value")).doubleValue(),
+                0d
+            );
+            // median_absolute_deviation is a TDigest sketch whose
+            // interpolated quantile moves with the order the values are
+            // added in (one sketch per fragment executor against one per
+            // oracle segment); it is compared with a tolerance instead of
+            // byte for byte.
             String mad = "\"size\":0,\"aggs\":{\"m\":{\"median_absolute_deviation\":{\"field\":\"rating\"}}}";
             double madFragment = extractDoublePath(
                 readAll(postJson("/" + index + "/_search", "{" + mad + "}")),
@@ -1359,13 +1361,13 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "value"
             );
             double madOracle = extractDoublePath(
-                readAll(postJson("/" + withStockOracle(index) + "/_search?request_cache=false", "{" + mad + "}")),
+                readAll(postJson("/" + oracleIndexFor(index) + "/_search?request_cache=false", "{" + mad + "}")),
                 "aggregations",
                 "m",
                 "value"
             );
             assertEquals("median_absolute_deviation within the sketch tolerance", madOracle, madFragment, 0.01 * Math.abs(madOracle));
-            assertEquals("every shape ran on the fragment path", before + shapes.length + 1, fragmentRequestsExecuted());
+            assertEquals("every shape ran on the fragment path", before + shapes.length + 2, fragmentRequestsExecuted());
 
             // Checks independent of the oracle: the multi terms buckets
             // (three categories by two flags) cover every row that has
@@ -1464,39 +1466,64 @@ public class LanceAggregationIT extends LanceRestTestCase {
 
     /**
      * Run {@code shape} (a {@code _search} body without its outer braces)
-     * through the fragment path and, against the target of
-     * {@link #withStockOracle}, through the stock search action, and
-     * assert the two responses carry the same {@code hits.total} and the
-     * same {@code aggregations} block. Numbers
-     * are compared with a relative tolerance of 1e-9: the two paths add
-     * the same values in a different order (one collector per fragment
-     * leaf against one over the whole reader), so the last bits of a
-     * floating point moment ({@code matrix_stats} variance, skewness)
-     * can differ. Returns the fragment path response.
+     * through the fragment path and against the oracle, the ordinary
+     * index of the same rows {@link #oracleIndexFor} loads, and assert
+     * the two responses carry the same {@code hits.total} and the same
+     * {@code aggregations} block. Numbers are compared with a relative
+     * tolerance of 1e-9: the two add the same values in a different
+     * order (one collector per fragment leaf against one per oracle
+     * segment), so the last bits of a floating point moment
+     * ({@code matrix_stats} variance, skewness) can differ. Returns the
+     * fragment path response.
      */
     @SuppressWarnings("unchecked")
-    private static Map<String, Object> assertStockSearchAgrees(String index, String shape) throws IOException {
-        return assertStockSearchAgrees(index, shape, false);
+    private static Map<String, Object> assertOracleAgrees(String index, String shape) throws Exception {
+        return assertOracleAgrees(index, shape, false);
     }
 
     /**
-     * As {@link #assertStockSearchAgrees(String, String)}; {@code
+     * As {@link #assertOracleAgrees(String, String)}; {@code
      * allowWarnings} accepts a {@code Warning} header on both answers
      * (a deprecated aggregation such as {@code moving_avg}).
      */
     @SuppressWarnings("unchecked")
-    private static Map<String, Object> assertStockSearchAgrees(String index, String shape, boolean allowWarnings) throws IOException {
+    private static Map<String, Object> assertOracleAgrees(String index, String shape, boolean allowWarnings) throws Exception {
         Map<String, Object> fragmentPath = parse(readAll(post("/" + index + "/_search", "{" + shape + "}", allowWarnings)));
-        Map<String, Object> shardPath = parse(
-            readAll(post("/" + withStockOracle(index) + "/_search?request_cache=false", "{" + shape + "}", allowWarnings))
+        Map<String, Object> oracle = parse(
+            readAll(post("/" + oracleIndexFor(index) + "/_search?request_cache=false", oracleBody(index, "{" + shape + "}"), allowWarnings))
         );
         assertEquals(
             shape,
-            ((Map<String, Object>) shardPath.get("hits")).get("total"),
+            ((Map<String, Object>) oracle.get("hits")).get("total"),
             ((Map<String, Object>) fragmentPath.get("hits")).get("total")
         );
-        assertJsonClose(shape, aggregationsBlock(shardPath.get("aggregations")), aggregationsBlock(fragmentPath.get("aggregations")));
+        assertJsonClose(shape, aggregationsBlock(oracle.get("aggregations")), aggregationsBlock(fragmentPath.get("aggregations")));
         return fragmentPath;
+    }
+
+    /**
+     * The ids of the {@code k} rows of a hint fixture of {@code rowCount}
+     * rows nearest to {@code x} on the first coordinate (row i sits at
+     * {@code (i, 0, ...)}), nearest first.
+     */
+    private static List<Integer> nearestRowIds(int rowCount, double x, int k) {
+        double[] distances = new double[rowCount];
+        for (int i = 0; i < rowCount; i++) {
+            distances[i] = Math.abs(i - x);
+        }
+        List<Integer> ids = new ArrayList<>();
+        boolean[] taken = new boolean[rowCount];
+        for (int n = 0; n < k; n++) {
+            int best = -1;
+            for (int i = 0; i < rowCount; i++) {
+                if (!taken[i] && (best < 0 || distances[i] < distances[best])) {
+                    best = i;
+                }
+            }
+            taken[best] = true;
+            ids.add(best);
+        }
+        return ids;
     }
 
     private static Response post(String path, String body, boolean allowWarnings) throws IOException {
@@ -1567,19 +1594,20 @@ public class LanceAggregationIT extends LanceRestTestCase {
 
     /**
      * Every aggregation type the allow list newly routes to the fragment
-     * path answers the same as the stock search path. The hint fixture has three
+     * path answers the same as the oracle, the ordinary index of the same
+     * rows. The hint fixture has three
      * fragments of 400 rows: rating {@code (i * 37) % 1000}, null when
      * {@code i % 5 == 4}; category {@code c(i % 3)}, null when
      * {@code i % 4 == 3}; tags and flag likewise. The exact aggregations
      * (stats, extended_stats, range, missing, filter, filters, composite
-     * with paging, hdr percentiles) have to match the stock search path byte for
+     * with paging, hdr percentiles) have to match the oracle byte for
      * byte; the sketches (tdigest percentiles, cardinality) within their
      * error. Every fragment path request leaves one fan-out line in the
      * node log, which is how the test knows the requests did not fall to
      * the stock search path.
      */
     @SuppressWarnings("unchecked")
-    public void testWiderAllowListAnswersLikeTheStockSearch() throws Exception {
+    public void testWiderAllowListAnswersLikeTheOracle() throws Exception {
         try (LanceTestCluster fixture = LanceTestCluster.setUpHintFixture(3, 400, "allow-list")) {
             String index = fixture.indexName();
             long fanOutBefore = fanOutLogLines(index);
@@ -1599,7 +1627,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"st\":{\"stats\":{\"field\":\"rating\"}},\"r\":{\"range\":{\"field\":\"rating\",\"ranges\":[{\"to\":500},{\"from\":500}]}}}}}" };
             int requests = 0;
             for (String shape : exact) {
-                assertStockSearchAgrees(index, shape);
+                assertOracleAgrees(index, shape);
                 requests++;
             }
 
@@ -1607,7 +1635,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
             // the first and is the same page on both paths.
             String firstPage =
                 "\"size\":0,\"aggs\":{\"c\":{\"composite\":{\"size\":7,\"sources\":[{\"cat\":{\"terms\":{\"field\":\"category\"}}},{\"r\":{\"terms\":{\"field\":\"rating\"}}}]}}}";
-            Map<String, Object> page = assertStockSearchAgrees(index, firstPage);
+            Map<String, Object> page = assertOracleAgrees(index, firstPage);
             requests++;
             Map<String, Object> afterKey = (Map<String, Object>) aggregation(page, "c").get("after_key");
             assertEquals("c0", afterKey.get("cat"));
@@ -1617,7 +1645,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 String nextPage = "\"size\":0,\"aggs\":{\"c\":{\"composite\":{\"size\":7,\"after\":"
                     + after
                     + ",\"sources\":[{\"cat\":{\"terms\":{\"field\":\"category\"}}},{\"r\":{\"terms\":{\"field\":\"rating\"}}}]}}}";
-                page = assertStockSearchAgrees(index, nextPage);
+                page = assertOracleAgrees(index, nextPage);
                 requests++;
                 for (Map<String, Object> bucket : (List<Map<String, Object>>) aggregation(page, "c").get("buckets")) {
                     keysSeen.add(String.valueOf(bucket.get("key")));
@@ -1629,19 +1657,19 @@ public class LanceAggregationIT extends LanceRestTestCase {
 
             // tdigest percentiles: one sketch per executor on the fragment
             // path, so the values are within the algorithm's error of the
-            // stock search path's single sketch: a couple of percentile points of
-            // the rating range (0 to 999) at the default compression.
+            // oracle's sketch: a couple of percentile points of the rating
+            // range (0 to 999) at the default compression.
             String tdigest = "{\"size\":0,\"aggs\":{\"p\":{\"percentiles\":{\"field\":\"rating\"}}}}";
             Map<String, Object> viaFragments = parse(readAll(postJson("/" + index + "/_search", tdigest)));
             requests++;
-            Map<String, Object> viaShard = parse(readAll(postJson("/" + withStockOracle(index) + "/_search?request_cache=false", tdigest)));
+            Map<String, Object> viaOracle = parse(readAll(postJson("/" + oracleIndexFor(index) + "/_search?request_cache=false", tdigest)));
             Map<String, Object> fragmentValues = (Map<String, Object>) aggregation(viaFragments, "p").get("values");
-            Map<String, Object> shardValues = (Map<String, Object>) aggregation(viaShard, "p").get("values");
-            assertEquals(shardValues.keySet(), fragmentValues.keySet());
-            for (String percentile : shardValues.keySet()) {
+            Map<String, Object> oracleValues = (Map<String, Object>) aggregation(viaOracle, "p").get("values");
+            assertEquals(oracleValues.keySet(), fragmentValues.keySet());
+            for (String percentile : oracleValues.keySet()) {
                 assertWithinShareOfRange(
                     "percentile " + percentile,
-                    ((Number) shardValues.get(percentile)).doubleValue(),
+                    ((Number) oracleValues.get(percentile)).doubleValue(),
                     ((Number) fragmentValues.get(percentile)).doubleValue(),
                     0.03d,
                     999d
@@ -1673,9 +1701,9 @@ public class LanceAggregationIT extends LanceRestTestCase {
             assertEquals("every request above took the fragment path", fanOutBefore + requests, fanOut);
 
             // A filter bucket over a Lance query runs on the fragment path
-            // too and answers what the stock search path answers.
+            // too and answers what the oracle's match answers.
             String ftsFilter = "\"size\":0,\"aggs\":{\"f\":{\"filter\":{\"lance_match\":{\"field\":\"body\",\"query\":\"grp7\"}}}}";
-            Map<String, Object> ftsBucket = assertStockSearchAgrees(index, ftsFilter);
+            Map<String, Object> ftsBucket = assertOracleAgrees(index, ftsFilter);
             assertEquals(48, ((Number) aggregation(ftsBucket, "f").get("doc_count")).intValue());
             assertEquals(fanOut + 1, fanOutLogLines(index));
         }
@@ -1684,7 +1712,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
     /**
      * Pipeline aggregations run on the coordinator's final reduce, so a
      * request carrying one stays on the fragment path and answers what
-     * the stock search path answers. The interleaved fixture has three fragments
+     * the oracle answers. The interleaved fixture has three fragments
      * of eight rows: id 0..23, category {@code c(id % 3)}, ts one day per
      * id from 2024-01-01. Every sibling pipeline ({@code avg_bucket},
      * {@code sum_bucket}, {@code min_bucket}, {@code max_bucket},
@@ -1695,12 +1723,12 @@ public class LanceAggregationIT extends LanceRestTestCase {
      * {@code bucket_sort}, {@code bucket_script}, {@code bucket_selector})
      * under a {@code date_histogram} or a {@code terms}, and the two
      * nested placements (a parent pipeline two levels down, a sibling
-     * pipeline under a bucket) have to match the stock search path's block byte
-     * for byte. The refusals are core's, raised before the routing
-     * decision, so both paths answer the same 400.
+     * pipeline under a bucket) have to match the oracle's block byte for
+     * byte. The refusals are core's, raised before the routing decision,
+     * so both indexes answer the same 400.
      */
     @SuppressWarnings("unchecked")
-    public void testPipelineAggregationsAnswerLikeTheStockSearch() throws Exception {
+    public void testPipelineAggregationsAnswerLikeTheOracle() throws Exception {
         // Every search opts out of the result cache: the test counts the
         // fan out log lines, and a cached answer fans nothing out.
         String suffix = "pipeline-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
@@ -1769,14 +1797,14 @@ public class LanceAggregationIT extends LanceRestTestCase {
             long fanOutBefore = fanOutLogLines(index);
             int requests = 0;
             for (String shape : shapes) {
-                Map<String, Object> answer = assertStockSearchAgrees(index, shape);
+                Map<String, Object> answer = assertOracleAgrees(index, shape);
                 assertNotNull(shape, answer.get("aggregations"));
                 requests++;
             }
             // moving_avg is deprecated in favour of moving_fn and answers
             // with a Warning header on both paths.
             String movingAvg = "\"size\":0,\"aggs\":{" + byWeek + ",\"ma\":{\"moving_avg\":{\"buckets_path\":\"s\",\"window\":2}}}}}";
-            assertStockSearchAgrees(index, movingAvg, true);
+            assertOracleAgrees(index, movingAvg, true);
             requests++;
 
             // Spot check of the reduce: the sums per category are 84, 92
@@ -1803,7 +1831,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
             // The refusals are core's request validation, answered before
             // the routing decision: the same 400 and message on both paths.
             String noop = "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"},\"aggs\":{\"bs\":{\"bucket_sort\":{}}}}}}";
-            assertSameRefusalAsStockSearch(
+            assertSameRefusalAsOracle(
                 index,
                 noop,
                 400,
@@ -1811,7 +1839,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
             );
             String danglingPath =
                 "{\"size\":0,\"aggs\":{\"t\":{\"terms\":{\"field\":\"category\"}},\"ab\":{\"avg_bucket\":{\"buckets_path\":\"nosuch>s\"}}}}";
-            assertSameRefusalAsStockSearch(index, danglingPath, 400, "No aggregation found for path [nosuch>s]");
+            assertSameRefusalAsOracle(index, danglingPath, 400, "No aggregation found for path [nosuch>s]");
             assertEquals("the validation refusals left no fan-out line", fanOutBefore + requests, fanOutLogLines(index));
             // A script that does not compile fails the reduce on the
             // coordinator on both paths: the status is the script
@@ -1825,7 +1853,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
                         + "\"bad\":{\"bucket_script\":{\"buckets_path\":{\"s\":\"s\"},\"script\":\"params.s +\"}}"
                 )
                 + "}}";
-            assertSameRefusalAsStockSearch(index, brokenScript, 400, "compile error");
+            assertSameRefusalAsOracle(index, brokenScript, 400, "compile error");
             requests++;
             assertEquals("the failed reduce followed one fan-out", fanOutBefore + requests, fanOutLogLines(index));
         } finally {
@@ -1837,19 +1865,15 @@ public class LanceAggregationIT extends LanceRestTestCase {
 
     /**
      * {@code body} answers the same status and a body carrying
-     * {@code reason} on the fragment path and on the stock search path (the
-     * body against the target of {@link #withStockOracle}).
+     * {@code reason} on the Lance index and on its oracle.
      */
-    private static void assertSameRefusalAsStockSearch(String index, String body, int status, String reason) throws IOException {
+    private static void assertSameRefusalAsOracle(String index, String body, int status, String reason) throws Exception {
         ConcurrentResult fragmentPath = postForStatus("/" + index + "/_search?request_cache=false", body);
-        // No partial results on the two shard oracle target: a refusal
-        // raised on the data bearing shard alone would otherwise leave
-        // the response at 200 next to the empty oracle shard.
-        ConcurrentResult shardPath = postForStatus("/" + withStockOracle(index) + "/_search?allow_partial_search_results=false", body);
+        ConcurrentResult oracle = postForStatus("/" + oracleIndexFor(index) + "/_search?request_cache=false", oracleBody(index, body));
         assertEquals(fragmentPath.body(), status, fragmentPath.status());
-        assertEquals(shardPath.body(), status, shardPath.status());
+        assertEquals(oracle.body(), status, oracle.status());
         assertTrue(fragmentPath.body(), fragmentPath.body().contains(reason));
-        assertTrue(shardPath.body(), shardPath.body().contains(reason));
+        assertTrue(oracle.body(), oracle.body().contains(reason));
     }
 
     /**
@@ -2000,7 +2024,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
      * {@code date_histogram} source on a timestamp column, against the
      * interleaved fixture (ts is 2024-01-01 plus {@code id} days).
      */
-    public void testDateAggregationsOnTheWiderAllowListAnswerLikeTheStockSearch() throws Exception {
+    public void testDateAggregationsOnTheWiderAllowListAnswerLikeTheOracle() throws Exception {
         String suffix = "allow-dates-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT);
         Path scratchDir = Files.createDirectories(sharedRoot().resolve("lance-it-" + suffix));
         String tableName = "demo-" + suffix;
@@ -2017,7 +2041,7 @@ public class LanceAggregationIT extends LanceRestTestCase {
                 "\"size\":0,\"aggs\":{\"c\":{\"composite\":{\"size\":3,\"after\":{\"month\":1706745600000,\"cat\":\"c0\"},\"sources\":[{\"month\":{\"date_histogram\":{\"field\":\"ts\",\"calendar_interval\":\"month\"}}},{\"cat\":{\"terms\":{\"field\":\"category\"}}}]}}}",
                 "\"size\":0,\"query\":{\"range\":{\"ts\":{\"gte\":\"2024-02-15\"}}},\"aggs\":{\"d\":{\"date_range\":{\"field\":\"ts\",\"ranges\":[{\"to\":\"2024-03-01\"},{\"from\":\"2024-03-01\"}]}}}" };
             for (String shape : shapes) {
-                assertStockSearchAgrees(indexName, shape);
+                assertOracleAgrees(indexName, shape);
             }
             assertEquals(fanOutBefore + shapes.length, fanOutLogLines(indexName));
         } finally {
