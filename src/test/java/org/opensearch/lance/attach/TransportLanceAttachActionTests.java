@@ -16,8 +16,8 @@ import org.opensearch.OpenSearchStatusException;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.lance.NativeMemoryLimit;
 import org.opensearch.lance.NativeMemoryLimit.IndexCacheSizing;
+import org.opensearch.lance.attach.MappingDerivation.Derivation;
 import org.opensearch.lance.query.LanceInvalidInput;
-import org.opensearch.lance.rest.RestAttachAction.Derivation;
 import org.opensearch.test.MockLogAppender;
 import org.opensearch.test.OpenSearchTestCase;
 

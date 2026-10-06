@@ -26,8 +26,8 @@ import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.lance.LanceOverrides;
+import org.opensearch.lance.attach.MappingDerivation;
 import org.opensearch.lance.engine.LanceEngineFactory;
-import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.transport.client.Client;
 
 /**
@@ -138,7 +138,7 @@ final class LanceSchemaDriftDetector {
                 continue;
             }
             try {
-                RestAttachAction.validateColumnOverride(entry.getKey(), entry.getValue(), field, lanceFieldsByName.keySet());
+                MappingDerivation.validateColumnOverride(entry.getKey(), entry.getValue(), field, lanceFieldsByName.keySet());
             } catch (IllegalArgumentException e) {
                 rewritten = rewritten.withoutColumn(entry.getKey());
                 String key = indexName + ":override-drop:" + entry.getKey() + ":" + field.getType();

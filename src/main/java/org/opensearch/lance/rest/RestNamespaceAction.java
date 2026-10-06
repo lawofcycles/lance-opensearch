@@ -5,15 +5,14 @@
 
 package org.opensearch.lance.rest;
 
-import java.util.LinkedHashMap;
+import java.io.IOException;
 import java.util.List;
-import java.util.Map;
+import java.util.function.Supplier;
 
-import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.core.xcontent.ObjectParser;
 import org.opensearch.core.xcontent.XContentBuilder;
-import org.opensearch.lance.LanceOverrides;
-import org.opensearch.lance.StorageOptions;
+import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.lance.namespace.LanceNamespaceListAction;
 import org.opensearch.lance.namespace.LanceNamespaceListRequest;
 import org.opensearch.lance.namespace.LanceNamespaceMetadata;
@@ -21,6 +20,8 @@ import org.opensearch.lance.namespace.LanceNamespacePollAction;
 import org.opensearch.lance.namespace.LanceNamespacePollRequest;
 import org.opensearch.lance.namespace.LanceNamespaceUpdateAction;
 import org.opensearch.lance.namespace.LanceNamespaceUpdateRequest;
+import org.opensearch.lance.namespace.LanceNamespaceUpdateRequest.Identifier;
+import org.opensearch.lance.namespace.LanceNamespaceUpdateRequest.Register;
 import org.opensearch.lance.namespace.LanceNamespaceUpdateResponse;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
@@ -57,9 +58,11 @@ import org.opensearch.transport.client.node.NodeClient;
  * </ul>
  *
  * <p>The handler only parses the body and hands the request to the
- * transport action. A body is checked against the top level keys of its
- * shape ({@link #REGISTER_KEYS} or {@link #IDENTIFIER_KEYS}) before it is
- * read, and an unknown key answers 400. Allowlist and path existence
+ * transport action. The register body is read by
+ * {@link LanceNamespaceUpdateRequest#REGISTER_PARSER} and the identifier
+ * bodies of DELETE and {@code /tables} by
+ * {@link LanceNamespaceUpdateRequest#IDENTIFIER_PARSER}; a field outside
+ * the declared set answers 400 naming it. Allowlist and path existence
  * checks live in the transport action so they run after a security
  * plugin has evaluated the caller's privileges, and nothing about the
  * path (whether it is registered, whether it exists) is revealed to a
@@ -67,23 +70,9 @@ import org.opensearch.transport.client.node.NodeClient;
  */
 public class RestNamespaceAction extends BaseRestHandler {
 
-    /**
-     * The top level keys the register body ({@code POST /_plugins/_lance/namespace})
-     * is read for, in the order {@link #prepareRequest} reads them. Any
-     * other key is a 400 naming it and this list.
-     */
-    static final List<String> REGISTER_KEYS = List.of("path", "type", "name", "config", "storage_options", "overrides");
-
-    /**
-     * The top level keys of the bodies that only identify a registration
-     * ({@code POST /_plugins/_lance/namespace/tables} and
-     * {@code DELETE /_plugins/_lance/namespace}), in the order they are read.
-     */
-    static final List<String> IDENTIFIER_KEYS = List.of("path", "name");
-
     @Override
     public String getName() {
-        return "lance_namespace";
+        return LanceNamespaceUpdateRequest.PARSER_NAME;
     }
 
     @Override
@@ -98,7 +87,7 @@ public class RestNamespaceAction extends BaseRestHandler {
     }
 
     @Override
-    protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) {
+    protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         if (request.method() == RestRequest.Method.GET) {
             return channel -> client.execute(
                 LanceNamespaceListAction.INSTANCE,
@@ -117,34 +106,17 @@ public class RestNamespaceAction extends BaseRestHandler {
                 new RestToXContentListener<>(channel)
             );
         }
-        Map<String, Object> body = request.hasContent()
-            ? XContentHelper.convertToMap(request.content(), true, request.getMediaType()).v2()
-            : Map.of();
-        boolean identifierOnly = request.path().endsWith("/tables") || request.method() == RestRequest.Method.DELETE;
-        // Thrown, not caught: the REST controller turns it into a 400
-        // illegal_argument_exception, the shape core uses for an unknown
-        // field in a request body. The body is read in document order so
-        // the key named is the first unknown one the caller wrote.
-        RestBodyKeys.rejectUnknown(getName(), body, identifierOnly ? IDENTIFIER_KEYS : REGISTER_KEYS);
-        String path;
-        try {
-            path = optionalString(body, "path");
-        } catch (IllegalArgumentException e) {
-            return badRequest(e.getMessage());
-        }
-        // POST /_plugins/_lance/namespace/tables is a read-only listing endpoint.
-        // POST is used (rather than GET with a query parameter) because
-        // registered paths can contain slashes, scheme prefixes
-        // (s3://bucket/root), and other characters that make URL-encoded
-        // path segments fragile. Body-with-identifier matches the shape
-        // of the register / unregister calls right below.
+        // Parse failures are thrown, not caught: the REST controller turns
+        // an IllegalArgumentException (the parser's XContentParseException
+        // is one) into a 400 whose reason is the message.
         if (request.path().endsWith("/tables")) {
-            String identifier;
-            try {
-                identifier = requireIdentifier(body, path);
-            } catch (IllegalArgumentException e) {
-                return badRequest(e.getMessage());
-            }
+            // POST /_plugins/_lance/namespace/tables is a read-only listing endpoint.
+            // POST is used (rather than GET with a query parameter) because
+            // registered paths can contain slashes, scheme prefixes
+            // (s3://bucket/root), and other characters that make URL-encoded
+            // path segments fragile. Body-with-identifier matches the shape
+            // of the register / unregister calls right below.
+            String identifier = parse(request, LanceNamespaceUpdateRequest.IDENTIFIER_PARSER, Identifier::new).resolve();
             return channel -> client.execute(
                 LanceNamespaceListAction.INSTANCE,
                 LanceNamespaceListRequest.tables(identifier),
@@ -157,12 +129,7 @@ public class RestNamespaceAction extends BaseRestHandler {
             // via DELETE /{index} if they want the tables to disappear.
             // The namespace registration and the lifecycle of the
             // OpenSearch indexes it surfaced are separate.
-            String identifier;
-            try {
-                identifier = requireIdentifier(body, path);
-            } catch (IllegalArgumentException e) {
-                return badRequest(e.getMessage());
-            }
+            String identifier = parse(request, LanceNamespaceUpdateRequest.IDENTIFIER_PARSER, Identifier::new).resolve();
             return channel -> client.execute(
                 LanceNamespaceUpdateAction.INSTANCE,
                 LanceNamespaceUpdateRequest.unregister(identifier),
@@ -176,148 +143,27 @@ public class RestNamespaceAction extends BaseRestHandler {
                 }
             );
         }
-        String type;
-        String name;
-        Map<String, String> config;
-        StorageOptions storageOptions;
-        String overridesJson;
-        try {
-            type = optionalString(body, "type");
-            if (type == null) {
-                type = LanceNamespaceMetadata.Entry.TYPE_DIRECTORY;
-            } else if (!LanceNamespaceMetadata.Entry.ACCEPTED_TYPES.contains(type)) {
-                return badRequest(
-                    "unknown namespace type [" + type + "]; accepted values are " + LanceNamespaceMetadata.Entry.ACCEPTED_TYPES
-                );
+        LanceNamespaceUpdateRequest register = parse(request, LanceNamespaceUpdateRequest.REGISTER_PARSER, Register::new).build();
+        return channel -> client.execute(LanceNamespaceUpdateAction.INSTANCE, register, new RestBuilderListener<>(channel) {
+            @Override
+            public RestResponse buildResponse(LanceNamespaceUpdateResponse response, XContentBuilder b) throws Exception {
+                b.startObject()
+                    .field("registered", register.name())
+                    .field("type", register.type())
+                    .field("note", "tables surface as indexes within the poll cadence")
+                    .endObject();
+                return new BytesRestResponse(RestStatus.OK, b);
             }
-            name = optionalString(body, "name");
-            config = parseConfig(body.get("config"));
-            storageOptions = StorageOptions.parseFromRequestField(body.get("storage_options"), "[lance_namespace]");
-            overridesJson = LanceOverrides.parseAttachClauses(body.get("overrides"), null).toJson();
-            if (LanceNamespaceMetadata.Entry.TYPE_DIRECTORY.equals(type)) {
-                if (path == null) {
-                    return badRequest("[path] is required");
-                }
-                if (name == null) {
-                    name = path;
-                }
-            } else {
-                if (path != null) {
-                    return badRequest("[path] is only accepted for type [directory]; a [" + type + "] namespace is rooted by its config");
-                }
-                if (name == null) {
-                    return badRequest("[name] is required for type [" + type + "]");
-                }
-                if (LanceNamespaceMetadata.Entry.TYPE_REST.equals(type) && isBlank(config.get("uri"))) {
-                    return badRequest("[config.uri] is required for type [rest]");
-                }
-                boolean icebergProtocol = LanceNamespaceMetadata.Entry.TYPE_ICEBERG.equals(type)
-                    || LanceNamespaceMetadata.Entry.TYPE_POLARIS.equals(type);
-                if (icebergProtocol || LanceNamespaceMetadata.Entry.TYPE_UNITY.equals(type)) {
-                    if (isBlank(config.get("endpoint"))) {
-                        return badRequest("[config.endpoint] is required for type [" + type + "]");
-                    }
-                }
-                if (icebergProtocol && isBlank(config.get("warehouse"))) {
-                    // Without a warehouse the client rejects every listing
-                    // (the warehouse / catalog is the first level of each
-                    // table id), so the registration could never surface
-                    // a table. Refuse it up front with the reason.
-                    return badRequest(
-                        "[config.warehouse] is required for type ["
-                            + type
-                            + "]; it names the warehouse (catalog) whose namespaces are polled"
-                    );
-                }
-                if (LanceNamespaceMetadata.Entry.TYPE_UNITY.equals(type) && isBlank(config.get("catalog"))) {
-                    return badRequest("[config.catalog] is required for type [unity]");
-                }
-            }
-        } catch (IllegalArgumentException e) {
-            return badRequest(e.getMessage());
-        }
-        final String registeredName = name;
-        final String registeredType = type;
-        return channel -> client.execute(
-            LanceNamespaceUpdateAction.INSTANCE,
-            LanceNamespaceUpdateRequest.register(registeredName, registeredType, path, storageOptions, config, overridesJson),
-            new RestBuilderListener<>(channel) {
-                @Override
-                public RestResponse buildResponse(LanceNamespaceUpdateResponse response, XContentBuilder b) throws Exception {
-                    b.startObject()
-                        .field("registered", registeredName)
-                        .field("type", registeredType)
-                        .field("note", "tables surface as indexes within the poll cadence")
-                        .endObject();
-                    return new BytesRestResponse(RestStatus.OK, b);
-                }
-            }
-        );
+        });
     }
 
-    private static RestChannelConsumer badRequest(String message) {
-        return channel -> channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, message));
-    }
-
-    /** Non-empty string field, or {@code null} when absent. Throws on wrong type or empty value. */
-    private static String optionalString(Map<String, Object> body, String field) {
-        Object raw = body.get(field);
-        if (raw == null) {
-            return null;
+    /** The request body read by {@code parser}; a request without a body reads as the empty value {@code empty} supplies. */
+    private static <T> T parse(RestRequest request, ObjectParser<T, Void> parser, Supplier<T> empty) throws IOException {
+        if (!request.hasContent()) {
+            return empty.get();
         }
-        if (!(raw instanceof String value)) {
-            throw new IllegalArgumentException("[" + field + "] must be a string, got " + raw.getClass().getSimpleName());
+        try (XContentParser content = request.contentParser()) {
+            return parser.parse(content, null);
         }
-        if (value.isEmpty()) {
-            throw new IllegalArgumentException("[" + field + "] must not be empty");
-        }
-        return value;
-    }
-
-    /** The registration identifier for DELETE and /tables: {@code name} when given, {@code path} otherwise. */
-    private static String requireIdentifier(Map<String, Object> body, String path) {
-        String name = optionalString(body, "name");
-        if (name != null) {
-            return name;
-        }
-        if (path != null) {
-            return path;
-        }
-        throw new IllegalArgumentException("[name] (or [path] for a directory registration) is required");
-    }
-
-    /**
-     * Parse the {@code config} object into a string-to-string map.
-     * Keys the plugin does not know pass through to the catalog
-     * implementation untouched; only the shape and the bounds of
-     * {@link StorageOptions#MAX_ENTRIES}, {@link StorageOptions#MAX_KEY_BYTES}
-     * and {@link StorageOptions#MAX_VALUE_BYTES} are validated here.
-     */
-    static Map<String, String> parseConfig(Object raw) {
-        if (raw == null) {
-            return Map.of();
-        }
-        if (!(raw instanceof Map<?, ?> rawMap)) {
-            throw new IllegalArgumentException("[config] must be a JSON object of string values");
-        }
-        StorageOptions.checkEntryCount(rawMap.size(), "[lance_namespace]", "config");
-        Map<String, String> parsed = new LinkedHashMap<>(rawMap.size());
-        for (Map.Entry<?, ?> entry : rawMap.entrySet()) {
-            if (!(entry.getKey() instanceof String key) || key.isEmpty()) {
-                throw new IllegalArgumentException("[config] keys must be non-empty strings");
-            }
-            if (!(entry.getValue() instanceof String value)) {
-                throw new IllegalArgumentException(
-                    "[config." + key + "] must be a string (nested objects / arrays / numbers / booleans are not accepted)"
-                );
-            }
-            StorageOptions.checkEntryBytes(key, value, "[lance_namespace]", "config");
-            parsed.put(key, value);
-        }
-        return parsed;
-    }
-
-    private static boolean isBlank(String value) {
-        return value == null || value.isEmpty();
     }
 }

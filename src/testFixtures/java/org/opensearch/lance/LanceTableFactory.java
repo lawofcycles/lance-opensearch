@@ -109,7 +109,7 @@ public final class LanceTableFactory {
      *   <li>{@code embedding[0] = i}, other coordinates 0</li>
      * </ul>
      * After writing, INVERTED indexes are created on {@code body} and
-     * {@code title} so the plugin's {@link RestAttachAction#derive}
+     * {@code title} so the plugin's {@link MappingDerivation#derive}
      * maps them to {@code lance_text}. Without the index the derivation
      * falls back to {@code keyword} and match queries lose their analyzer
      * step.
@@ -1511,7 +1511,7 @@ public final class LanceTableFactory {
      * Writes a Lance table exercising Float32 and Float64 scalar columns.
      * The default {@link #writeTable} fixture only carries integer, string
      * and vector columns, so it cannot exercise the floating point mapping
-     * path {@code RestAttachAction.derive} lays down for the {@code float}
+     * path {@code MappingDerivation.derive} lays down for the {@code float}
      * and {@code double} OpenSearch field types.
      *
      * <p>Row layout (fixed six-row table):

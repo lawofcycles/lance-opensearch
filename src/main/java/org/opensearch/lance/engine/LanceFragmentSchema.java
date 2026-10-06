@@ -458,7 +458,7 @@ public final class LanceFragmentSchema {
      * {@code null} when the column's current Arrow shape does not admit
      * the override (a schema reset since attach; the caller falls back
      * to the normal classification). Mirrors the attach-time validation
-     * in {@code RestAttachAction.validateColumnOverride}: a Struct with
+     * in {@code MappingDerivation.validateColumnOverride}: a Struct with
      * two Float64 children named {@code (lat, lon)},
      * {@code (latitude, longitude)} or {@code (y, x)} in either order,
      * or a FixedSizeList&lt;Float64&gt;[2] whose element order comes

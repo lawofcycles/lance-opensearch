@@ -18,7 +18,7 @@ import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
-import org.opensearch.lance.rest.RestAttachAction;
+import org.opensearch.lance.attach.MappingDerivation;
 
 /**
  * Per-column mapping override rules an operator declared on the attach
@@ -48,7 +48,7 @@ import org.opensearch.lance.rest.RestAttachAction;
  * values, format syntax) happens in {@link #parseAttachClauses};
  * schema-dependent validation (does the column exist, does its Arrow
  * type admit the override) happens in
- * {@link RestAttachAction#derive} where the dataset is open.
+ * {@link MappingDerivation#derive} where the dataset is open.
  */
 public final class LanceOverrides {
 
@@ -224,7 +224,7 @@ public final class LanceOverrides {
         }
         String legacy = LanceSettings.MULTI_FIELDS_SETTING.get(settings);
         if (!legacy.isEmpty()) {
-            return fromSubFields(RestAttachAction.deserialiseMultiFields(legacy));
+            return fromSubFields(MappingDerivation.deserialiseMultiFields(legacy));
         }
         return EMPTY;
     }
@@ -394,7 +394,7 @@ public final class LanceOverrides {
             }
         }
         if (multiFieldsRaw != null) {
-            Map<String, LinkedHashMap<String, String>> legacy = RestAttachAction.parseMultiFields(multiFieldsRaw);
+            Map<String, LinkedHashMap<String, String>> legacy = MappingDerivation.parseMultiFields(multiFieldsRaw);
             for (Map.Entry<String, LinkedHashMap<String, String>> entry : legacy.entrySet()) {
                 String baseName = entry.getKey();
                 Column existing = columns.get(baseName);

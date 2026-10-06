@@ -53,7 +53,6 @@ import org.opensearch.lance.engine.LanceDirectoryReader;
 import org.opensearch.lance.engine.LanceEngineFactory;
 import org.opensearch.lance.namespace.AllowedTableRoots;
 import org.opensearch.lance.query.LanceInvalidInput;
-import org.opensearch.lance.rest.RestAttachAction;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 import org.opensearch.transport.client.Client;
@@ -236,14 +235,14 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
                 }
             }
         }
-        RestAttachAction.Derivation derivation;
+        MappingDerivation.Derivation derivation;
         long[] fragmentDocs;
         try (
             Dataset dataset = openVersion.isPresent()
                 ? LanceRegistry.openDatasetAt(table, request.storageOptions(), openVersion.get())
                 : LanceRegistry.openDataset(table, request.storageOptions())
         ) {
-            derivation = RestAttachAction.derive(dataset, request.overrides());
+            derivation = MappingDerivation.derive(dataset, request.overrides());
             List<Fragment> fragments = dataset.getFragments();
             fragmentDocs = new long[fragments.size()];
             for (int i = 0; i < fragmentDocs.length; i++) {
@@ -378,7 +377,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
         return true;
     }
 
-    private static void warnIfInvertedIndexExceedsShardShare(String indexName, RestAttachAction.Derivation derivation) {
+    private static void warnIfInvertedIndexExceedsShardShare(String indexName, MappingDerivation.Derivation derivation) {
         String warning = invertedIndexShardShareWarning(indexName, derivation, LanceRegistry.indexCacheSizing());
         if (warning != null) {
             LOG.warn(warning);
@@ -398,7 +397,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
      */
     static String invertedIndexShardShareWarning(
         String indexName,
-        RestAttachAction.Derivation derivation,
+        MappingDerivation.Derivation derivation,
         NativeMemoryLimit.IndexCacheSizing sizing
     ) {
         if (derivation.ftsColumns().isEmpty() || sizing == null) {
@@ -420,7 +419,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
     private void createIndex(
         String indexName,
         String table,
-        RestAttachAction.Derivation derivation,
+        MappingDerivation.Derivation derivation,
         StorageOptions storageOptions,
         Optional<Long> pinnedVersion,
         Optional<String> tag,
@@ -493,7 +492,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
     private void verifyExistingLanceIndex(
         String indexName,
         String table,
-        RestAttachAction.Derivation derivation,
+        MappingDerivation.Derivation derivation,
         StorageOptions storageOptions,
         boolean luceneBoundExceeded,
         ActionListener<LanceAttachResponse> listener
@@ -543,7 +542,7 @@ public final class TransportLanceAttachAction extends TransportClusterManagerNod
     private static LanceAttachResponse response(
         String indexName,
         String table,
-        RestAttachAction.Derivation derivation,
+        MappingDerivation.Derivation derivation,
         boolean alreadyAttached,
         boolean luceneBoundExceeded
     ) {

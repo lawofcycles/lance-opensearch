@@ -35,6 +35,7 @@ import org.opensearch.lance.LanceSettings;
 import org.opensearch.lance.LanceRegistry;
 import org.opensearch.lance.LanceTableFactory;
 import org.opensearch.lance.StorageOptions;
+import org.opensearch.lance.attach.MappingDerivation;
 import org.opensearch.lance.engine.LanceWarmCache.Lease;
 import org.opensearch.lance.engine.LanceWarmCache.Snapshot;
 import org.opensearch.lance.engine.LanceWarmCache.SnapshotKey;
@@ -80,9 +81,9 @@ public class LanceEngineFactoryTests extends EngineTestCase {
     public void testMultiFieldsSerialiseDeserialiseRoundTrip() {
         // Empty map round-trips to empty string and back to empty map so
         // absence of a multi_fields clause never persists a setting.
-        assertEquals("", org.opensearch.lance.rest.RestAttachAction.serialiseMultiFields(java.util.Collections.emptyMap()));
-        assertTrue(org.opensearch.lance.rest.RestAttachAction.deserialiseMultiFields("").isEmpty());
-        assertTrue(org.opensearch.lance.rest.RestAttachAction.deserialiseMultiFields(null).isEmpty());
+        assertEquals("", MappingDerivation.serialiseMultiFields(java.util.Collections.emptyMap()));
+        assertTrue(MappingDerivation.deserialiseMultiFields("").isEmpty());
+        assertTrue(MappingDerivation.deserialiseMultiFields(null).isEmpty());
 
         // Nested map with one keyword sub-field survives the JSON round
         // trip so the engine sees exactly what attach persisted.
@@ -90,11 +91,10 @@ public class LanceEngineFactoryTests extends EngineTestCase {
         java.util.LinkedHashMap<String, String> bodySubs = new java.util.LinkedHashMap<>();
         bodySubs.put("raw", "keyword");
         in.put("body", bodySubs);
-        String json = org.opensearch.lance.rest.RestAttachAction.serialiseMultiFields(in);
+        String json = MappingDerivation.serialiseMultiFields(in);
         assertEquals("{\"body\":{\"raw\":\"keyword\"}}", json);
 
-        java.util.Map<String, java.util.LinkedHashMap<String, String>> out = org.opensearch.lance.rest.RestAttachAction
-            .deserialiseMultiFields(json);
+        java.util.Map<String, java.util.LinkedHashMap<String, String>> out = MappingDerivation.deserialiseMultiFields(json);
         assertEquals(1, out.size());
         assertEquals("keyword", out.get("body").get("raw"));
     }
