@@ -706,13 +706,18 @@ public class LanceAttachIT extends LanceRestTestCase {
     }
 
     public void testAttachRejectsNonObjectStorageOptions() throws IOException {
+        // The body parser declares storage_options as an object, so a
+        // string value is refused by the parser naming the field and the
+        // value type it saw.
         String payload = "{\"table\":\"/tmp/does-not-matter.lance\",\"storage_options\":\"not-an-object\"}";
         ResponseException failure = expectThrows(ResponseException.class, () -> postJson("/_plugins/_lance/attach", payload));
         int status = failure.getResponse().getStatusLine().getStatusCode();
         assertEquals("expected 400 for non-object storage_options, saw " + status, 400, status);
         String body = readAll(failure.getResponse());
-        assertTrue("expected message about storage_options: " + body, body.contains("storage_options"));
-        assertTrue("expected message about JSON object: " + body, body.contains("JSON object"));
+        assertTrue(
+            "expected the parser to name storage_options and the value type: " + body,
+            body.contains("[lance_attach] storage_options doesn't support values of type: VALUE_STRING")
+        );
     }
 
     public void testAttachRejectsNestedStorageOptionsValue() throws IOException {
